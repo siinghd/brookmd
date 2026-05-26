@@ -1,6 +1,6 @@
 {
   "name": "flux-md",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Zero-dep streaming markdown for the browser. Rust→WASM core, Web Worker per stream, incremental parse with speculative closure.",
   "type": "module",
   "main": "./src/index.ts",
@@ -14,7 +14,8 @@
   },
   "files": [
     "src",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "peerDependencies": {
     "react": ">=18"
@@ -33,7 +34,7 @@
     "test": "bun test",
     "prepublishOnly": "cd ../.. && bun run build:wasm"
   },
-  "keywords": ["markdown", "streaming", "wasm", "rust", "react", "incremental", "llm", "ai"],
+  "keywords": ["markdown", "streaming", "wasm", "rust", "react", "incremental", "llm", "ai", "math", "katex", "latex", "bidi", "rtl"],
   "license": "MIT",
   "publishConfig": {
     "access": "public"
