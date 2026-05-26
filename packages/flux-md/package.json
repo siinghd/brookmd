@@ -1,0 +1,49 @@
+{
+  "name": "flux-md",
+  "version": "0.2.0",
+  "description": "Zero-dep streaming markdown for the browser. Rust→WASM core, Web Worker per stream, incremental parse with speculative closure.",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./client": "./src/client.ts",
+    "./react": "./src/react.tsx",
+    "./highlight": "./src/hi.ts",
+    "./types": "./src/types.ts"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3"
+  },
+  "scripts": {
+    "test": "bun test",
+    "prepublishOnly": "cd ../.. && bun run build:wasm"
+  },
+  "keywords": ["markdown", "streaming", "wasm", "rust", "react", "incremental", "llm", "ai"],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/siinghd/flux-md.git"
+  },
+  "homepage": "https://md.hsingh.app",
+  "bugs": {
+    "url": "https://github.com/siinghd/flux-md/issues"
+  }
+}

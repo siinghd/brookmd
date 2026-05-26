@@ -1,0 +1,192 @@
+//! Regression tests reproducing real bugs reported against Streamdown (the
+//! library flux-md replaces), each verifying flux-md gets it right. Issue
+//! numbers refer to https://github.com/vercel/streamdown/issues.
+
+use flux_md_core::{BlockKind, StreamParser};
+
+/// Render in one shot (GFM autolinks + alerts on, matching the demo config).
+fn render(md: &str) -> String {
+    let mut p = StreamParser::new().with_gfm_autolinks(true).with_gfm_alerts(true);
+    p.append(md);
+    p.finalize();
+    collect(&p)
+}
+
+/// Render fed one character at a time (the streaming path).
+fn render_streamed(md: &str) -> String {
+    let mut p = StreamParser::new().with_gfm_autolinks(true).with_gfm_alerts(true);
+    for ch in md.chars() {
+        let mut buf = [0u8; 4];
+        p.append(ch.encode_utf8(&mut buf));
+    }
+    p.finalize();
+    collect(&p)
+}
+
+fn collect(p: &StreamParser) -> String {
+    let mut out = String::new();
+    for b in p.all_blocks() {
+        out.push_str(&b.html);
+    }
+    out
+}
+
+/// #445: a single `~` must not become strikethrough (only `~~…~~` does).
+/// Streamdown struck through `20~25°C`.
+#[test]
+fn issue_445_single_tilde_is_literal() {
+    assert_eq!(render("20~25°C\n"), "<p>20~25°C</p>");
+    // Double tilde still works.
+    assert!(render("~~struck~~\n").contains("<del>struck</del>"));
+}
+
+/// #475: a *tight* list (no blank lines between items) must not wrap items in
+/// `<p>` — and crucially must stay tight even when streamed char-by-char,
+/// where a naive parser flips it to loose at a transient trailing blank.
+#[test]
+fn issue_475_tight_list_stays_tight_when_streamed() {
+    let tight = "- hello\n- world\n";
+    let expected = render(tight);
+    assert!(!expected.contains("<p>"), "tight list should not wrap items in <p>: {expected}");
+    assert_eq!(render_streamed(tight), expected, "streaming must not flip a tight list to loose");
+    // A genuinely loose list (blank line between items) *does* wrap, per spec.
+    assert!(render("- a\n\n- b\n").contains("<p>"));
+}
+
+/// #473: fenced code must render incrementally — an open (not-yet-closed) fence
+/// already shows its content, instead of buffering until the closing fence.
+#[test]
+fn issue_473_open_fence_renders_incrementally() {
+    let mut p = StreamParser::new();
+    p.append("```js\nconst x = 1;\n");
+    let out = collect(&p);
+    assert!(out.contains("<pre><code"), "open fence should render a code block: {out}");
+    assert!(out.contains("const x = 1;"), "open fence should show its content: {out}");
+}
+
+/// #519: Streamdown crashes on iOS 16 / Safari < 16.3 because its autolink
+/// handling uses regex look-behind. flux-md's extended autolinks are written
+/// in Rust without look-behind, so the same input just works.
+#[test]
+fn issue_519_extended_autolinks_without_lookbehind() {
+    assert!(render("see www.example.com today\n")
+        .contains("<a href=\"http://www.example.com\""));
+    assert!(render("mail me at foo@bar.example\n").contains("href=\"mailto:foo@bar.example\""));
+}
+
+/// #467: GitHub alerts. `> [!NOTE]` becomes a styled callout with
+/// GitHub-compatible class names; the body renders as normal markdown.
+#[test]
+fn issue_467_github_alerts() {
+    let out = render("> [!NOTE]\n> Useful **info**.\n");
+    assert!(out.contains("<div class=\"markdown-alert markdown-alert-note\""), "got: {out}");
+    assert!(out.contains("data-alert=\"note\""), "got: {out}");
+    assert!(out.contains("role=\"note\""), "alert needs role=note for a11y: {out}");
+    assert!(out.contains("<p class=\"markdown-alert-title\">Note</p>"), "got: {out}");
+    assert!(out.contains("Useful <strong>info</strong>."), "body should render markdown: {out}");
+    assert!(!out.contains("<blockquote>"), "alert should not also be a blockquote: {out}");
+
+    // All five keywords map to the right class + title.
+    for (kw, class, title) in [
+        ("NOTE", "note", "Note"),
+        ("TIP", "tip", "Tip"),
+        ("IMPORTANT", "important", "Important"),
+        ("WARNING", "warning", "Warning"),
+        ("CAUTION", "caution", "Caution"),
+    ] {
+        let out = render(&format!("> [!{kw}]\n> x\n"));
+        assert!(out.contains(&format!("markdown-alert-{class}")), "{kw}: {out}");
+        assert!(out.contains(&format!(">{title}</p>")), "{kw}: {out}");
+    }
+}
+
+/// Alerts are conservative: lowercase keyword, trailing text, or an unknown
+/// keyword all fall back to a plain blockquote (matching GitHub).
+#[test]
+fn issue_467_alert_fallbacks_to_blockquote() {
+    assert!(render("> [!note]\n> x\n").contains("<blockquote>"), "lowercase is not an alert");
+    assert!(render("> [!NOTE] trailing\n> x\n").contains("<blockquote>"), "trailing text disqualifies");
+    assert!(render("> [!BOGUS]\n> x\n").contains("<blockquote>"), "unknown keyword is not an alert");
+    // And with alerts OFF, even a valid marker is a literal blockquote.
+    let mut p = StreamParser::new();
+    p.append("> [!NOTE]\n> x\n");
+    p.finalize();
+    assert!(collect(&p).contains("<blockquote>"), "alerts off → plain blockquote");
+}
+
+/// Alerts converge under streaming: the block transitions Blockquote→Alert as
+/// `[!NOTE]` completes, and the finalized HTML matches a one-shot parse.
+#[test]
+fn issue_467_alert_streams_to_same_output() {
+    let md = "> [!WARNING]\n> Be careful.\n>\n> Second paragraph.\n";
+    assert_eq!(render_streamed(md), render(md));
+}
+
+/// The Blockquote→Alert transition (when `]` completes the marker) changes the
+/// block's kind, hence its stable ID. Verify that at *every* prefix the block
+/// list stays well-formed — ordered, non-overlapping, unique IDs — so the
+/// streaming UI never sees a duplicate or orphaned block during the flip.
+#[test]
+fn issue_467_alert_streaming_has_no_orphan_blocks() {
+    let md = "> [!NOTE]\n> body line one\n> body line two\n";
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    let mut buf = [0u8; 4];
+    for ch in md.chars() {
+        p.append(ch.encode_utf8(&mut buf));
+        let blocks: Vec<_> = p.all_blocks().collect();
+        let mut last_end = 0usize;
+        let mut ids = std::collections::HashSet::new();
+        for b in &blocks {
+            assert!(b.start >= last_end, "overlapping/disordered block mid-stream: {:?}",
+                blocks.iter().map(|x| (x.id, x.start, x.end)).collect::<Vec<_>>());
+            assert!(ids.insert(b.id), "duplicate block id mid-stream");
+            last_end = b.end;
+        }
+    }
+    p.finalize();
+    let blocks: Vec<_> = p.all_blocks().collect();
+    assert_eq!(blocks.len(), 1, "should converge to one block");
+    assert!(matches!(blocks[0].kind, BlockKind::Alert { .. }), "final kind: {:?}", blocks[0].kind);
+}
+
+/// #503: a partial image mid-stream (URL not yet closed) must degrade
+/// gracefully — render as literal text, never a broken `<img>` with a
+/// truncated `src`. Once the `)` arrives it becomes a real image.
+#[test]
+fn issue_503_partial_image_degrades_gracefully() {
+    let mut p = StreamParser::new();
+    p.append("![cat](http://example.com/cat");
+    let mid = collect(&p);
+    assert!(!mid.contains("<img"), "incomplete image must not render a broken <img>: {mid}");
+
+    p.append(".png)\n");
+    p.finalize();
+    let done = collect(&p);
+    assert!(
+        done.contains("<img src=\"http://example.com/cat.png\" alt=\"cat\""),
+        "completed image should render: {done}"
+    );
+}
+
+/// The original motivation: malformed / mid-stream markdown must degrade
+/// gracefully, never panic. Unclosed emphasis stays literal (per CommonMark);
+/// nothing crashes regardless of where the stream is cut.
+#[test]
+fn malformed_and_partial_input_never_panics() {
+    for md in [
+        "**unclosed bold",
+        "_em without close",
+        "`code without close",
+        "[link](http://x.com",
+        "> quote\n> more",
+        "| a | b |\n| - |",
+        "###### \n",
+        "~~~",
+        "1. item\n   - nested\n\n     lazy",
+    ] {
+        let _ = render(md);
+        let _ = render_streamed(md);
+    }
+    // Unclosed strong emphasis renders as literal text, not a dangling tag.
+    assert_eq!(render("**unclosed bold\n"), "<p>**unclosed bold</p>");
+}

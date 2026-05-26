@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Rust build output
+target/
+crates/*/target/
+
+# Web build output
+web/dist/
+*.tsbuildinfo
+
+# Generated WASM is built on demand (see packages/flux-md/src/wasm/.gitignore)
+
+# Editor / OS
+.DS_Store
+*.local

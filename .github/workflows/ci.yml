@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust core (CommonMark 0.31 + GFM + footnotes + security)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/flux-md-core
+      - name: cargo test (enforces the 652/652 + GFM floors)
+        working-directory: crates/flux-md-core
+        env:
+          CMARK_MIN_PASS: "652"
+          GFM_MIN_PASS: "23"
+        run: cargo test --release
+
+  js:
+    name: WASM build + JS package (types, component/pool/store tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/flux-md-core
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Build WASM
+        run: bun run build:wasm
+      - name: Typecheck the package
+        working-directory: packages/flux-md
+        run: bunx tsc --noEmit -p tsconfig.json
+      - name: Component / pool / store tests
+        run: bun run test:components
+      - name: Web build
+        run: bun run build:web
