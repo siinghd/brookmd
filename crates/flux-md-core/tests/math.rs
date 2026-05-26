@@ -72,6 +72,19 @@ fn inline_display_dollar_stays_inline() {
 }
 
 #[test]
+fn math_mid_paragraph_is_pure_inline() {
+    // Math that is NOT at a line start never reaches the block scanner — it
+    // goes straight through the inline parser. Both `$$…$$` (display) and
+    // `\(…\)` (inline) must render in place inside the surrounding paragraph.
+    let dollars = render("the identity $$e^{i\\pi} = -1$$ is famous\n");
+    assert!(dollars.contains("the identity <span class=\"math math-display\">e^{i\\pi} = -1</span> is famous"), "{dollars}");
+    assert!(dollars.starts_with("<p>") && dollars.ends_with("</p>"), "{dollars}");
+
+    let paren = render("recall \\(a + b\\) before\n");
+    assert!(paren.contains("recall <span class=\"math math-inline\">a + b</span> before"), "{paren}");
+}
+
+#[test]
 fn math_body_is_html_escaped_not_markdown() {
     // `<`, `&`, `"` escaped; `*emph*` and `_x_` inside math are NOT processed.
     let out = render("$a < b & *c*$\n");

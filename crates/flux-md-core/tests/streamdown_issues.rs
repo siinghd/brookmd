@@ -171,6 +171,55 @@ fn issue_522_latex_math_delimiters() {
     assert!(!dollars.contains("<em>"), "math body must not be emphasized: {dollars}");
 }
 
+/// Streaming a `$$…$$` block flips the active block's kind (Paragraph →
+/// MathFence) the moment the second `$` arrives, which changes its stable ID.
+/// As with the Blockquote→Alert flip (#467), verify that at *every* prefix the
+/// block list stays well-formed — ordered, non-overlapping, unique IDs — so the
+/// UI never sees a duplicate or orphaned block during the transition. (Mirrors
+/// `issue_467_alert_streaming_has_no_orphan_blocks`.)
+#[test]
+fn issue_522_math_streaming_has_no_orphan_blocks() {
+    fn assert_well_formed(p: &StreamParser) {
+        let blocks: Vec<_> = p.all_blocks().collect();
+        let mut last_end = 0usize;
+        let mut ids = std::collections::HashSet::new();
+        for b in &blocks {
+            assert!(
+                b.start >= last_end,
+                "overlapping/disordered block mid-stream: {:?}",
+                blocks.iter().map(|x| (x.id, x.start, x.end)).collect::<Vec<_>>()
+            );
+            assert!(ids.insert(b.id), "duplicate block id mid-stream");
+            last_end = b.end;
+        }
+    }
+
+    // (a) A multi-line display block converges to exactly one MathBlock.
+    let md = "$$\n\\sum_{i=1}^{n} x_i\n$$\n";
+    let mut p = StreamParser::new().with_gfm_math(true);
+    let mut buf = [0u8; 4];
+    for ch in md.chars() {
+        p.append(ch.encode_utf8(&mut buf));
+        assert_well_formed(&p);
+    }
+    p.finalize();
+    let blocks: Vec<_> = p.all_blocks().collect();
+    assert_eq!(blocks.len(), 1, "should converge to one block: {blocks:?}");
+    assert!(matches!(blocks[0].kind, BlockKind::MathBlock), "final kind: {:?}", blocks[0].kind);
+
+    // (b) Prose around a math block: the active tail flips kind as `$$` opens
+    // and closes, while the surrounding paragraphs must never overlap it.
+    let md = "before\n$$\nx = 1\n$$\nafter\n";
+    let mut q = StreamParser::new().with_gfm_math(true);
+    for ch in md.chars() {
+        q.append(ch.encode_utf8(&mut buf));
+        assert_well_formed(&q);
+    }
+    q.finalize();
+    let kinds: Vec<_> = q.all_blocks().map(|b| b.kind.tag()).collect();
+    assert_eq!(kinds, vec!["Paragraph", "MathBlock", "Paragraph"], "got: {kinds:?}");
+}
+
 /// #503: a partial image mid-stream (URL not yet closed) must degrade
 /// gracefully — render as literal text, never a broken `<img>` with a
 /// truncated `src`. Once the `)` arrives it becomes a real image.
