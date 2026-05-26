@@ -10,12 +10,14 @@ Built because [Streamdown](https://streamdown.ai) crashes the main thread when y
 bun add flux-md     # or: npm i flux-md / pnpm add flux-md
 ```
 
-flux-md ships as **source** (TypeScript + the compiled WASM), so you need a
-bundler that transpiles it and understands `?url` imports for the WASM asset —
-**Vite** is the reference setup (esbuild via `vite-plugin-wasm`, or Webpack with
-`file-loader`, also work). It is **browser-only** (it constructs Web Workers);
-it does not run under SSR/RSC. `react` is an optional peer dependency — only
-needed if you import `flux-md/react`.
+flux-md ships as **source** (TypeScript + the compiled WASM). The worker and
+WASM asset are referenced with the **web-standard `new URL(asset,
+import.meta.url)`** pattern, so any bundler with asset-module support resolves
+them: **Vite** (the reference setup), **webpack 5**, **Rollup** (with asset
+modules), and **Parcel**. Next.js (webpack/turbopack) should work but is
+untested — file an issue if it doesn't. It is **browser-only** (it constructs
+Web Workers); it does not run under SSR/RSC. `react` is an optional peer
+dependency — only needed if you import `flux-md/react`.
 
 ## Quick start
 

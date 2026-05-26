@@ -1,9 +1,12 @@
 /// <reference lib="webworker" />
 import init, { FluxParser } from "./wasm/flux_md_core.js";
-// Vite returns a URL for the WASM asset; we pass it to init().
-// @ts-ignore — Vite-specific import suffix
-import wasmUrl from "./wasm/flux_md_core_bg.wasm?url";
 import type { FromWorker, ParserConfig, Patch, ToWorker } from "./types";
+
+// Resolve the WASM asset with the *web-standard* `new URL(asset,
+// import.meta.url)` pattern (not Vite's `?url` suffix), so the package works in
+// any bundler with asset-module support — Vite, webpack 5, Rollup, Parcel.
+// wasm-bindgen's init() fetches a URL instance directly.
+const wasmUrl = new URL("./wasm/flux_md_core_bg.wasm", import.meta.url);
 
 // One worker multiplexes many streams: a parser per stream id (the worker
 // pool). WASM is loaded once for the whole worker, shared by every parser.

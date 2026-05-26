@@ -30,10 +30,12 @@ npm login                 # or set NPM_TOKEN in CI for automated release
 npm publish               # prepublishOnly rebuilds the WASM first
 ```
 
-## Known limitation (follow-up, not a blocker)
+## Distribution note (not a blocker)
 
-The package is distributed as **source** (`main`/`exports` point at `.ts`/`.tsx`)
-and relies on Vite-style `?url` WASM imports, so consumers must use a compatible
-bundler (see the README "Install" note). Emitting a pre-bundled `dist/` (e.g.
-via `tsup`) that works across more bundlers is a sensible next iteration; it
-does not block a Vite-targeted 0.2.0 release.
+The package is distributed as **source** (`main`/`exports` point at `.ts`/`.tsx`).
+The worker + WASM use the web-standard `new URL(asset, import.meta.url)` pattern,
+so they resolve in any bundler with asset-module support (Vite, webpack 5,
+Rollup, Parcel) — not just Vite. Next.js is untested. If a real consumer hits a
+bundler without `new URL` asset support (e.g. raw no-bundler ESM, or older
+esbuild used directly), the fallback is an inline-everything `dist/` build
+(base64 WASM + Blob-URL worker) — kept on the shelf, not built speculatively.
