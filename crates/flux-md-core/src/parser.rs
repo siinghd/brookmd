@@ -9,13 +9,15 @@ use crate::render::{
     render_footnote_section, LinkRef, RenderOpts,
 };
 use crate::blocks::BlockKind;
-use crate::scanner::{parse_link_ref_def, scan, RawBlockKind, RawBlock};
+use crate::scanner::{parse_link_ref_def, scan, RawBlockKind, RawBlock, ScanCtx};
 
 /// Collect link reference definitions from `text` into `refs`, recursing into
-/// block quotes and list items (definitions are document-wide, §4.7).
-fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>) {
+/// block quotes and list items (definitions are document-wide, §4.7). `ctx`
+/// keeps the block split identical to the render-time scan (e.g. a `$$…$$`
+/// math fence stays one block instead of being mis-read).
+fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx) {
     let bytes = text.as_bytes();
-    for raw in scan(text) {
+    for raw in scan(text, ctx) {
         match &raw.kind {
             RawBlockKind::LinkRefDefinition => {
                 if let Some(((label, url, title), _)) = parse_link_ref_def(bytes, raw.range.start) {
@@ -24,14 +26,14 @@ fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>) {
             }
             RawBlockKind::Blockquote => {
                 let inner = blockquote_inner(&text[raw.range.clone()]);
-                collect_refs(&inner, refs);
+                collect_refs(&inner, refs, ctx);
             }
             RawBlockKind::List { .. } => {
                 // Re-split the list into items and recurse into each body.
                 let slice = &text[raw.range.clone()];
                 for item in split_list_items(slice) {
                     if let Some(body) = item_body(item.as_bytes()) {
-                        collect_refs(&body, refs);
+                        collect_refs(&body, refs, ctx);
                     }
                 }
             }
@@ -105,6 +107,7 @@ pub struct StreamParser {
     gfm_autolinks: bool,
     gfm_alerts: bool,
     gfm_footnotes: bool,
+    gfm_math: bool,
 }
 
 #[derive(Default)]
@@ -131,6 +134,7 @@ impl StreamParser {
             gfm_autolinks: false,
             gfm_alerts: false,
             gfm_footnotes: false,
+            gfm_math: false,
         }
     }
 
@@ -176,6 +180,22 @@ impl StreamParser {
         self.gfm_footnotes = on;
     }
 
+    /// Enable math: `$…$` / `\(…\)` inline and `$$…$$` / `\[…\]` display math.
+    /// Off by default so `$` in ordinary prose (and currency like `$5`) stays
+    /// literal. Inline uses the pandoc rule for `$` (the opener has a non-space
+    /// to its right, the closer a non-space to its left and no digit after it),
+    /// so `$5 and $10` is not treated as math. The HTML carries the LaTeX in
+    /// `<span class="math math-inline">` / `<div class="math math-display">` for
+    /// KaTeX (bring your own renderer — flux-md stays zero-dep).
+    pub fn with_gfm_math(mut self, on: bool) -> Self {
+        self.gfm_math = on;
+        self
+    }
+
+    pub fn set_gfm_math(&mut self, on: bool) {
+        self.gfm_math = on;
+    }
+
     pub fn set_unsafe_html(&mut self, on: bool) {
         self.unsafe_html = on;
     }
@@ -219,14 +239,15 @@ impl StreamParser {
         let tail_start = self.committed_offset;
         let tail = &self.buffer[tail_start..];
 
-        let raw_blocks = scan(tail);
+        let ctx = ScanCtx { math: self.gfm_math };
+        let raw_blocks = scan(tail, ctx);
 
         // Pre-pass: build the ref table for this render. Permanent definitions
         // from the committed region win (first-definition-wins); definitions in
         // the tail are layered on top, recomputed fresh each reparse so a
         // half-typed definition in the growing tail can't get stuck.
         let mut refs = self.committed_refs.clone();
-        collect_refs(tail, &mut refs);
+        collect_refs(tail, &mut refs, ctx);
 
         // Renderable blocks: skip link-ref defs (no output) and, when footnotes
         // are on, footnote definitions (collected into the section instead).
@@ -255,6 +276,7 @@ impl StreamParser {
             in_link: false,
             gfm_autolinks: self.gfm_autolinks,
             gfm_alerts: self.gfm_alerts,
+            gfm_math: self.gfm_math,
             gfm_footnotes,
             footnotes: fn_nums.clone(),
             // Seed the per-label occurrence counter from the committed counts so
@@ -290,7 +312,11 @@ impl StreamParser {
 
         let buffer_ends_blank = self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n");
         let last_is_open_fence = renderable.last().map_or(false, |b| {
-            matches!(b.kind, RawBlockKind::CodeFence { terminated: false, .. })
+            matches!(
+                b.kind,
+                RawBlockKind::CodeFence { terminated: false, .. }
+                    | RawBlockKind::MathFence { terminated: false }
+            )
         });
         // A trailing list, block quote, indented code, or open HTML block can
         // *resume* after a blank line (loose lists, lazy continuations, code
@@ -395,7 +421,7 @@ impl StreamParser {
             // tables, and lock in footnote numbers (so committed <sup>N</sup>
             // values never shift as the tail grows).
             let committed_slice = &self.buffer[tail_start..tail_start + last_raw_end_to_commit];
-            collect_refs(committed_slice, &mut self.committed_refs);
+            collect_refs(committed_slice, &mut self.committed_refs, ctx);
             if gfm_footnotes {
                 collect_footnote_refs(
                     committed_slice,

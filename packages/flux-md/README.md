@@ -93,6 +93,7 @@ const client = new FluxClient({
     gfmAutolinks: true,   // bare www./http(s):// URLs + emails → links (default true)
     gfmAlerts: true,      // > [!NOTE] → callouts (default true)
     gfmFootnotes: true,   // [^1] + [^1]: → footnote section (default false)
+    gfmMath: true,        // $…$ / \(…\) inline + $$…$$ / \[…\] display math (default false)
     unsafeHtml: false,    // pass raw HTML through (default false — keep it false for untrusted input)
   },
 });
@@ -112,6 +113,22 @@ definition lists **one backref per reference**. Remaining v1 limits:
 single-block definitions (no continuation-indent / multi-paragraph) and no
 nested footnotes. The section uses GitHub-style markup
 (`<section class="footnotes">`, `<sup class="footnote-ref">`).
+
+**Math** (`gfmMath`) recognizes both delimiter families LLMs emit — `$…$` /
+`$$…$$` and LaTeX `\(…\)` / `\[…\]`. Inline math renders to
+`<span class="math math-inline">…</span>`, display math to
+`<div class="math math-display">…</div>` (and inline display to a `math-display`
+span), each carrying the **HTML-escaped LaTeX as its text content** — exactly
+what [KaTeX](https://katex.org)'s auto-render / `rehype-katex` consume. flux-md
+stays **zero-dep**: it produces the KaTeX-ready markup and never processes the
+body as markdown; you bring the KaTeX pass (or override `components.MathBlock`,
+which receives the raw LaTeX as `text`). Single `$` uses the **pandoc rule** so
+prose and currency stay literal — the opener needs a non-space to its right, the
+closer a non-space to its left and no digit after it, so `$5 and $10` is **not**
+math. A `$$`/`\[` block is **blank-line tolerant** (multi-line `\begin{aligned}…`
+stays one block) and renders incrementally while streaming, like a code fence.
+Off by default (so `$` in plain prose is untouched) — enable it per stream when
+your model emits LaTeX.
 
 ### `FluxMarkdown` (React)
 
@@ -219,10 +236,11 @@ const html = highlight("const x = 1;", "ts");
 **CommonMark 0.31: 100% (652/652 spec examples)** — every section, including
 the hard ones (nested/loose lists, link reference definitions, link precedence,
 lazy blockquote continuation). Plus GFM extensions: tables, strikethrough, task
-lists, extended autolinks, GitHub alerts (`> [!NOTE]` → styled callouts), and
-footnotes (`[^1]` + `[^1]:`). Autolinks/alerts/footnotes are opt-in per stream
-(see [Per-stream config](#per-stream-config)); the demo turns them on. See
-`crates/flux-md-core/tests/{cmark_spec,gfm_spec,footnotes}.rs` for runners and floors.
+lists, extended autolinks, GitHub alerts (`> [!NOTE]` → styled callouts),
+footnotes (`[^1]` + `[^1]:`), and math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`).
+Autolinks and alerts are on by default; footnotes and math are opt-in per stream
+(see [Per-stream config](#per-stream-config)). See
+`crates/flux-md-core/tests/{cmark_spec,gfm_spec,footnotes,math}.rs` for runners and floors.
 
 GitHub alerts render to GitHub-compatible markup
 (`<div class="markdown-alert markdown-alert-note">…`), so existing markdown CSS
@@ -238,10 +256,11 @@ By design, not yet, or only partially:
 - **Forward link references when streaming** — a `[ref]` used *before* its later
   `[ref]: url` definition can't resolve until the definition arrives; one-shot
   parsing handles it fully, streaming converges once the definition streams in.
-- **Footnotes**, **definition lists**, **inline math `$x$`** — out of scope for v1.
-- **KaTeX/Mermaid rendering** — flux-md gives you a `MathBlock` / `Mermaid` slot
-  that renders source-text; bring your own renderer (or a `components.Mermaid` /
-  `components.MathBlock` override) if you want SVG/MathML output.
+- **Definition lists** — out of scope for v1.
+- **KaTeX / Mermaid rendering** — flux-md emits KaTeX-ready math markup
+  (`<span>`/`<div class="math …">` with `gfmMath` on) and a `Mermaid` slot, but
+  stays zero-dep: bring your own KaTeX / mermaid pass (or a `components.MathBlock`
+  / `components.Mermaid` override) for the actual SVG/MathML output.
 - **Syntax highlighting on open code blocks** — deferred until close. This is a
   deliberate perf choice.
 

@@ -100,6 +100,15 @@ impl FluxParser {
     pub fn set_gfm_footnotes(&mut self, on: bool) {
         self.inner.set_gfm_footnotes(on);
     }
+
+    /// Enable math: `$…$` / `\(…\)` inline and `$$…$$` / `\[…\]` display math.
+    /// Off by default (so `$` in prose / currency stays literal). The emitted
+    /// HTML carries the LaTeX in `<span class="math math-inline">` /
+    /// `<div class="math math-display">` for a KaTeX pass on the JS side.
+    #[wasm_bindgen(js_name = setGfmMath)]
+    pub fn set_gfm_math(&mut self, on: bool) {
+        self.inner.set_gfm_math(on);
+    }
 }
 
 impl Default for FluxParser {

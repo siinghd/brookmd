@@ -84,15 +84,30 @@ function FluxMarkdownImpl({ client, components, virtualize, stickToBottom }: Flu
 
 export const FluxMarkdown = memo(FluxMarkdownImpl);
 
-function decodeCodeText(html: string): string {
-  const m = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
-  if (!m) return "";
-  return m[1]
+function decodeEntities(s: string): string {
+  return s
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"')
     .replace(/&#39;/g, "'")
     .replace(/&amp;/g, "&");
+}
+
+function decodeCodeText(html: string): string {
+  const m = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
+  return m ? decodeEntities(m[1]) : "";
+}
+
+/**
+ * The LaTeX source for a MathBlock. Display math (`$$…$$` / `\[…\]`) renders as
+ * `<div class="math math-display">…</div>`; a fenced ```math block renders as
+ * `<pre><code>…</code></pre>`. Either way the body is the HTML-escaped LaTeX —
+ * decode it back so a `components.MathBlock` override gets the raw source.
+ */
+function decodeMathText(html: string): string {
+  const d = html.match(/<div class="math math-display">([\s\S]*?)<\/div>/);
+  if (d) return decodeEntities(d[1]);
+  return decodeCodeText(html);
 }
 
 function blockKindProps(block: Block): BlockComponentProps {
@@ -107,7 +122,7 @@ function blockKindProps(block: Block): BlockComponentProps {
     props.text = decodeCodeText(block.html);
     props.language = data?.lang ?? "";
   } else if (block.kind.type === "MathBlock") {
-    props.text = decodeCodeText(block.html);
+    props.text = decodeMathText(block.html);
   }
   return props;
 }

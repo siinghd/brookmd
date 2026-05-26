@@ -249,6 +249,48 @@ test("Alert with no override renders the GitHub-compatible HTML", () => {
   expect(out).toContain("flux-block-alert");
 });
 
+test("MathBlock ($$ display) override receives decoded LaTeX as text", () => {
+  let props: any = null;
+  const b = block({
+    kind: { type: "MathBlock" },
+    html: '<div class="math math-display">E = mc^2 \\text{ where } a &lt; b</div>',
+  });
+  render(
+    createElement(FluxMarkdown, {
+      client: fakeClient([b]),
+      components: { MathBlock: (p: any) => ((props = p), createElement("div", null, p.text)) },
+    }),
+  );
+  // Display-math HTML is `<div class="math math-display">`; the override must
+  // still get the raw LaTeX (entities decoded back).
+  expect(props.text).toBe("E = mc^2 \\text{ where } a < b");
+});
+
+test("MathBlock (```math fence) override still receives decoded code text", () => {
+  let props: any = null;
+  const b = block({
+    kind: { type: "MathBlock" },
+    html: '<pre><code class="language-math" data-lang="math">\\frac{1}{2}</code></pre>',
+  });
+  render(
+    createElement(FluxMarkdown, {
+      client: fakeClient([b]),
+      components: { MathBlock: (p: any) => ((props = p), createElement("div", null, p.text)) },
+    }),
+  );
+  expect(props.text).toBe("\\frac{1}{2}");
+});
+
+test("MathBlock with no override renders the math-display markup", () => {
+  const b = block({
+    kind: { type: "MathBlock" },
+    html: '<div class="math math-display">x^2</div>',
+  });
+  const out = render(createElement(FluxMarkdown, { client: fakeClient([b]) }));
+  expect(out).toContain('class="math math-display"');
+  expect(out).toContain("x^2");
+});
+
 // ---------------------------------------------------------------------------
 // Virtualization (content-visibility for long docs)
 // ---------------------------------------------------------------------------

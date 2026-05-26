@@ -76,6 +76,13 @@ export interface ParserConfig {
   gfmAlerts?: boolean;
   /** GFM footnotes (`[^1]` + `[^1]:` → footnote section). Default false. */
   gfmFootnotes?: boolean;
+  /**
+   * Math: `$…$` / `\(…\)` inline and `$$…$$` / `\[…\]` display. Default false
+   * (so `$` in prose / currency stays literal). Emits KaTeX-ready markup
+   * (`<span class="math math-inline">` / `<div class="math math-display">`)
+   * carrying the LaTeX — bring your own KaTeX pass (flux-md stays zero-dep).
+   */
+  gfmMath?: boolean;
   /** Pass raw HTML through unescaped. Default false. **Never enable for untrusted input.** */
   unsafeHtml?: boolean;
 }

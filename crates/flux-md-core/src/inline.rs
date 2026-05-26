@@ -46,6 +46,28 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
         }
         let b = bytes[pos];
         match b {
+            // LaTeX inline math `\(…\)` and inline display `\[…\]` (math on).
+            // Probed before the generic backslash-escape arm because `(`/`[` are
+            // escapable; if there's no matching closer we fall back to the
+            // escape behavior (a literal `(` / `[`).
+            b'\\' if opts.gfm_math && bytes.get(pos + 1) == Some(&b'(') => {
+                match try_math_delim(bytes, pos, b"\\(", b"\\)", false, out) {
+                    Some(end) => pos = end,
+                    None => {
+                        push_escaped(b'(', out);
+                        pos += 2;
+                    }
+                }
+            }
+            b'\\' if opts.gfm_math && bytes.get(pos + 1) == Some(&b'[') => {
+                match try_math_delim(bytes, pos, b"\\[", b"\\]", true, out) {
+                    Some(end) => pos = end,
+                    None => {
+                        push_escaped(b'[', out);
+                        pos += 2;
+                    }
+                }
+            }
             b'\\' if pos + 1 < bytes.len() && ESCAPABLE.contains(&bytes[pos + 1]) => {
                 push_escaped(bytes[pos + 1], out);
                 pos += 2;
@@ -118,6 +140,15 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 } else {
                     out.push('[');
                     pos += 1;
+                }
+            }
+            b'$' if opts.gfm_math => {
+                match try_dollar_math(bytes, pos, out) {
+                    Some(end) => pos = end,
+                    None => {
+                        out.push('$');
+                        pos += 1;
+                    }
                 }
             }
             b'*' | b'_' | b'~' => {
@@ -419,6 +450,111 @@ fn trim_code_span(s: &[u8]) -> &[u8] {
     } else {
         s
     }
+}
+
+// ---------------------------------------------------------------------
+// Math (gated on opts.gfm_math)
+// ---------------------------------------------------------------------
+
+/// Emit `<span class="math math-(inline|display)">…</span>` carrying the
+/// HTML-escaped LaTeX. The body is never markdown-processed; KaTeX (or a
+/// `components.MathBlock`-style override) reads the LaTeX from text content.
+fn emit_inline_math(content: &[u8], display: bool, out: &mut String) {
+    let s = std::str::from_utf8(content).unwrap_or("");
+    out.push_str(if display {
+        "<span class=\"math math-display\">"
+    } else {
+        "<span class=\"math math-inline\">"
+    });
+    escape_html(s, out);
+    out.push_str("</span>");
+}
+
+/// LaTeX-delimited inline math: `\(…\)` (inline) or `\[…\]` (display). Returns
+/// the offset just past the closing delimiter, or None (no closer / empty body)
+/// so the caller can fall back to literal output. The body may span soft line
+/// breaks but not a blank line (which ends the paragraph).
+fn try_math_delim(
+    bytes: &[u8],
+    start: usize,
+    open: &[u8],
+    close: &[u8],
+    display: bool,
+    out: &mut String,
+) -> Option<usize> {
+    let content_start = start + open.len();
+    let mut i = content_start;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(close) {
+            if i == content_start {
+                return None; // empty `\(\)` — leave literal
+            }
+            emit_inline_math(&bytes[content_start..i], display, out);
+            return Some(i + close.len());
+        }
+        if bytes[i] == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
+            return None;
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Dollar-delimited inline math: `$…$` (inline) or `$$…$$` (display). Uses the
+/// pandoc disambiguation rule for single `$` so currency text stays literal:
+/// the opener must be followed by a non-space, and a closer is only valid when
+/// preceded by a non-space and not followed by an ASCII digit. Returns the
+/// offset past the closing run, or None to fall back to a literal `$`.
+fn try_dollar_math(bytes: &[u8], start: usize, out: &mut String) -> Option<usize> {
+    let mut run = 0;
+    while start + run < bytes.len() && bytes[start + run] == b'$' {
+        run += 1;
+    }
+    let display = run >= 2;
+    let n = if display { 2 } else { 1 };
+    let content_start = start + n;
+    if !display {
+        // Opener must have a non-space, non-EOL char to its right.
+        match bytes.get(content_start) {
+            None => return None,
+            Some(&c) if matches!(c, b' ' | b'\t' | b'\n' | b'\r') => return None,
+            _ => {}
+        }
+    }
+    let mut i = content_start;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let mut clen = 0;
+            while i + clen < bytes.len() && bytes[i + clen] == b'$' {
+                clen += 1;
+            }
+            if clen >= n {
+                let content_end = i;
+                if content_end == content_start {
+                    return None; // empty `$$` / `$ $`-style — leave literal
+                }
+                if !display {
+                    // pandoc: closer needs a non-space to its left and must not
+                    // be immediately followed by a digit.
+                    let prev = bytes[content_end - 1];
+                    let bad_left = matches!(prev, b' ' | b'\t' | b'\n' | b'\r');
+                    let bad_right = bytes.get(content_end + n).is_some_and(|b| b.is_ascii_digit());
+                    if bad_left || bad_right {
+                        i += clen;
+                        continue;
+                    }
+                }
+                emit_inline_math(&bytes[content_start..content_end], display, out);
+                return Some(content_end + n);
+            }
+            i += clen;
+        } else if bytes[i] == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
+            return None; // don't cross a blank line
+        } else {
+            i += 1;
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------

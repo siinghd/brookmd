@@ -14,6 +14,15 @@
 
 use core::ops::Range;
 
+/// Feature flags the scanner needs at block-detection time. Threaded through
+/// `scan` and the paragraph-interruption checks. All-false by default, so the
+/// scanner's behavior is byte-for-byte unchanged unless a flag is enabled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanCtx {
+    /// Recognize `$$…$$` / `\[…\]` display-math fences as standalone blocks.
+    pub math: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RawBlockKind {
     Heading { level: u8 },
@@ -26,6 +35,12 @@ pub enum RawBlockKind {
     /// `fence_char` is `'`'` or `'~'`. `fence_len` is the opening fence width.
     /// `terminated` is true iff a matching closing fence was found.
     CodeFence { info: String, fence_char: u8, fence_len: usize, terminated: bool },
+    /// Display-math fence: a block opening with `$$` or `\[` (after ≤3 spaces
+    /// of indent), closing at the matching `$$` / `\]`. Blank-line tolerant
+    /// like a code fence. `terminated` is true once the closer is seen; an
+    /// open one is kept speculative by the streaming parser. Only produced when
+    /// `ScanCtx::math` is set.
+    MathFence { terminated: bool },
     /// Code block formed by 4+ space indentation, no fence markers.
     IndentedCode,
     /// List as a whole. Items have their own ranges.
@@ -52,7 +67,7 @@ pub struct RawBlock {
     pub range: Range<usize>,
 }
 
-pub fn scan(input: &str) -> Vec<RawBlock> {
+pub fn scan(input: &str, ctx: ScanCtx) -> Vec<RawBlock> {
     let bytes = input.as_bytes();
     let mut pos = 0;
     let mut blocks = Vec::new();
@@ -66,6 +81,15 @@ pub fn scan(input: &str) -> Vec<RawBlock> {
 
         let start = pos;
 
+        // Display-math fence (`$$` / `\[`) is unambiguous — no other block
+        // opener begins with `$` or `\` — so it's safe to probe first.
+        if ctx.math {
+            if let Some(b) = scan_math_block(bytes, pos) {
+                pos = b.range.end;
+                blocks.push(b);
+                continue;
+            }
+        }
         if let Some(b) = scan_fence(bytes, pos) {
             pos = b.range.end;
             blocks.push(b);
@@ -96,23 +120,23 @@ pub fn scan(input: &str) -> Vec<RawBlock> {
             blocks.push(b);
             continue;
         }
-        if let Some(b) = scan_blockquote(bytes, pos) {
+        if let Some(b) = scan_blockquote(bytes, pos, ctx) {
             pos = b.range.end;
             blocks.push(b);
             continue;
         }
-        if let Some(b) = scan_list(bytes, pos) {
+        if let Some(b) = scan_list(bytes, pos, ctx) {
             pos = b.range.end;
             blocks.push(b);
             continue;
         }
-        if let Some(b) = scan_table(bytes, pos) {
+        if let Some(b) = scan_table(bytes, pos, ctx) {
             pos = b.range.end;
             blocks.push(b);
             continue;
         }
         // Default: paragraph.
-        let p = scan_paragraph(bytes, pos);
+        let p = scan_paragraph(bytes, pos, ctx);
         pos = p.range.end;
         blocks.push(p);
         if pos == start {
@@ -226,6 +250,63 @@ fn is_closing_fence(bytes: &[u8], start: usize, fence_char: u8, min_len: usize) 
     true
 }
 
+/// First index of `needle` within `haystack`, byte-wise.
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Display-math fence (CTX-gated). A line that begins (after ≤3 spaces) with
+/// `$$` or `\[` opens a display-math block. It closes either later on the same
+/// line (single-line `$$x$$`, which must be followed by only whitespace) or at
+/// a subsequent line containing the matching closer — blank-line tolerant, so
+/// multi-line LaTeX (e.g. `\begin{aligned}…`) is kept whole. An unterminated
+/// fence runs to end-of-input and is left open (the parser keeps it speculative
+/// during streaming, exactly like an open code fence).
+fn scan_math_block(bytes: &[u8], start: usize) -> Option<RawBlock> {
+    let line = line_slice(bytes, start);
+    let (indent, body) = strip_indent(line, 3);
+    if indent > 3 {
+        return None;
+    }
+    let (open, close): (&[u8], &[u8]) = if body.starts_with(b"$$") {
+        (b"$$", b"$$")
+    } else if body.starts_with(b"\\[") {
+        (b"\\[", b"\\]")
+    } else {
+        return None;
+    };
+    // Byte offset just past the opener within `line`.
+    let after_open = (line.len() - body.len()) + open.len();
+    let rest_of_line = &line[after_open..];
+    if let Some(rel) = find_subslice(rest_of_line, close) {
+        // Closer on the opening line: a clean single-line block only if nothing
+        // but whitespace follows it. Trailing prose (`$$x$$ and more`) means it
+        // isn't a standalone block — let the inline parser render it instead.
+        let after_close = &rest_of_line[rel + close.len()..];
+        if after_close.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r')) {
+            let end = line_end(bytes, start);
+            return Some(RawBlock { kind: RawBlockKind::MathFence { terminated: true }, range: start..end });
+        }
+        return None;
+    }
+    // Multi-line: walk subsequent lines (blanks included) for the closer.
+    let mut pos = line_end(bytes, start);
+    let mut terminated = false;
+    while pos < bytes.len() {
+        let l = line_slice(bytes, pos);
+        if find_subslice(l, close).is_some() {
+            pos = line_end(bytes, pos);
+            terminated = true;
+            break;
+        }
+        pos = line_end(bytes, pos);
+    }
+    Some(RawBlock { kind: RawBlockKind::MathFence { terminated }, range: start..pos })
+}
+
 fn scan_hr(bytes: &[u8], start: usize) -> Option<RawBlock> {
     let line = line_slice(bytes, start);
     let (indent, line) = strip_indent(line, 3);
@@ -311,7 +392,7 @@ fn strip_container_markers(mut c: &[u8]) -> &[u8] {
     }
 }
 
-fn scan_blockquote(bytes: &[u8], start: usize) -> Option<RawBlock> {
+fn scan_blockquote(bytes: &[u8], start: usize, ctx: ScanCtx) -> Option<RawBlock> {
     if !line_starts_with_marker(bytes, start, b'>') {
         return None;
     }
@@ -330,7 +411,7 @@ fn scan_blockquote(bytes: &[u8], start: usize) -> Option<RawBlock> {
             if is_blank_line(bytes, pos)
                 || fence.is_some()
                 || !para_open
-                || would_start_other_block(bytes, pos)
+                || would_start_other_block(bytes, pos, ctx)
             {
                 break;
             }
@@ -356,7 +437,7 @@ fn scan_blockquote(bytes: &[u8], start: usize) -> Option<RawBlock> {
             // indented code only continues an already-open paragraph.
             let inner = strip_container_markers(content);
             let inner_blank = inner.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
-            if inner_blank || would_start_other_block(inner, 0) {
+            if inner_blank || would_start_other_block(inner, 0, ctx) {
                 para_open = false;
             } else if indent_cols(inner) < 4 {
                 para_open = true;
@@ -368,7 +449,7 @@ fn scan_blockquote(bytes: &[u8], start: usize) -> Option<RawBlock> {
     Some(RawBlock { kind: RawBlockKind::Blockquote, range: start..pos })
 }
 
-fn scan_list(bytes: &[u8], start: usize) -> Option<RawBlock> {
+fn scan_list(bytes: &[u8], start: usize, ctx: ScanCtx) -> Option<RawBlock> {
     let first_line = line_slice(bytes, start);
     let first = scan_marker(first_line)?;
     let ordered = first.ordered;
@@ -460,7 +541,7 @@ fn scan_list(bytes: &[u8], start: usize) -> Option<RawBlock> {
         }
         // A shallower line that would itself open a new block ends the list;
         // otherwise it is a lazy paragraph continuation of the current item.
-        if would_start_other_block(bytes, pos) {
+        if would_start_other_block(bytes, pos, ctx) {
             break;
         }
         cur_empty = false;
@@ -670,7 +751,7 @@ pub(crate) fn indent_cols(line: &[u8]) -> usize {
     col
 }
 
-fn scan_table(bytes: &[u8], start: usize) -> Option<RawBlock> {
+fn scan_table(bytes: &[u8], start: usize, ctx: ScanCtx) -> Option<RawBlock> {
     // Quick gate: needs `|` in the first line, AND second line must be a
     // delimiter row (`|---|---|` with optional alignment colons).
     let line = line_slice(bytes, start);
@@ -694,7 +775,7 @@ fn scan_table(bytes: &[u8], start: usize) -> Option<RawBlock> {
         // A blank line or a line that starts another block ends the table; any
         // other line (even one without pipes) is a data row, normalized to the
         // header's column count by the renderer (§GFM).
-        if is_blank_line(bytes, pos) || would_start_other_block(bytes, pos) {
+        if is_blank_line(bytes, pos) || would_start_other_block(bytes, pos, ctx) {
             break;
         }
         pos = line_end(bytes, pos);
@@ -755,7 +836,7 @@ fn is_table_delimiter_row(line: &[u8]) -> bool {
     saw_dash && saw_pipe
 }
 
-fn scan_paragraph(bytes: &[u8], start: usize) -> RawBlock {
+fn scan_paragraph(bytes: &[u8], start: usize, ctx: ScanCtx) -> RawBlock {
     let mut pos = line_end(bytes, start);
     while pos < bytes.len() {
         if is_blank_line(bytes, pos) {
@@ -770,7 +851,7 @@ fn scan_paragraph(bytes: &[u8], start: usize) -> RawBlock {
                 range: start..end,
             };
         }
-        if would_start_other_block(bytes, pos) {
+        if would_start_other_block(bytes, pos, ctx) {
             break;
         }
         pos = line_end(bytes, pos);
@@ -925,9 +1006,10 @@ fn line_starts_with_marker(bytes: &[u8], start: usize, marker: u8) -> bool {
     !body.is_empty() && body[0] == marker
 }
 
-fn would_start_other_block(bytes: &[u8], start: usize) -> bool {
+fn would_start_other_block(bytes: &[u8], start: usize, ctx: ScanCtx) -> bool {
     scan_heading(bytes, start).is_some()
         || scan_fence(bytes, start).is_some()
+        || (ctx.math && scan_math_block(bytes, start).is_some())
         || scan_hr(bytes, start).is_some()
         || scan_html_block_interrupting(bytes, start)
         || line_starts_with_marker(bytes, start, b'>')

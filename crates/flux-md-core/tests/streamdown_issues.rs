@@ -149,6 +149,28 @@ fn issue_467_alert_streaming_has_no_orphan_blocks() {
     assert!(matches!(blocks[0].kind, BlockKind::Alert { .. }), "final kind: {:?}", blocks[0].kind);
 }
 
+/// #522: LaTeX math delimiters `\(…\)` (inline) and `\[…\]` (display) — plus
+/// `$…$` / `$$…$$` — must be recognized as math, not mangled as emphasis or
+/// escaped parentheses. flux-md renders them to KaTeX-ready markup and keeps
+/// the LaTeX body verbatim (HTML-escaped, never markdown-processed).
+#[test]
+fn issue_522_latex_math_delimiters() {
+    let mut p = StreamParser::new().with_gfm_math(true);
+    p.append("inline \\(a_1 + b_2\\) and display:\n\n\\[\n\\sum_{i=1}^{n} i\n\\]\n");
+    p.finalize();
+    let out = collect(&p);
+    assert!(out.contains("<span class=\"math math-inline\">a_1 + b_2</span>"), "got: {out}");
+    assert!(out.contains("<div class=\"math math-display\">\\sum_{i=1}^{n} i</div>"), "got: {out}");
+
+    // `$…$` underscores/carets are math, not `<em>`/`<sub>`.
+    let mut q = StreamParser::new().with_gfm_math(true);
+    q.append("$a_i^2$\n");
+    q.finalize();
+    let dollars = collect(&q);
+    assert!(dollars.contains("<span class=\"math math-inline\">a_i^2</span>"), "got: {dollars}");
+    assert!(!dollars.contains("<em>"), "math body must not be emphasized: {dollars}");
+}
+
 /// #503: a partial image mid-stream (URL not yet closed) must degrade
 /// gracefully — render as literal text, never a broken `<img>` with a
 /// truncated `src`. Once the `)` arrives it becomes a real image.

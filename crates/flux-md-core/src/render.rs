@@ -9,6 +9,7 @@ use crate::blocks::{AlertKind, BlockKind};
 use crate::inline::render_inline;
 use crate::scanner::{
     indent_cols, is_blank_line, line_end, line_slice, scan, scan_marker, RawBlock, RawBlockKind,
+    ScanCtx,
 };
 use crate::url::{escape_attr, escape_html};
 
@@ -37,6 +38,10 @@ pub struct RenderOpts {
     /// (`<div class="markdown-alert …">`). Off by default so strict CommonMark
     /// output (a plain `<blockquote>`) is unchanged.
     pub gfm_alerts: bool,
+    /// Math: recognize `$…$` / `\(…\)` inline and `$$…$$` / `\[…\]` display
+    /// math. Off by default (so `$` in prose stays literal). The block-level
+    /// half is also gated in the scanner via [`ScanCtx::math`].
+    pub gfm_math: bool,
     /// GFM footnotes. Off by default. When on, an inline `[^label]` whose label
     /// appears in `footnotes` renders as a superscript link.
     pub gfm_footnotes: bool,
@@ -56,6 +61,13 @@ pub struct RenderOpts {
 impl RenderOpts {
     pub fn lookup(&self, label: &str) -> Option<&LinkRef> {
         self.refs.get(&normalize_label(label))
+    }
+
+    /// Scanner feature flags derived from these render options, so sub-blocks
+    /// (inside lists, block quotes, alerts) scan with the same feature set as
+    /// the top level.
+    pub(crate) fn scan_ctx(&self) -> ScanCtx {
+        ScanCtx { math: self.gfm_math }
     }
 }
 
@@ -136,6 +148,7 @@ pub fn classify(raw: &RawBlockKind, slice: &str, gfm_alerts: bool) -> BlockKind 
             }
         }
         RawBlockKind::IndentedCode => BlockKind::CodeBlock { lang: None },
+        RawBlockKind::MathFence { .. } => BlockKind::MathBlock,
         RawBlockKind::List { ordered, .. } => BlockKind::List { ordered: *ordered },
         RawBlockKind::Blockquote => BlockKind::Blockquote,
         RawBlockKind::Table => BlockKind::Table,
@@ -155,6 +168,7 @@ pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut S
             render_code_fence(slice, info, *fence_char, *fence_len, *terminated, out)
         }
         RawBlockKind::IndentedCode => render_indented_code(slice, out),
+        RawBlockKind::MathFence { terminated } => render_math_block(slice, *terminated, out),
         RawBlockKind::Blockquote => render_blockquote(slice, opts, out),
         RawBlockKind::List { ordered, start } => render_list(slice, *ordered, *start, opts, out),
         RawBlockKind::Table => render_table(slice, opts, out),
@@ -318,6 +332,39 @@ fn is_fence_close_line(line: &[u8]) -> bool {
     true
 }
 
+/// Display-math block (`$$…$$` / `\[…\]`). Emits `<div class="math
+/// math-display">` carrying the HTML-escaped LaTeX source — KaTeX auto-render
+/// (or a `components.MathBlock` override) consumes that `class` and reads the
+/// LaTeX from the element's text content. We never process the body as
+/// markdown. An open (still-streaming) block has no closer yet, so its content
+/// is everything after the opener.
+fn render_math_block(slice: &str, terminated: bool, out: &mut String) {
+    // Leading indent is ≤3 spaces (guaranteed by the scanner); trim it plus any
+    // trailing newline so we can match the opener delimiter.
+    let s = slice.trim_start_matches([' ', '\t']);
+    let (open, close): (&str, &str) = if s.starts_with("$$") {
+        ("$$", "$$")
+    } else if s.starts_with("\\[") {
+        ("\\[", "\\]")
+    } else {
+        // Defensive: scanner only produces these two openers.
+        ("", "")
+    };
+    let after_open = &s[open.len().min(s.len())..];
+    let content = if terminated && !close.is_empty() {
+        match after_open.rfind(close) {
+            Some(idx) => &after_open[..idx],
+            None => after_open,
+        }
+    } else {
+        after_open
+    };
+    let content = content.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    out.push_str("<div class=\"math math-display\">");
+    escape_html(content, out);
+    out.push_str("</div>");
+}
+
 fn render_setext_heading(slice: &str, level: u8, opts: &RenderOpts, out: &mut String) {
     let bytes = slice.as_bytes();
     let mut end = bytes.len();
@@ -434,7 +481,7 @@ fn render_blockquote(slice: &str, opts: &RenderOpts, out: &mut String) {
     }
     out.push_str("<blockquote>");
     // Ref defs render to nothing (their content was hoisted into the table).
-    let sub: Vec<_> = scan(&inner)
+    let sub: Vec<_> = scan(&inner, opts.scan_ctx())
         .into_iter()
         .filter(|b| !matches!(b.kind, RawBlockKind::LinkRefDefinition))
         .collect();
@@ -467,7 +514,7 @@ fn render_alert(inner: &str, kind: AlertKind, opts: &RenderOpts, out: &mut Strin
         Some(nl) => &inner[nl + 1..],
         None => "",
     };
-    let sub: Vec<_> = scan(body)
+    let sub: Vec<_> = scan(body, opts.scan_ctx())
         .into_iter()
         .filter(|b| !matches!(b.kind, RawBlockKind::LinkRefDefinition))
         .collect();
@@ -587,7 +634,7 @@ pub(crate) fn count_footnote_refs(text: &str, counts: &mut HashMap<String, usize
 /// Collect footnote definitions (label → rendered-inline HTML) from `text`.
 /// First definition wins.
 pub(crate) fn collect_footnote_defs(text: &str, defs: &mut HashMap<String, String>, opts: &RenderOpts) {
-    for raw in scan(text) {
+    for raw in scan(text, opts.scan_ctx()) {
         let slice = &text[raw.range.clone()];
         if !is_footnote_def_block(slice) {
             continue;
@@ -781,7 +828,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
     let mut loose = had_blank_between;
     if !loose {
         for win in item_starts.windows(2) {
-            if item_directly_loose(&bytes[win[0]..win[1]]) {
+            if item_directly_loose(&bytes[win[0]..win[1]], opts.scan_ctx()) {
                 loose = true;
                 break;
             }
@@ -816,7 +863,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
 /// whether any blank line sits in the gap between two consecutive blocks.
 /// Blanks inside a single block (fenced code, a nested list) are part of that
 /// child block and are invisible to this top-level scan, so they don't count.
-fn item_directly_loose(item: &[u8]) -> bool {
+fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
     let body = match item_body(item) {
         Some(b) => b,
         None => return false,
@@ -825,7 +872,7 @@ fn item_directly_loose(item: &[u8]) -> bool {
     if !tmp.ends_with('\n') {
         tmp.push('\n');
     }
-    let sub = scan(&tmp);
+    let sub = scan(&tmp, ctx);
     if sub.len() < 2 {
         return false;
     }
@@ -887,7 +934,7 @@ fn render_list_item(item: &[u8], ordered: bool, loose: bool, opts: &RenderOpts, 
     if !tmp.ends_with('\n') {
         tmp.push('\n');
     }
-    let sub = crate::scanner::scan(&tmp);
+    let sub = crate::scanner::scan(&tmp, opts.scan_ctx());
     if sub.is_empty() {
         // Empty item.
     } else if !loose && sub.len() == 1 && matches!(sub[0].kind, RawBlockKind::Paragraph) {
