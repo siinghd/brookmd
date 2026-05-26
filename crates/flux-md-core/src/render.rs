@@ -284,9 +284,20 @@ fn render_code_fence(
         ""
     };
 
+    push_code_fence_open(info, out);
+    escape_html(content, out);
+    if !content.is_empty() && !content.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("</code></pre>");
+}
+
+/// Emit a code-fence opening tag `<pre><code…>` for the given info string.
+/// Shared by the block renderer and the streaming-parser's incremental
+/// code-fence cache so their output can't drift. CommonMark §4.5: the info
+/// string is processed for backslash escapes and entity references.
+pub(crate) fn push_code_fence_open(info: &str, out: &mut String) {
     let lang_raw = info.split_whitespace().next().unwrap_or("");
-    // CommonMark §4.5: the info string is processed for backslash escapes
-    // and entity references.
     let lang = crate::url::decode_text(lang_raw);
     out.push_str("<pre><code");
     if !lang.is_empty() {
@@ -297,14 +308,14 @@ fn render_code_fence(
         out.push('"');
     }
     out.push('>');
-    escape_html(content, out);
-    if !content.is_empty() && !content.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("</code></pre>");
 }
 
-fn is_fence_close_line(line: &[u8]) -> bool {
+/// True if `line` (a body line, with or without its trailing newline) reads as
+/// a closing code fence: ≤3 leading spaces, then ≥3 `` ` `` or `~`, then only
+/// whitespace. The streaming cache bails to the full renderer on any such line
+/// — that covers the real closer *and* the rarer "fence-looking but not the
+/// closer" case the block renderer trims, so cached output can't diverge.
+pub(crate) fn is_fence_close_line(line: &[u8]) -> bool {
     let mut i = 0;
     while i < line.len() && line[i] == b' ' && i < 3 {
         i += 1;
