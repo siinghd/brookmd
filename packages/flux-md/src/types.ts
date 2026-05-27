@@ -9,7 +9,8 @@ export type BlockKindTag =
   | "Alert"
   | "Table"
   | "Rule"
-  | "Html";
+  | "Html"
+  | "Component";
 
 export interface BlockKind {
   type: BlockKindTag;
@@ -60,6 +61,10 @@ export interface BlockComponentProps {
   text?: string;
   /** Info-string language — present for `CodeBlock` (from `kind.data.lang`). */
   language?: string;
+  /** Component tag name — present for `Component` blocks (from `kind.data.tag`). */
+  tag?: string;
+  /** Sanitized attributes — present for `Component` blocks (from `kind.data.attrs`). */
+  attrs?: Record<string, string>;
 }
 
 /**
@@ -93,6 +98,16 @@ export interface ParserConfig {
   dirAuto?: boolean;
   /** Pass raw HTML through unescaped. Default false. **Never enable for untrusted input.** */
   unsafeHtml?: boolean;
+  /**
+   * Opt-in allowlist of custom component tag names (e.g. `["Thinking",
+   * "Callout"]`). A `<Tag>…</Tag>` whose name is listed renders as a component
+   * whose inner content is parsed as **markdown** — safely, without `unsafeHtml`
+   * (the tag is allowlisted and its attributes are sanitized: event handlers
+   * dropped, dangerous URL schemes neutralized). The block is dispatched on the
+   * React side via `components[tag]` (or `components.Component`). Empty/omitted =
+   * off. Names match case-sensitively.
+   */
+  componentTags?: string[];
 }
 
 // Each message carries a `streamId` so one worker can multiplex many parsers

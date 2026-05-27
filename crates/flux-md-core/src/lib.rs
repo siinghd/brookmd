@@ -118,6 +118,15 @@ impl FluxParser {
     pub fn set_dir_auto(&mut self, on: bool) {
         self.inner.set_dir_auto(on);
     }
+
+    /// Set the opt-in component-tag allowlist (e.g. `["Thinking", "Callout"]`).
+    /// A `<Tag>…</Tag>` whose name is listed renders as a component whose inner
+    /// content is markdown — safely, without unsafe HTML (the tag is allowlisted
+    /// and its attributes are sanitized). Empty by default (feature off).
+    #[wasm_bindgen(js_name = setComponentTags)]
+    pub fn set_component_tags(&mut self, tags: Vec<String>) {
+        self.inner.set_component_tags(tags);
+    }
 }
 
 impl Default for FluxParser {

@@ -117,12 +117,17 @@ function blockKindProps(block: Block): BlockComponentProps {
     open: block.open,
     speculative: block.speculative,
   };
-  const data = block.kind.data as { lang?: string | null } | undefined;
+  const data = block.kind.data as
+    | { lang?: string | null; tag?: string; attrs?: [string, string][] }
+    | undefined;
   if (block.kind.type === "CodeBlock") {
     props.text = decodeCodeText(block.html);
     props.language = data?.lang ?? "";
   } else if (block.kind.type === "MathBlock") {
     props.text = decodeMathText(block.html);
+  } else if (block.kind.type === "Component") {
+    props.tag = data?.tag ?? "";
+    props.attrs = Object.fromEntries(data?.attrs ?? []);
   }
   return props;
 }
@@ -138,6 +143,7 @@ function SafeHtml({ html, components }: { html: string; components: Components }
 const INTRINSIC_PX: Record<string, number> = {
   Paragraph: 80, Heading: 44, CodeBlock: 300, MathBlock: 140, Mermaid: 220,
   List: 120, Blockquote: 100, Alert: 120, Table: 200, Rule: 24, Html: 80,
+  Component: 120,
 };
 
 function BlockViewImpl(props: { block: Block; components?: Components; virtualize?: boolean }) {
@@ -161,8 +167,17 @@ function BlockViewImpl(props: { block: Block; components?: Components; virtualiz
 function renderBlockContent({ block, components }: { block: Block; components?: Components }) {
   const kind = block.kind.type;
 
-  // Block-kind override replaces the entire renderer for this block.
+  // Block-kind override replaces the entire renderer for this block. A
+  // `Component` block also dispatches on its tag name, so `components.Thinking`
+  // (the specific tag) wins over `components.Component` (the generic fallback).
   if (components) {
+    if (kind === "Component") {
+      const tag = (block.kind.data as { tag?: string } | undefined)?.tag;
+      const override = (tag && components[tag]) || components.Component;
+      if (override) {
+        return createElement(override, blockKindProps(block));
+      }
+    }
     const blockOverride = components[kind];
     if (blockOverride) {
       return createElement(blockOverride, blockKindProps(block));
