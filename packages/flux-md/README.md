@@ -105,6 +105,7 @@ const client = new FluxClient({
     gfmMath: true,        // $…$ / \(…\) inline + $$…$$ / \[…\] display math (default false)
     dirAuto: true,        // per-block dir="auto" for RTL/bidi text (default false)
     unsafeHtml: false,    // pass raw HTML through (default false — keep it false for untrusted input)
+    componentTags: ["Thinking", "Callout"], // custom tags with markdown inside (default none)
   },
 });
 ```
@@ -210,6 +211,44 @@ Rules worth knowing:
 - For **code blocks** the built-in highlighter is the default; it is bypassed
   (so your override wins) when you pass `components.CodeBlock`, `components.pre`,
   or `components.code`.
+
+### Component tags
+
+LLMs increasingly emit custom component tags like `<Thinking>…</Thinking>`. By
+default these are inert (escaped, or — with `unsafeHtml` — raw HTML whose body
+is *not* markdown). Opt in by allowlisting the tag names:
+
+```tsx
+const client = new FluxClient({ config: { componentTags: ["Thinking", "Callout"] } });
+```
+
+Now a listed tag is a **markdown container**: its inner content is parsed as
+markdown, it spans blank lines up to its matching close tag (not split like a
+raw HTML block), it nests, and a `</Tag>` inside a code fence stays content. It's
+**safe without `unsafeHtml`** — the tag is allowlisted and its attributes are
+sanitized (event handlers dropped, dangerous URL schemes → `#`).
+
+Each renders as a `Component` block. Override it in React by tag name (or with
+the generic `Component` fallback). The override receives `tag`, the sanitized
+`attrs`, and `html` — the **inner** (already-rendered markdown) HTML, so you can
+wrap it in your own element:
+
+```tsx
+<FluxMarkdown
+  client={client}
+  components={{
+    Thinking: ({ html }) => (
+      <details className="thinking">
+        <summary>Reasoning</summary>
+        <div dangerouslySetInnerHTML={{ __html: html }} />
+      </details>
+    ),
+  }}
+/>
+```
+
+With no override, the component renders as `<thinking …>…</thinking>` HTML.
+Tag names match case-sensitively; the feature is off unless `componentTags` is set.
 
 ### Types
 

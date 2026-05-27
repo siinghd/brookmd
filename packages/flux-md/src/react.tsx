@@ -128,8 +128,23 @@ function blockKindProps(block: Block): BlockComponentProps {
   } else if (block.kind.type === "Component") {
     props.tag = data?.tag ?? "";
     props.attrs = Object.fromEntries(data?.attrs ?? []);
+    // An override replaces the `<tag>` wrapper, so it gets the *inner* HTML
+    // (markdown already rendered) rather than the full wrapped block.
+    props.html = componentInnerHtml(block.html, props.tag);
   }
   return props;
+}
+
+/** Strip the `<tag …>` open and trailing `</tag>` from a component block's HTML,
+ *  leaving the inner (already-rendered markdown) HTML. Handles open (unclosed)
+ *  blocks, where there is no close tag yet. */
+function componentInnerHtml(html: string, tag: string): string {
+  const gt = html.indexOf(">");
+  if (gt < 0) return "";
+  let inner = html.slice(gt + 1);
+  const close = `</${tag}>`;
+  if (inner.endsWith(close)) inner = inner.slice(0, -close.length);
+  return inner.replace(/^\n/, "").replace(/\n$/, "");
 }
 
 /** Convert a closed block's HTML to a React tree, memoized on html+components. */

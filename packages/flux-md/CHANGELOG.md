@@ -6,6 +6,19 @@ Notable changes to flux-md. Format based on
 
 ## Unreleased
 
+### Added
+
+- **`componentTags`** — opt-in custom component tags. List tag names (e.g.
+  `componentTags: ['Thinking', 'Callout']`) and a `<Thinking>…</Thinking>` in the
+  stream renders as a component whose **inner content is parsed as markdown** —
+  safely, **without `unsafeHtml`**: the tag is allowlisted and its attributes are
+  sanitized (event handlers dropped, dangerous URL schemes neutralized). The
+  container spans blank lines (unlike a raw HTML block) up to its matching close
+  tag, supports nesting, and ignores a `</Tag>` inside a code fence. Each renders
+  as a `Component` block dispatched on the React side via `components[tag]` (e.g.
+  `components.Thinking`) or the generic `components.Component`, receiving `{ tag,
+  attrs, … }`. Off unless configured; tag names match case-sensitively.
+
 ### Performance
 
 - Streaming a long open display-math block (`$$…$$` / `\[…\]`) is now O(n)
