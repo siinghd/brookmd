@@ -1,6 +1,6 @@
-import { StreamLab } from "./components/StreamLab";
+import { Chat } from "./components/Chat";
 import "./styles.css";
 
 export default function App() {
-  return <StreamLab />;
+  return <Chat />;
 }
