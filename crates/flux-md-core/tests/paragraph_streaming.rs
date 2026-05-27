@@ -181,6 +181,40 @@ fn paragraph_termination_bails() {
 }
 
 #[test]
+fn closed_construct_interactions_parity() {
+    // The cache may now commit *past* closed constructs, so streamed == one-shot
+    // must hold across every emphasis/code/link interaction. (Pre-cache these
+    // pass trivially since the cache bails; they gate the boundary computation.)
+    let cases: &[&str] = &[
+        "**a** plain text **b** more text *c* end of the line here\n",
+        "*a *b* c*\n",
+        "*a **b** c*\n",
+        "***triple emphasis*** then plain words continue on for a while here\n",
+        "__intra_word__ text and some_snake_case_name and more words after it\n",
+        "*a_b_c* and then *d e f* with spaces inside the emphasis spans here\n",
+        "a `closed code span` then `another one with spaces` and plain text tail\n",
+        "an [inline link](http://x.com/path) then more text and *emphasis* after\n",
+        "[*emph in link text*](http://x.com) followed by plain words to the end\n",
+        "*_*_*_*_* rule of three chains then plain text continues here for a while\n",
+        "**", // bare delimiter run, degenerate
+        "*open with no close that just runs to the very end of this paragraph here\n",
+        "text `code with | pipes` and **bold | bar** mixing specials in constructs\n",
+    ];
+    for md in cases {
+        parity(md, &default);
+        parity(md, &all_on);
+    }
+    // Long emphasis-rich paragraph: the boundary should advance past each closed
+    // span, but parity must hold regardless.
+    let mut long = String::new();
+    for i in 0..150 {
+        long.push_str(&format!("sentence {i} continues with **bold {i}** and *italic* and `code{i}` words "));
+    }
+    long.push('\n');
+    parity(&long, &default);
+}
+
+#[test]
 fn dir_auto_paragraph_parity() {
     // The cached path must still produce <p dir="auto"> when bidi is on.
     let md = plain("", 300, "");
@@ -199,18 +233,22 @@ fn intermediate_prefix_matches_full_render() {
     // must match a fresh single-append parse of the same prefix (which always
     // takes the full-render path) — so the cache's *intermediate* output is
     // byte-identical too, not just the finalized result.
-    for md in [
-        plain("intro ", 120, "tail"),
-        format!("plain start {}*emph words*{}", plain("", 40, ""), plain(" ", 40, "")),
-    ] {
-        let mut streamed = StreamParser::new();
+    let cases: &[(&str, fn() -> StreamParser)] = &[
+        ("intro words then more words and a long plain tail that keeps going here", default),
+        ("plain prefix **bold span** then *italic* and `code span` then plain tail words", default),
+        ("words then a partial bare url www.exa being typed out char by char here", autolinks),
+        ("an [inline link](http://x.com) and then plain words continuing to the end", default),
+    ];
+    for &(md, mk) in cases {
+        let md = format!("{md}\n");
+        let mut streamed = mk();
         let mut buf = [0u8; 4];
         let mut at = 0usize;
         for ch in md.chars() {
             let s = ch.encode_utf8(&mut buf);
             streamed.append(s);
             at += s.len();
-            let mut oneshot = StreamParser::new();
+            let mut oneshot = mk();
             oneshot.append(&md[..at]);
             let a: String = streamed.all_blocks().map(|b| b.html.clone()).collect();
             let b: String = oneshot.all_blocks().map(|b| b.html.clone()).collect();

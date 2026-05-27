@@ -13,7 +13,7 @@ use crate::scanner::{
     is_blank_line, is_setext_underline, line_end, parse_link_ref_def, scan, would_start_other_block,
     RawBlock, RawBlockKind, ScanCtx,
 };
-use crate::inline::render_inline;
+use crate::inline::{render_inline, render_inline_boundary};
 use crate::url::escape_html;
 
 /// Collect link reference definitions from `text` into `refs`, recursing into
@@ -170,16 +170,6 @@ struct ParagraphCache {
     cut: usize,
     /// Rendered inline HTML of `buffer[start..cut]`.
     committed_inner: String,
-}
-
-/// Characters that begin an inline construct able to span an inter-word space,
-/// so a cut must never advance past one: emphasis/strike (`* _ ~`), code spans
-/// (`` ` ``), links/images (`[`), autolinks/inline-HTML (`<`). When math is on,
-/// `$…$` and `\(…\)` also span spaces, so `$` and `\` join the set. Deliberately
-/// NOT included: `& \ ! ] >` — they settle within a single token, and any
-/// partial lives in the trailing token, which is never committed.
-fn is_paragraph_blocker(b: u8, math: bool) -> bool {
-    matches!(b, b'*' | b'_' | b'~' | b'`' | b'[' | b'<') || (math && matches!(b, b'$' | b'\\'))
 }
 
 impl StreamParser {
@@ -723,16 +713,25 @@ impl StreamParser {
             return None;
         }
         let opts = self.build_inline_opts(&self.buffer[cache.start..content_end]);
-        // Advance the committed cut over newly-arrived blocker-free plain text.
-        let new_cut = paragraph_cut(bytes, cache.start, cache.cut, content_end, self.gfm_math);
-        if new_cut > cache.cut {
-            render_inline(&self.buffer[cache.cut..new_cut], &opts, &mut cache.committed_inner);
-            cache.cut = new_cut;
-        }
-        // Re-render the (short) active tail and assemble the paragraph, matching
-        // render_paragraph's `<p…>` opener and trailing-whitespace trim.
+        // Render the active region and learn how far of it is now settled — past
+        // closed emphasis / code spans / inline links, but not an unpaired opener
+        // or unclosed construct. `boundary_rel` is relative to the active slice.
         let mut active = String::new();
-        render_inline(&self.buffer[cache.cut..content_end], &opts, &mut active);
+        let boundary_rel =
+            render_inline_boundary(&self.buffer[cache.cut..content_end], &opts, &mut active);
+        let new_cut = cache.cut + boundary_rel;
+        if new_cut > cache.cut {
+            // Commit [cut..new_cut] by rendering that segment on its own — a clean
+            // boundary guarantees it equals its slice of the full render — then
+            // re-render the now-shorter active tail.
+            let mut seg = String::new();
+            render_inline(&self.buffer[cache.cut..new_cut], &opts, &mut seg);
+            cache.committed_inner.push_str(&seg);
+            cache.cut = new_cut;
+            active.clear();
+            render_inline(&self.buffer[cache.cut..content_end], &opts, &mut active);
+        }
+        // Assemble, matching render_paragraph's `<p…>` opener and trailing trim.
         let mut inner = String::with_capacity(cache.committed_inner.len() + active.len());
         inner.push_str(&cache.committed_inner);
         inner.push_str(&active);
@@ -806,64 +805,22 @@ fn build_code_fence_cache(
 }
 
 /// Arm the paragraph cache for the open paragraph at `start`, rendering its
-/// initial committed (plain) prefix once. `None` if there's no committable
-/// prefix yet (a blocker appears too early, or the paragraph is still short).
+/// initial settled prefix once. `None` if nothing is committable yet (the very
+/// first construct/word boundary hasn't settled, or the paragraph is still short).
 fn build_paragraph_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> Option<ParagraphCache> {
     let bytes = buffer.as_bytes();
     let mut content_end = bytes.len();
     while content_end > start && matches!(bytes[content_end - 1], b'\n' | b'\r') {
         content_end -= 1;
     }
-    let cut = paragraph_cut(bytes, start, start, content_end, opts.gfm_math);
+    let mut tmp = String::new();
+    let cut = start + render_inline_boundary(&buffer[start..content_end], opts, &mut tmp);
     if cut <= start {
         return None;
     }
     let mut committed_inner = String::new();
     render_inline(&buffer[start..cut], opts, &mut committed_inner);
     Some(ParagraphCache { start, id, cut, committed_inner })
-}
-
-/// Largest clean cut boundary in `(from, stable_in]`, where `stable_in` is the
-/// first paragraph-blocker at or after `from` (else `content_end`). Returns
-/// `from` when nothing can be committed. The committed region therefore never
-/// contains a space-spanning construct, and the cut never splits one.
-fn paragraph_cut(bytes: &[u8], start: usize, from: usize, content_end: usize, math: bool) -> usize {
-    let mut stable_in = content_end;
-    let mut i = from;
-    while i < content_end {
-        if is_paragraph_blocker(bytes[i], math) {
-            stable_in = i;
-            break;
-        }
-        i += 1;
-    }
-    // Scan down from stable_in for the largest valid boundary.
-    let mut p = stable_in;
-    while p > from {
-        if is_cut_boundary(bytes, start, p, content_end) {
-            return p;
-        }
-        p -= 1;
-    }
-    from
-}
-
-/// A position is a clean cut iff a word/line begins there with whitespace before
-/// it that can't be part of a multi-space hard break — i.e. right after a single
-/// inter-word space (preceded by a non-space) or right after a newline — and it
-/// is strictly before `content_end` (the trailing token is never committed).
-fn is_cut_boundary(bytes: &[u8], start: usize, p: usize, content_end: usize) -> bool {
-    if p <= start || p >= content_end {
-        return false;
-    }
-    if matches!(bytes[p], b' ' | b'\t' | b'\n' | b'\r') {
-        return false;
-    }
-    match bytes[p - 1] {
-        b'\n' => true,
-        b' ' => p >= start + 2 && !matches!(bytes[p - 2], b' ' | b'\t' | b'\n' | b'\r'),
-        _ => false,
-    }
 }
 
 /// True if the open paragraph beginning before `cut` actually ends somewhere in

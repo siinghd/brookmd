@@ -21,12 +21,67 @@ use crate::url::{escape_attr, escape_html, sanitize_image_url, sanitize_url};
 
 const ESCAPABLE: &[u8] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 
+/// Render an inline string to HTML. Thin wrapper over [`render_inline_core`]
+/// with boundary tracking off (zero overhead, byte-identical output).
 pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
+    render_inline_core(input, opts, out, false);
+}
+
+/// Like [`render_inline`], but also returns the largest *stable* input offset —
+/// the byte position up to which the rendered output is final regardless of any
+/// text appended after `input`. Used by the streaming parser to commit the
+/// settled prefix of a long open paragraph. Output is identical to
+/// `render_inline`; only the extra analysis runs.
+pub fn render_inline_boundary(input: &str, opts: &RenderOpts, out: &mut String) -> usize {
+    render_inline_core(input, opts, out, true)
+}
+
+/// A top-level position is a clean cut iff a word begins there right after a
+/// single inter-word space (preceded by a non-space) or right after a newline —
+/// never inside a multi-space hard-break run.
+fn is_boundary(bytes: &[u8], pos: usize) -> bool {
+    if pos == 0 || pos >= bytes.len() || matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        return false;
+    }
+    match bytes[pos - 1] {
+        b'\n' => true,
+        b' ' => pos >= 2 && !matches!(bytes[pos - 2], b' ' | b'\t' | b'\n' | b'\r'),
+        _ => false,
+    }
+}
+
+/// Largest boundary candidate that is stable: at/before any unstable construct
+/// (`unstable`), at/before any unpaired can-open emphasis opener (could pair
+/// forward), and not strictly inside any resolved emphasis pair `(a, b]`.
+fn compute_cut(candidates: &[usize], unstable: usize, stack: &[Delim], pairs: &[(usize, usize)]) -> usize {
+    let mut earliest_open = usize::MAX;
+    for d in stack {
+        if d.len > 0 && d.can_open && d.in_at < earliest_open {
+            earliest_open = d.in_at;
+        }
+    }
+    let limit = unstable.min(earliest_open);
+    let mut best = 0;
+    for &c in candidates {
+        if c > best && c <= limit && !pairs.iter().any(|&(a, b)| a < c && c <= b) {
+            best = c;
+        }
+    }
+    best
+}
+
+fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: bool) -> usize {
     let bytes = input.as_bytes();
     let mut pos = 0;
     let mut deli_stack: Vec<Delim> = Vec::new();
+    // Streaming boundary tracking (only populated when `track`).
+    let mut candidates: Vec<usize> = Vec::new();
+    let mut unstable = usize::MAX;
 
     while pos < bytes.len() {
+        if track && is_boundary(bytes, pos) {
+            candidates.push(pos);
+        }
         // GFM extended autolinks: bare www./http(s)://ftp:// URLs and email
         // addresses in text. Gated on a left boundary (start / whitespace /
         // `*_~(`) so we only probe at plausible starts.
@@ -54,6 +109,9 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 match try_math_delim(bytes, pos, b"\\(", b"\\)", false, out) {
                     Some(end) => pos = end,
                     None => {
+                        if track && pos < unstable {
+                            unstable = pos; // a later `\)` could form inline math
+                        }
                         push_escaped(b'(', out);
                         pos += 2;
                     }
@@ -63,6 +121,9 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 match try_math_delim(bytes, pos, b"\\[", b"\\]", true, out) {
                     Some(end) => pos = end,
                     None => {
+                        if track && pos < unstable {
+                            unstable = pos; // a later `\]` could form display math
+                        }
                         push_escaped(b'[', out);
                         pos += 2;
                     }
@@ -94,6 +155,10 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                     // No matching close for this backtick run: the whole run is
                     // literal. Emit all of it and advance past it, so its inner
                     // backticks aren't re-tried as a shorter opening run.
+                    // Unstable: a closer could still arrive and form a code span.
+                    if track && pos < unstable {
+                        unstable = pos;
+                    }
                     let mut run = 0;
                     while pos + run < bytes.len() && bytes[pos + run] == b'`' {
                         run += 1;
@@ -110,6 +175,10 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 } else if let Some(consumed) = try_inline_html(bytes, pos, opts, out) {
                     pos = consumed;
                 } else {
+                    // Unstable: a later `>` could form an autolink / inline HTML.
+                    if track && pos < unstable {
+                        unstable = pos;
+                    }
                     out.push_str("&lt;");
                     pos += 1;
                 }
@@ -132,12 +201,25 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                     if let Some(consumed) = fnref {
                         pos = consumed;
                     } else if let Some(consumed) = try_link(bytes, pos, opts, out) {
+                        // Settled: an inline `[text](url)` or a reference resolved
+                        // via `opts.refs`. (Safe to treat resolved refs as settled
+                        // because an *open paragraph* — the only block this cache
+                        // serves — defines no reference definitions of its own, and
+                        // first-definition-wins makes later doc defs non-overriding.)
                         pos = consumed;
                     } else {
+                        // Literal `[`: a later `](url)` or `[ref]` (or a forward
+                        // `[ref]: …` definition) could still turn it into a link.
+                        if track && pos < unstable {
+                            unstable = pos;
+                        }
                         out.push('[');
                         pos += 1;
                     }
                 } else {
+                    if track && pos < unstable {
+                        unstable = pos;
+                    }
                     out.push('[');
                     pos += 1;
                 }
@@ -146,6 +228,9 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 match try_dollar_math(bytes, pos, out) {
                     Some(end) => pos = end,
                     None => {
+                        if track && pos < unstable {
+                            unstable = pos; // a later `$` could form inline math
+                        }
                         out.push('$');
                         pos += 1;
                     }
@@ -160,7 +245,7 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
                 for _ in 0..len {
                     out.push(class as char);
                 }
-                deli_stack.push(Delim { at: written_at, class, len, can_open, can_close });
+                deli_stack.push(Delim { at: written_at, in_at: pos, class, len, can_open, can_close });
                 pos += len;
             }
             b' ' if pos + 1 < bytes.len() && bytes[pos + 1] == b' ' && trailing_spaces_before_nl(bytes, pos) => {
@@ -203,7 +288,14 @@ pub fn render_inline(input: &str, opts: &RenderOpts, out: &mut String) {
         }
     }
 
-    resolve_delimiters(out, &mut deli_stack);
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    resolve_delimiters(out, &mut deli_stack, if track { Some(&mut pairs) } else { None });
+
+    if track {
+        compute_cut(&candidates, unstable, &deli_stack, &pairs)
+    } else {
+        0
+    }
 }
 
 /// GFM §6.9: an extended autolink may begin at the start of the line or after
@@ -1266,6 +1358,10 @@ fn read_link_destination(
 #[derive(Debug)]
 struct Delim {
     at: usize,
+    /// Byte offset of this delimiter run's start in the *input* (not the output
+    /// `at`). Set at push, never modified by resolution — used by the streaming
+    /// boundary computation to locate emphasis spans in the source.
+    in_at: usize,
     class: u8,
     len: usize,
     can_open: bool,
@@ -1330,7 +1426,11 @@ fn is_unicode_punct(c: char) -> bool {
     !c.is_alphanumeric() && !c.is_whitespace()
 }
 
-fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>) {
+/// Resolve the emphasis delimiter stack into `<em>/<strong>/<del>` edits on
+/// `out`. When `pairs` is `Some`, also records each pairing as an input-position
+/// span `(opener_run_start, closer_run_start)` — the streaming boundary
+/// computation uses these to avoid cutting inside a resolved emphasis span.
+fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>, mut pairs: Option<&mut Vec<(usize, usize)>>) {
     let mut edits: Vec<Edit> = Vec::new();
 
     let n = stack.len();
@@ -1387,6 +1487,9 @@ fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>) {
             let cl_at = stack[i].at;
             edits.push(Edit { at: op_at, delete: take, insert: open_tag.to_string() });
             edits.push(Edit { at: cl_at, delete: take, insert: close_tag.to_string() });
+            if let Some(p) = pairs.as_deref_mut() {
+                p.push((stack[opener_idx].in_at, stack[i].in_at));
+            }
 
             stack[opener_idx].len -= take;
             stack[i].len -= take;
