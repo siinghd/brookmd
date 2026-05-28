@@ -171,6 +171,31 @@ test("CodeBlock with no override → dedicated highlighter renderer", () => {
   expect(out).toContain("flux-code-lang");
 });
 
+test("CodeBlock (closed) renders a copy button with an accessible label", () => {
+  const b = block({
+    kind: { type: "CodeBlock", data: { lang: "rust" } },
+    html: '<pre><code class="language-rust" data-lang="rust">fn main(){}</code></pre>',
+  });
+  const out = render(createElement(FluxMarkdown, { client: fakeClient([b]) }));
+  expect(out).toContain("flux-code-copy");
+  expect(out).toContain('aria-label="Copy code"');
+  expect(out).toContain('type="button"');
+  // No streaming pill on a closed block.
+  expect(out).not.toContain("flux-code-streaming-pill");
+});
+
+test("CodeBlock (open / streaming) hides the copy button until close", () => {
+  const b = block({
+    kind: { type: "CodeBlock", data: { lang: "rust" } },
+    html: '<pre><code class="language-rust" data-lang="rust">fn ma',
+    open: true,
+  });
+  const out = render(createElement(FluxMarkdown, { client: fakeClient([b]) }));
+  expect(out).toContain("flux-code-streaming-pill");
+  expect(out).not.toContain("flux-code-copy");
+  expect(out).not.toContain("Copy code");
+});
+
 test("CodeBlock block-kind override wins and receives text + language", () => {
   let props: any = null;
   const b = block({

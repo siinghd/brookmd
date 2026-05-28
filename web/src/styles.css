@@ -298,6 +298,17 @@ button { cursor: pointer; }
   text-transform: uppercase; letter-spacing: 0.06em;
 }
 .flux-code-streaming-pill { background: var(--acc-soft); color: var(--acc); padding: 1px 7px; border-radius: 4px; font-weight: 600; }
+.flux-code-copy {
+  display: inline-flex; align-items: center; gap: 5px;
+  background: transparent; border: 1px solid var(--bd-2);
+  color: var(--fg-2); font-family: inherit; font-size: inherit;
+  letter-spacing: inherit; text-transform: inherit;
+  padding: 2px 8px; border-radius: 4px;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.flux-code-copy:hover { color: var(--fg-0); border-color: var(--fg-3); background: var(--bg-1); }
+.flux-code-copy:focus-visible { outline: 2px solid var(--acc-line); outline-offset: 1px; }
+.flux-code-copy svg { display: block; }
 .flux-code-body { margin: 0; padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; overflow-x: auto; }
 .flux-code-body pre { margin: 0; padding: 0; background: transparent; }
 .flux-code-body code { background: transparent; padding: 0; color: var(--fg-1); font-size: inherit; white-space: pre; }
