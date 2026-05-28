@@ -1057,7 +1057,7 @@ fn render_table(slice: &str, opts: &RenderOpts, out: &mut String) {
     out.push_str("</table>");
 }
 
-fn push_table_cell(
+pub(crate) fn push_table_cell(
     tag: &str,
     content: &str,
     align: Option<&Option<&'static str>>,
@@ -1131,7 +1131,7 @@ fn render_component(slice: &str, tag: &str, terminated: bool, opts: &RenderOpts,
     out.push('>');
 }
 
-fn split_table_cells(line: &str) -> Vec<String> {
+pub(crate) fn split_table_cells(line: &str) -> Vec<String> {
     let trimmed = line.trim();
     let inner = trimmed.strip_prefix('|').unwrap_or(trimmed);
     let inner = inner.strip_suffix('|').unwrap_or(inner);
@@ -1155,7 +1155,7 @@ fn split_table_cells(line: &str) -> Vec<String> {
     cells
 }
 
-fn parse_alignments(line: &str) -> Vec<Option<&'static str>> {
+pub(crate) fn parse_alignments(line: &str) -> Vec<Option<&'static str>> {
     split_table_cells(line)
         .into_iter()
         .map(|cell| {

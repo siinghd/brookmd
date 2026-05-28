@@ -176,7 +176,11 @@ fn main() {
     let table = big_table(200_000);
 
     // Small chunks = many appends = many tail re-parses (the demanding case).
-    for &chunk in &[16usize, 256] {
+    // The intermediate sizes (64/128/512) matter: a scenario that's fast at 16
+    // and 256 can still hide an O(n²/chunk) curve between them (the table-cache
+    // fix in 0.5.2 was the proof). Print every shape × every chunk so the next
+    // regression can't slip in unnoticed.
+    for &chunk in &[16usize, 64, 128, 256, 512, 1024] {
         bench("mixed", &mixed, chunk, false);
         bench("big_code", &code, chunk, false);
         bench("long_paragraph", &para, chunk, false);

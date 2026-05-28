@@ -7,7 +7,8 @@ use crate::blocks::Block;
 use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
     count_footnote_refs, is_fence_close_line, is_footnote_def_block, item_body, normalize_label,
-    push_code_fence_open, render_block, render_footnote_section, LinkRef, RenderOpts,
+    parse_alignments, push_code_fence_open, push_table_cell, render_block,
+    render_footnote_section, split_table_cells, LinkRef, RenderOpts,
 };
 use crate::blocks::BlockKind;
 use crate::scanner::{
@@ -128,6 +129,8 @@ pub struct StreamParser {
     fence_cache: Option<FenceCache>,
     /// Fast path for a long open paragraph at the tail (see [`ParagraphCache`]).
     para_cache: Option<ParagraphCache>,
+    /// Fast path for a long open GFM table at the tail (see [`TableCache`]).
+    table_cache: Option<TableCache>,
 }
 
 #[derive(Default)]
@@ -206,6 +209,43 @@ struct ParagraphCache {
     committed_inner: String,
 }
 
+/// Incremental render state for a single open GFM table at the tail. Streaming
+/// a long table is otherwise O(n²) — `render_table` re-walks every row on every
+/// append, normalizing cell counts and re-rendering inline content. Each body
+/// row's HTML is self-contained (it depends only on the row's own bytes, the
+/// header's column count, the alignments, and the committed link-ref/footnote
+/// tables — none of which change while the table is open), so once a row is
+/// rendered into the cache it's stable. The cache stores the pre-rendered
+/// prefix (`<table>…<thead>…</thead>` plus the `<tbody>` opener and every
+/// completed `<tr>`) and extends it by the newly-arrived complete rows; the
+/// trailing partial row is re-rendered each append (it is short).
+///
+/// Disarmed when footnotes are on: cell-level `[^x]` occurrence ids would
+/// diverge across the cache vs. full-reparse boundary (the cache renders each
+/// row once; the full path re-renders the whole tail each append). The full
+/// path stays O(n²) in that combination — rare enough to defer to a later fix.
+struct TableCache {
+    /// Absolute byte offset of the table's header line in `buffer`.
+    start: usize,
+    /// Stable id of the table block (preserved across appends and the eventual close).
+    id: u64,
+    /// Pre-rendered HTML prefix: `<table dir?><thead>…</thead>` and, once any
+    /// body row exists, `<tbody>` followed by every completed `<tr>…</tr>`.
+    /// No trailing `</tbody></table>`.
+    cached_prefix: String,
+    /// Absolute offset just past the last complete cached body row's `\n`. The
+    /// next complete line at this offset is the next row to fold into the cache.
+    lines_upto: usize,
+    /// Header column count (locked at the delimiter row).
+    ncol: usize,
+    /// Per-column alignment (parsed once from the delimiter row).
+    aligns: Vec<Option<&'static str>>,
+    /// `true` once we've emitted `<tbody>` into `cached_prefix` (after the first
+    /// committed body row). The trailing partial-row path emits its own `<tbody>`
+    /// when speculatively rendering the very first row of the body.
+    tbody_opened: bool,
+}
+
 impl StreamParser {
     pub fn new() -> Self {
         Self {
@@ -229,6 +269,7 @@ impl StreamParser {
             component_tags: Vec::new(),
             fence_cache: None,
             para_cache: None,
+            table_cache: None,
         }
     }
 
@@ -364,6 +405,9 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_paragraph() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_table() {
                 return patch;
             }
         }
@@ -617,6 +661,7 @@ impl StreamParser {
         // take the O(new bytes) path instead of re-rendering the whole tail.
         self.fence_cache = None;
         self.para_cache = None;
+        self.table_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -645,6 +690,13 @@ impl StreamParser {
                     RawBlockKind::Paragraph => {
                         self.para_cache =
                             build_paragraph_cache(&self.buffer, start, new_active[0].id, &opts);
+                    }
+                    // Footnotes are disabled for the table cache (see `TableCache`
+                    // docs): the per-`[^x]` occurrence counter would diverge across
+                    // the cache vs. full-reparse boundary.
+                    RawBlockKind::Table if !self.gfm_footnotes => {
+                        self.table_cache =
+                            build_table_cache(&self.buffer, start, new_active[0].id, &opts);
                     }
                     _ => {}
                 }
@@ -862,6 +914,126 @@ impl StreamParser {
         self.para_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
+
+    /// O(new bytes) extension of a long open GFM table at the tail. Folds each
+    /// newly-complete body row into the cached prefix; speculatively renders
+    /// the trailing partial line as the last row. Returns `None` (dropping the
+    /// cache) whenever the table has ended (blank line, interrupting block, or
+    /// a `\r` line that the full path handles) or is no longer the sole tail
+    /// block — the full reparse then handles it.
+    fn try_incremental_table(&mut self) -> Option<Patch> {
+        let mut cache = self.table_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Must still be at the tail (only whitespace before it).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        let ctx = ScanCtx { math: self.gfm_math, component_tags: &self.component_tags };
+        // Build inline opts once for the whole append: the same shared RenderOpts
+        // backs cached-row rendering and the speculative partial-row render. Cells
+        // never define link refs / footnote defs themselves, so the open table
+        // contributes nothing to the footnote_region — `&""` is fine.
+        let opts = self.build_inline_opts("");
+
+        // Fold every newly-complete body row into the cache. A blank/interrupting
+        // line bails: the table has ended, full reparse takes over so the block
+        // boundary updates correctly.
+        let mut pos = cache.lines_upto;
+        while pos < end {
+            let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
+                None => break, // trailing partial line — handled below
+                Some(r) => r,
+            };
+            let content_end = pos + r;
+            let next = pos + r + 1;
+            // The cache stores LF-only state; CRLF rows route through the full
+            // renderer (same fallback strategy as `FenceCache`).
+            if bytes[pos..content_end].contains(&b'\r') {
+                return None;
+            }
+            if is_blank_line(bytes, pos) || would_start_other_block(bytes, pos, ctx) {
+                return None;
+            }
+            let line_str = std::str::from_utf8(&bytes[pos..content_end]).unwrap_or("");
+            let cells = split_table_cells(line_str);
+            if !cache.tbody_opened {
+                cache.cached_prefix.push_str("<tbody>");
+                cache.tbody_opened = true;
+            }
+            cache.cached_prefix.push_str("<tr>");
+            for i in 0..cache.ncol {
+                push_table_cell(
+                    "td",
+                    cells.get(i).map(String::as_str).unwrap_or(""),
+                    cache.aligns.get(i),
+                    &opts,
+                    &mut cache.cached_prefix,
+                );
+            }
+            cache.cached_prefix.push_str("</tr>");
+            cache.lines_upto = next;
+            pos = next;
+        }
+
+        // Speculatively render the trailing partial line (no `\n`) as a row, if
+        // it's non-empty and not blank. The full renderer treats a final
+        // newline-less line as the last row, so we must too. The partial is short
+        // (≤ one row's worth), so re-rendering it each append is O(row).
+        let partial = &bytes[cache.lines_upto..end];
+        let mut partial_html = String::new();
+        if !partial.is_empty() && !is_blank_line(bytes, cache.lines_upto) {
+            if partial.contains(&b'\r') {
+                return None;
+            }
+            let line_str = std::str::from_utf8(partial).unwrap_or("");
+            let cells = split_table_cells(line_str);
+            partial_html.push_str("<tr>");
+            for i in 0..cache.ncol {
+                push_table_cell(
+                    "td",
+                    cells.get(i).map(String::as_str).unwrap_or(""),
+                    cache.aligns.get(i),
+                    &opts,
+                    &mut partial_html,
+                );
+            }
+            partial_html.push_str("</tr>");
+        }
+
+        // Assemble final HTML: cached_prefix [+ "<tbody>" if first row is partial]
+        // + partial_html + "</tbody>" (if any body row at all) + "</table>".
+        let need_tbody_for_partial = !cache.tbody_opened && !partial_html.is_empty();
+        let mut html = String::with_capacity(
+            cache.cached_prefix.len() + partial_html.len() + 32,
+        );
+        html.push_str(&cache.cached_prefix);
+        if need_tbody_for_partial {
+            html.push_str("<tbody>");
+        }
+        html.push_str(&partial_html);
+        if cache.tbody_opened || need_tbody_for_partial {
+            html.push_str("</tbody>");
+        }
+        html.push_str("</table>");
+
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Table,
+            start: cache.start,
+            end,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.table_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
 }
 
 /// Build the incremental cache for an open code fence at `start`, walking its
@@ -992,6 +1164,72 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
         trim_body: true,
         escaped_lines,
         lines_upto,
+    })
+}
+
+/// Arm the table cache for the open table at `start`, pre-rendering the
+/// `<thead>` once. The body grows incrementally via `try_incremental_table`.
+/// Returns `None` (no caching) if the header or delimiter lines aren't fully
+/// present yet, if either contains a `\r` (CRLF tables route through the full
+/// path), or if column counts disagree (the scanner shouldn't have produced
+/// a Table block in that case, but the guard is cheap).
+fn build_table_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> Option<TableCache> {
+    let bytes = buffer.as_bytes();
+    let end = bytes.len();
+    // Header line.
+    let header_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
+    let header_end = start + header_nl;
+    if bytes[start..header_end].contains(&b'\r') {
+        return None;
+    }
+    let header_line = std::str::from_utf8(&bytes[start..header_end]).ok()?;
+    // Delimiter line.
+    let delim_start = header_end + 1;
+    if delim_start >= end {
+        return None;
+    }
+    let delim_nl = bytes[delim_start..end].iter().position(|&b| b == b'\n')?;
+    let delim_end = delim_start + delim_nl;
+    if bytes[delim_start..delim_end].contains(&b'\r') {
+        return None;
+    }
+    let delim_line = std::str::from_utf8(&bytes[delim_start..delim_end]).ok()?;
+    let body_start = delim_end + 1;
+
+    let aligns = parse_alignments(delim_line);
+    let header_cells = split_table_cells(header_line);
+    let ncol = header_cells.len();
+    if ncol == 0 || ncol != count_table_columns(delim_line.as_bytes()) {
+        return None;
+    }
+
+    // Pre-render `<table dir?><thead><tr>…</tr></thead>` exactly as
+    // `render_table` would. Cells use the same `push_table_cell` so inline
+    // markup in headers (e.g. `**bold**`) renders byte-identical to the
+    // full path.
+    let mut cached_prefix = String::with_capacity(64 + ncol * 32);
+    cached_prefix.push_str("<table");
+    cached_prefix.push_str(opts.dir());
+    cached_prefix.push_str("><thead><tr>");
+    for i in 0..ncol {
+        push_table_cell(
+            "th",
+            header_cells.get(i).map(String::as_str).unwrap_or(""),
+            aligns.get(i),
+            opts,
+            &mut cached_prefix,
+        );
+    }
+    cached_prefix.push_str("</tr></thead>");
+
+    Some(TableCache {
+        start,
+        id,
+        cached_prefix,
+        lines_upto: body_start,
+        ncol,
+        aligns,
+        tbody_opened: false,
     })
 }
 
