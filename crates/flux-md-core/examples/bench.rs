@@ -222,14 +222,9 @@ fn main() {
     let para = long_paragraph(200_000);
     let emph = emphasis_paragraph(200_000);
     let table = big_table(200_000);
-    // Resumable containers (blockquote / list / alert) are still O(n²) when their
-    // inner grows as a single open block: every append re-scans + re-renders the
-    // whole growing inner. Sized down to 50 KB so the bench completes in seconds
-    // and the quadratic curve is still visible — at 200 KB these would dominate
-    // the runtime. See CHANGELOG / known-limitations for the planned fix.
-    let quote = big_blockquote(50_000);
-    let list = big_list(50_000);
-    let alert = big_alert(50_000);
+    let quote = big_blockquote(200_000);
+    let list = big_list(200_000);
+    let alert = big_alert(200_000);
     let manyp = many_paragraphs(200_000);
 
     // Small chunks = many appends = many tail re-parses (the demanding case).

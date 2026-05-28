@@ -13,7 +13,7 @@ use crate::render::{
 use crate::blocks::BlockKind;
 use crate::scanner::{
     count_table_columns, is_blank_line, is_setext_underline, is_table_delimiter_row, line_end,
-    line_slice, parse_link_ref_def, scan, would_start_other_block,
+    line_slice, parse_link_ref_def, scan, scan_marker, would_start_other_block, MarkerScan,
     RawBlock, RawBlockKind, ScanCtx,
 };
 use crate::inline::{render_inline, render_inline_boundary};
@@ -133,6 +133,8 @@ pub struct StreamParser {
     table_cache: Option<TableCache>,
     /// Fast path for a long open blockquote / alert at the tail (see [`ContainerCache`]).
     container_cache: Option<ContainerCache>,
+    /// Fast path for a long open tight, flat list at the tail (see [`ListCache`]).
+    list_cache: Option<ListCache>,
 }
 
 #[derive(Default)]
@@ -301,6 +303,43 @@ enum ContainerCacheKind {
     Alert(crate::blocks::AlertKind),
 }
 
+/// Incremental render state for a single open *tight, flat* list at the tail
+/// — the LLM-emit shape where every line is a same-family marker (no blank
+/// lines, no continuation, no nesting). The cache bails (full path takes
+/// over) on any of:
+///   - a blank line (a loose list wraps items in `<p>`; tight rendering would
+///     produce the wrong output, and the loose/tight decision is retroactive),
+///   - a line whose `marker_indent` exceeds the list's `edge + 3` (nested
+///     content, continuation, or end-of-list),
+///   - a line of a different marker family / delimiter (a sibling list of a
+///     different family closes this one),
+///   - a `\r` byte (CRLF — full path handles).
+///
+/// Inside the cache, each new sibling line renders directly as a tight
+/// `<li>{inline}</li>` (GFM task-list `[ ]`/`[x]` prefix supported), folded
+/// into a single cached HTML buffer. Subsequent appends do O(new bytes).
+///
+/// Disarmed when `gfmFootnotes` is on, like `TableCache` / `ContainerCache`.
+struct ListCache {
+    /// Absolute byte offset of the list's first line in `buffer`.
+    start: usize,
+    /// Stable id of the list block.
+    id: u64,
+    /// Ordered vs. unordered — locked at the first marker.
+    ordered: bool,
+    /// Marker family + delimiter (`b'-'`/`b'*'`/`b'+'` for bullets,
+    /// `b'.'`/`b')'` for ordered). A sibling must match.
+    delim: u8,
+    /// `marker_indent` of the first item — siblings must have
+    /// `marker_indent <= edge + 3` (CommonMark §5.2).
+    edge: usize,
+    /// Pre-rendered HTML: opener (`<ul>` or `<ol start=N>`) + `\n` + every
+    /// fully-cached `<li>…</li>\n`. No trailing `</ul>` / `</ol>`.
+    cached_prefix: String,
+    /// Absolute offset just past the last cached complete item line's `\n`.
+    lines_upto: usize,
+}
+
 impl StreamParser {
     pub fn new() -> Self {
         Self {
@@ -326,6 +365,7 @@ impl StreamParser {
             para_cache: None,
             table_cache: None,
             container_cache: None,
+            list_cache: None,
         }
     }
 
@@ -467,6 +507,9 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_container() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_list() {
                 return patch;
             }
         }
@@ -722,6 +765,7 @@ impl StreamParser {
         self.para_cache = None;
         self.table_cache = None;
         self.container_cache = None;
+        self.list_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -764,6 +808,18 @@ impl StreamParser {
                             start,
                             new_active[0].id,
                             &new_active[0].kind,
+                            &opts,
+                        );
+                    }
+                    RawBlockKind::List { ordered, start: list_start_num }
+                        if !self.gfm_footnotes =>
+                    {
+                        self.list_cache = build_list_cache(
+                            &self.buffer,
+                            start,
+                            new_active[0].id,
+                            *ordered,
+                            *list_start_num,
                             &opts,
                         );
                     }
@@ -1245,6 +1301,157 @@ impl StreamParser {
         self.container_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
+
+    /// O(new bytes) extension of a long open *tight, flat* list at the tail.
+    /// Each newly-complete sibling line renders directly as a tight `<li>…</li>`
+    /// folded into `cached_prefix`; the trailing partial-marker line renders
+    /// speculatively. The cache bails (full path takes over) on any blank line,
+    /// non-marker line, foreign-family marker, deeper-than-edge marker, or `\r`.
+    fn try_incremental_list(&mut self) -> Option<Patch> {
+        let mut cache = self.list_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Tail-only check.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        let opts = self.build_inline_opts("");
+
+        // Fold every newly-complete sibling line into `cached_prefix`. Any bail
+        // condition drops the cache so the full reparse can produce loose /
+        // nested / lazy output correctly.
+        let mut pos = cache.lines_upto;
+        while pos < end {
+            let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
+                None => break, // trailing partial — handled below
+                Some(r) => r,
+            };
+            let content_end = pos + r;
+            let next = pos + r + 1;
+            if bytes[pos..content_end].contains(&b'\r') {
+                return None;
+            }
+            let line = &bytes[pos..content_end];
+            if line.iter().all(|&b| matches!(b, b' ' | b'\t')) {
+                return None; // blank line → potentially loose, full path decides
+            }
+            let m = scan_marker(line)?;
+            if m.ordered != cache.ordered
+                || m.delim != cache.delim
+                || m.marker_indent > cache.edge + 3
+            {
+                return None;
+            }
+            let cached_len_before = cache.cached_prefix.len();
+            if render_tight_item_line(line, &m, &opts, &mut cache.cached_prefix).is_none() {
+                cache.cached_prefix.truncate(cached_len_before);
+                return None;
+            }
+            cache.cached_prefix.push('\n');
+            cache.lines_upto = next;
+            pos = next;
+        }
+
+        // Speculatively render the trailing partial as a tight item if it's
+        // already a same-family marker line. If the partial has no marker yet,
+        // it could grow into a marker or a lazy continuation — bail to be safe.
+        let partial = &bytes[cache.lines_upto..end];
+        let mut partial_html = String::new();
+        if !partial.is_empty() {
+            if partial.contains(&b'\r') {
+                return None;
+            }
+            if partial.iter().all(|&b| matches!(b, b' ' | b'\t')) {
+                return None;
+            }
+            match scan_marker(partial) {
+                Some(m)
+                    if m.ordered == cache.ordered
+                        && m.delim == cache.delim
+                        && m.marker_indent <= cache.edge + 3 =>
+                {
+                    if render_tight_item_line(partial, &m, &opts, &mut partial_html).is_none() {
+                        return None;
+                    }
+                    partial_html.push('\n');
+                }
+                // Foreign-family marker / over-edge / no-marker-yet → bail.
+                _ => return None,
+            }
+        }
+
+        let close = if cache.ordered { "</ol>" } else { "</ul>" };
+        let mut html = String::with_capacity(
+            cache.cached_prefix.len() + partial_html.len() + close.len(),
+        );
+        html.push_str(&cache.cached_prefix);
+        html.push_str(&partial_html);
+        html.push_str(close);
+
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::List { ordered: cache.ordered },
+            start: cache.start,
+            end,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.list_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+}
+
+/// Render one tight list item from its raw line bytes. Mirrors the inline
+/// branch of `render_list_item` (single-paragraph tight item, with GFM
+/// task-list `[ ] ` / `[x] ` checkbox prefix). Returns `None` on any
+/// invalid-UTF-8 path so the cache can bail to the full renderer.
+fn render_tight_item_line(
+    line: &[u8],
+    m: &MarkerScan,
+    opts: &RenderOpts,
+    out: &mut String,
+) -> Option<()> {
+    let content_bytes = &line[m.content_byte..];
+    let content_str = std::str::from_utf8(content_bytes).ok()?;
+    // Trim trailing whitespace to match `render_list_item`'s `body_trimmed`.
+    let trimmed = content_str.trim_end_matches(|c: char| matches!(c, '\n' | '\r' | ' ' | '\t'));
+
+    // GFM task list: a body opening with `[ ] ` / `[x] ` (case-insensitive `x`)
+    // becomes a disabled checkbox + remainder.
+    let (checkbox, rest) = {
+        let b = trimmed.as_bytes();
+        if b.len() >= 4 && b[0] == b'[' && b[2] == b']' && b[3] == b' ' {
+            match b[1] {
+                b' ' => (Some(false), &trimmed[4..]),
+                b'x' | b'X' => (Some(true), &trimmed[4..]),
+                _ => (None, trimmed),
+            }
+        } else {
+            (None, trimmed)
+        }
+    };
+
+    out.push_str("<li");
+    out.push_str(opts.dir());
+    out.push('>');
+    if let Some(checked) = checkbox {
+        out.push_str(if checked {
+            "<input type=\"checkbox\" checked disabled> "
+        } else {
+            "<input type=\"checkbox\" disabled> "
+        });
+    }
+    if !rest.is_empty() {
+        render_inline(rest, opts, out);
+    }
+    out.push_str("</li>");
+    Some(())
 }
 
 /// Strip the CommonMark blockquote marker (`>` with optional one space, after
@@ -1529,6 +1736,59 @@ fn build_container_cache(
         lines_upto,
         inner_cut: 0,
         committed_inner_html: String::new(),
+    })
+}
+
+/// Arm the list cache for the open tight, flat list at `start`. Requires the
+/// first line to be complete (so the marker family / delimiter / edge are
+/// settled — a partial first line could still grow into a foreign family).
+/// First incremental call processes any existing sibling lines; subsequent
+/// appends only fold new bytes.
+fn build_list_cache(
+    buffer: &str,
+    start: usize,
+    id: u64,
+    ordered: bool,
+    list_start_num: u32,
+    opts: &RenderOpts,
+) -> Option<ListCache> {
+    let bytes = buffer.as_bytes();
+    let end = bytes.len();
+    let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
+    if bytes[start..start + first_nl].contains(&b'\r') {
+        return None;
+    }
+    let first_line = &bytes[start..start + first_nl];
+    let m = scan_marker(first_line)?;
+    if m.ordered != ordered {
+        return None;
+    }
+    // Pre-render the opener — matches the prefix `render_list` emits before
+    // the first item. `<ul dir?>\n` / `<ol dir? start="N">\n`.
+    let mut cached_prefix = String::with_capacity(64);
+    if ordered {
+        cached_prefix.push_str("<ol");
+        cached_prefix.push_str(opts.dir());
+        if list_start_num != 1 {
+            cached_prefix.push_str(" start=\"");
+            cached_prefix.push_str(&list_start_num.to_string());
+            cached_prefix.push('"');
+        }
+        cached_prefix.push('>');
+    } else {
+        cached_prefix.push_str("<ul");
+        cached_prefix.push_str(opts.dir());
+        cached_prefix.push('>');
+    }
+    cached_prefix.push('\n');
+    Some(ListCache {
+        start,
+        id,
+        ordered,
+        delim: m.delim,
+        edge: m.marker_indent,
+        cached_prefix,
+        lines_upto: start,
     })
 }
 
