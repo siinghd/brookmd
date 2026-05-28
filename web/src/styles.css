@@ -345,6 +345,52 @@ button { cursor: pointer; }
 .flux-mermaid-block.flux-streaming { opacity: 0.7; }
 .flux-mermaid-rendered svg { max-width: 100%; }
 
+/* <Thinking> callout — visual weight matches .flux-code-block, body muted/italic. */
+.thinking {
+  margin: 0 0 14px 0;
+  background: var(--bg-2);
+  border: 1px solid var(--bd);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid transparent;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  color: var(--fg-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.thinking-summary::-webkit-details-marker { display: none; }
+.thinking-summary:hover { color: var(--fg-2); }
+.thinking[open] .thinking-summary { border-bottom-color: var(--bd); }
+.thinking-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--fg-3);
+}
+.thinking.flux-open .thinking-dot {
+  background: var(--acc);
+  animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+@keyframes thinking-pulse { 50% { opacity: 0.35; } }
+.thinking-body {
+  padding: 10px 14px;
+  color: var(--fg-2);
+  font-style: italic;
+  line-height: 1.55;
+  font-size: 0.95em;
+}
+.thinking-body > *:first-child { margin-top: 0; }
+.thinking-body > *:last-child { margin-bottom: 0; }
+
 /* Streaming caret on the open (still-arriving) block */
 .flux-open { position: relative; }
 .flux-open::after {

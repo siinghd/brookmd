@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FluxClient, FluxMarkdown } from "flux-md";
+import { FluxClient, FluxMarkdown, type BlockComponentProps, type Components } from "flux-md";
 import DOMPurify from "dompurify";
 import { streamChat, type ChatMessage } from "../streaming/openai";
 
@@ -8,6 +8,27 @@ import { streamChat, type ChatMessage } from "../streaming/openai";
 // (drops scripts, on* handlers, javascript:/dangerous schemes, and unsafe tags);
 // stable identity so flux-md's per-block memo doesn't churn.
 const sanitizeHtml = (html: string) => DOMPurify.sanitize(html);
+
+// Custom <Thinking> block — shown as a collapsible callout. The `html` prop is
+// the *inner* markdown already rendered (and run through DOMPurify via the
+// `sanitize` hook on FluxMarkdown), so dangerouslySetInnerHTML is safe here.
+// Keep `flux-open` on the wrapper while streaming so the page-level KaTeX
+// MutationObserver still skips partial LaTeX inside the block.
+function Thinking({ html, open }: BlockComponentProps) {
+  return (
+    <details className={"thinking" + (open ? " flux-open" : "")} open={open}>
+      <summary className="thinking-summary">
+        <span className="thinking-dot" aria-hidden="true" />
+        {open ? "Thinking…" : "Thought process"}
+      </summary>
+      <div className="thinking-body" dangerouslySetInnerHTML={{ __html: html }} />
+    </details>
+  );
+}
+
+// Module-scope so the components-object identity is stable; a fresh object
+// each render would bust flux-md's per-block memo.
+const COMPONENTS: Components = { Thinking };
 
 interface Turn {
   id: number;
@@ -24,14 +45,16 @@ const SYSTEM_PROMPT =
   "blank line between every block — headings, paragraphs, lists, tables, and code " +
   "fences. Open a fenced code block on its own line as ```lang followed by a " +
   "newline, and close it with ``` on its own line. Use $…$ for inline math and " +
-  "$$…$$ on their own lines for display math. If the user explicitly asks for " +
-  "HTML, you may reply with raw HTML markup; otherwise use Markdown. Be " +
-  "substantive, not padded.";
+  "$$…$$ on their own lines for display math. When the user asks you to reason " +
+  "through a hard problem, wrap your step-by-step reasoning in a " +
+  "<Thinking>…</Thinking> block, then state the final answer outside it. If the " +
+  "user explicitly asks for HTML, you may reply with raw HTML markup; otherwise " +
+  "use Markdown. Be substantive, not padded.";
 
 const EXAMPLES = [
   "Explain how a streaming markdown parser stays O(n), with a Rust code sketch.",
   "Give me a comparison table of three rope data structures.",
-  "Derive the quadratic formula with LaTeX, step by step.",
+  "Derive the quadratic formula. Show your reasoning in a <Thinking> block, then state the formula.",
 ];
 
 export function Chat() {
@@ -128,7 +151,11 @@ export function Chat() {
       // unsafeHtml lets the model's HTML render (e.g. "give me the result in
       // HTML"); every block's HTML — including the streaming tail — is run
       // through DOMPurify via FluxMarkdown's `sanitize` prop (see `sanitizeHtml`).
-      const client = new FluxClient({ config: { gfmMath: true, unsafeHtml: true } });
+      // componentTags allowlists <Thinking> so the model's reasoning blocks
+      // render via the React override below.
+      const client = new FluxClient({
+        config: { gfmMath: true, unsafeHtml: true, componentTags: ["Thinking"] },
+      });
       const userTurn: Turn = { id: nextId.current++, role: "user", text, done: true };
       const aiTurn: Turn = { id: nextId.current++, role: "assistant", text: "", client, done: false };
       setTurns((prev) => [...prev, userTurn, aiTurn]);
@@ -234,7 +261,9 @@ export function Chat() {
                 <div className="msg msg-ai" key={t.id}>
                   <div className="ai-mark">⚡</div>
                   <div className="ai-body">
-                    {t.client && <FluxMarkdown client={t.client} sanitize={sanitizeHtml} />}
+                    {t.client && (
+                      <FluxMarkdown client={t.client} sanitize={sanitizeHtml} components={COMPONENTS} />
+                    )}
                   </div>
                 </div>
               ),
