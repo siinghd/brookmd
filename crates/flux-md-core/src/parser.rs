@@ -278,10 +278,18 @@ struct ContainerCache {
     /// Container variant — drives wrapper HTML + line accounting (Alert skips
     /// the `[!KIND]` marker line; Blockquote starts from the first line).
     kind: ContainerCacheKind,
-    /// Pre-built wrapper HTML emitted before the inner inline content.
-    html_prefix: String,
-    /// Pre-built wrapper HTML emitted after the inner inline content.
-    html_suffix: String,
+    /// Wrapper opener that always appears: `<blockquote dir?>\n` for blockquote,
+    /// or `<div class="...">\n<p class="...title">Title</p>\n` for an alert.
+    wrapper_open: String,
+    /// Body paragraph opener: `<p dir?>` — emitted only when the inner has
+    /// content. An empty body must produce no `<p></p>` (matches the full
+    /// renderer, where an empty inner produces no body sub-block).
+    body_p_open: String,
+    /// Body paragraph closer plus the `\n` that the full renderer emits after
+    /// each sub-block: `</p>\n`.
+    body_p_close: String,
+    /// Wrapper closer: `</blockquote>` or `</div>`.
+    wrapper_close: String,
     /// Stripped inner content built up so far, one `\n`-terminated line per
     /// processed source line. Grows by O(new line length) per append.
     inner_buffer: String,
@@ -1262,9 +1270,11 @@ impl StreamParser {
             render_inline(&cache.inner_buffer[cache.inner_cut..], &opts, &mut active_html);
         }
 
-        // Assemble: prefix + committed + active (trimmed end) + suffix. Mirror
-        // `render_paragraph`'s trailing-whitespace trim so the cache and full
-        // path produce byte-identical bytes around `</p>`.
+        // Assemble: wrapper_open + (body_p_open + inner + body_p_close if any)
+        // + wrapper_close. Trailing whitespace in the inner is trimmed so the
+        // cache matches `render_paragraph`'s behavior around `</p>`. An empty
+        // body produces no `<p></p>` — matches the full renderer (no body
+        // sub-block).
         let mut inner_total = String::with_capacity(
             cache.committed_inner_html.len() + active_html.len(),
         );
@@ -1274,11 +1284,21 @@ impl StreamParser {
             .trim_end_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\r'));
 
         let mut html = String::with_capacity(
-            cache.html_prefix.len() + final_inner.len() + cache.html_suffix.len(),
+            cache.wrapper_open.len()
+                + (if final_inner.is_empty() {
+                    0
+                } else {
+                    cache.body_p_open.len() + final_inner.len() + cache.body_p_close.len()
+                })
+                + cache.wrapper_close.len(),
         );
-        html.push_str(&cache.html_prefix);
-        html.push_str(final_inner);
-        html.push_str(&cache.html_suffix);
+        html.push_str(&cache.wrapper_open);
+        if !final_inner.is_empty() {
+            html.push_str(&cache.body_p_open);
+            html.push_str(final_inner);
+            html.push_str(&cache.body_p_close);
+        }
+        html.push_str(&cache.wrapper_close);
 
         // Drop the speculative partial bytes so the cache's committed state is
         // unchanged for the next append.
@@ -1694,35 +1714,36 @@ fn build_container_cache(
     if bytes[start..first_line_end].contains(&b'\r') {
         return None;
     }
-    let (kind, html_prefix, html_suffix, lines_upto) = match block_kind {
+    // Body `<p>` opener / closer — emitted only when the inner has content
+    // (an empty body must not produce `<p></p>`, matching the full renderer).
+    let mut body_p_open = String::with_capacity(16);
+    body_p_open.push_str("<p");
+    body_p_open.push_str(opts.dir());
+    body_p_open.push('>');
+    let body_p_close = String::from("</p>\n");
+    let (kind, wrapper_open, wrapper_close, lines_upto) = match block_kind {
         BlockKind::Blockquote => {
-            let mut p = String::with_capacity(48);
-            p.push_str("<blockquote");
-            p.push_str(opts.dir());
-            p.push_str(">\n<p");
-            p.push_str(opts.dir());
-            p.push('>');
-            let s = String::from("</p>\n</blockquote>");
-            (ContainerCacheKind::Blockquote, p, s, start)
+            let mut w = String::with_capacity(32);
+            w.push_str("<blockquote");
+            w.push_str(opts.dir());
+            w.push_str(">\n");
+            (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), start)
         }
         BlockKind::Alert { kind: ak } => {
-            let mut p = String::with_capacity(96);
-            p.push_str("<div class=\"markdown-alert markdown-alert-");
-            p.push_str(ak.class());
-            p.push_str("\" data-alert=\"");
-            p.push_str(ak.class());
-            p.push_str("\" role=\"note\"");
-            p.push_str(opts.dir());
-            p.push_str(">\n<p class=\"markdown-alert-title\"");
-            p.push_str(opts.dir());
-            p.push('>');
-            p.push_str(ak.title());
-            p.push_str("</p>\n<p");
-            p.push_str(opts.dir());
-            p.push('>');
-            let s = String::from("</p>\n</div>");
-            // Alert: skip past the `[!KIND]` marker line — the body starts on line 2.
-            (ContainerCacheKind::Alert(*ak), p, s, first_line_end + 1)
+            let mut w = String::with_capacity(96);
+            w.push_str("<div class=\"markdown-alert markdown-alert-");
+            w.push_str(ak.class());
+            w.push_str("\" data-alert=\"");
+            w.push_str(ak.class());
+            w.push_str("\" role=\"note\"");
+            w.push_str(opts.dir());
+            w.push_str(">\n<p class=\"markdown-alert-title\"");
+            w.push_str(opts.dir());
+            w.push('>');
+            w.push_str(ak.title());
+            w.push_str("</p>\n");
+            // Alert: skip past the `[!KIND]` marker line — body starts on line 2.
+            (ContainerCacheKind::Alert(*ak), w, String::from("</div>"), first_line_end + 1)
         }
         _ => return None,
     };
@@ -1730,8 +1751,10 @@ fn build_container_cache(
         start,
         id,
         kind,
-        html_prefix,
-        html_suffix,
+        wrapper_open,
+        body_p_open,
+        body_p_close,
+        wrapper_close,
         inner_buffer: String::new(),
         lines_upto,
         inner_cut: 0,
@@ -1817,6 +1840,35 @@ fn build_paragraph_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts)
 /// is a continuation (it began as paragraph text), so it's skipped.
 fn paragraph_ends_before_eof(bytes: &[u8], cut: usize, ctx: ScanCtx) -> bool {
     let len = bytes.len();
+
+    // Phase 1: re-check the line containing `cut` if it has just completed.
+    if cut < len && cut > 0 && bytes[cut - 1] != b'\n' {
+        if bytes[cut..len].contains(&b'\n') {
+            let mut s = cut - 1;
+            while s > 0 && bytes[s - 1] != b'\n' {
+                s -= 1;
+            }
+            let cur_line_start = s;
+            let next = line_end(bytes, cur_line_start);
+            if next > cur_line_start && bytes[next - 1] == b'\n' {
+                if is_blank_line(bytes, cur_line_start)
+                    || is_setext_underline(bytes, cur_line_start).is_some()
+                    || would_start_other_block(bytes, cur_line_start, ctx)
+                {
+                    return true;
+                }
+                if is_table_delimiter_row(line_slice(bytes, cur_line_start)) {
+                    let prev = prev_line_start(bytes, cur_line_start);
+                    if prev != cur_line_start
+                        && forms_table_header(bytes, prev, cur_line_start)
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
     let mut pos = cut;
     if pos < len && (pos == 0 || bytes[pos - 1] != b'\n') {
         while pos < len && bytes[pos] != b'\n' {
