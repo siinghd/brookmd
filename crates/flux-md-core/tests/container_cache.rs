@@ -143,6 +143,9 @@ fn container_cache_with_dir_auto() {
         "> Hello, world!\n",
         "> line one\n> line two\n",
         "> [!WARNING]\n> warning body\n> more of warning\n",
+        // dir_auto × multi-paragraph: every `<p>` opener must carry dir="auto".
+        "> p1\n>\n> p2\n",
+        "> [!WARNING]\n> first\n>\n> second\n",
     ];
     for md in cases {
         let one = render_with(make, md);
@@ -187,4 +190,80 @@ fn open_alert_renders_incrementally() {
     p.append("\nAfter the alert.\n");
     let blocks: Vec<_> = p.all_blocks().cloned().collect();
     assert!(blocks.iter().any(|b| b.id == id0), "alert block id survives close");
+}
+
+#[test]
+fn multi_paragraph_container_matches_full_render() {
+    // The blank-`>` line case the cache now handles instead of bailing — every
+    // append-shape must agree with one-shot, including the byte-identical
+    // `<blockquote>\n<p>P1</p>\n<p>P2</p>\n</blockquote>` shape.
+    let make = || alerts(StreamParser::new());
+
+    // Stress: 200 short paragraphs separated by blank `>` lines.
+    let mut stress = String::new();
+    for i in 0..200 {
+        stress.push_str("> paragraph ");
+        stress.push_str(&i.to_string());
+        stress.push_str(" body with **bold** and `code`.\n>\n");
+    }
+
+    let cases: &[&str] = &[
+        // Simple two-paragraph blockquote.
+        "> p1\n>\n> p2\n",
+        // Three-paragraph blockquote with multi-line paragraphs.
+        "> first paragraph\n> still first\n>\n> second paragraph\n> still second\n>\n> third\n",
+        // Consecutive blank `>` lines collapse to a single paragraph break.
+        "> p1\n>\n>\n> p3\n",
+        // Trailing blank `>` line, no follow-up content.
+        "> p1\n>\n",
+        // Trailing blank then partial next paragraph (no newline yet).
+        "> p1\n>\n> p2",
+        // Three-paragraph alert.
+        "> [!NOTE]\n> first\n>\n> second\n>\n> third\n",
+        // Alert whose first body line is blank (empty leading body para).
+        "> [!NOTE]\n>\n> body\n",
+        // Alert with blank, then content, then trailing blank.
+        "> [!TIP]\n>\n> tip body\n>\n",
+        // Inline markup spread across paragraphs.
+        "> **bold** in p1\n>\n> *italic* in p2 with `code` and [link](https://x)\n",
+        // Big multi-paragraph stress.
+        &stress,
+    ];
+    for md in cases {
+        let one = render_with(make, md);
+        let preview: String = md.chars().take(60).collect();
+        assert_eq!(streamed_with(make, md), one, "char-stream != one-shot for {:?}", preview);
+        for n in 1..=9 {
+            assert_eq!(chunked_with(make, md, n), one, "chunk={n} != one-shot for {:?}", preview);
+        }
+    }
+}
+
+#[test]
+fn multi_paragraph_blockquote_exact_bytes() {
+    // Pin the byte-exact shape so any future drift is loud — the cache must
+    // emit the same `\n`-separated sub-block layout the full renderer does.
+    let mut p = alerts(StreamParser::new());
+    p.append("> p1\n>\n> p2\n");
+    p.finalize();
+    assert_eq!(collect(&p), "<blockquote>\n<p>p1</p>\n<p>p2</p>\n</blockquote>");
+}
+
+#[test]
+fn multi_paragraph_id_stable_across_paragraph_breaks() {
+    // The block id must survive each paragraph break — closing a paragraph is
+    // an internal cache transition, not a block boundary.
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    p.append("> [!NOTE]\n");
+    p.append("> first body\n");
+    let id0 = p.all_blocks().last().unwrap().id;
+    p.append(">\n"); // close first paragraph
+    assert_eq!(p.all_blocks().last().unwrap().id, id0, "id stable across blank `>`");
+    p.append("> second body\n");
+    assert_eq!(p.all_blocks().last().unwrap().id, id0, "id stable into second paragraph");
+    p.append(">\n");
+    p.append("> third body\n");
+    assert_eq!(p.all_blocks().last().unwrap().id, id0, "id stable into third paragraph");
+    let h = collect(&p);
+    assert!(h.contains("first body") && h.contains("second body") && h.contains("third body"), "{h}");
 }

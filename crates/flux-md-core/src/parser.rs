@@ -258,12 +258,11 @@ struct TableCache {
 /// `> ` line is stripped once into `inner_buffer`, and only the unsettled
 /// inline tail is re-rendered per append.
 ///
-/// Limited to the single-paragraph-inner shape — by far the realistic LLM
-/// output (a long `> [!NOTE]` note, a `>`-quoted explanation). The cache
+/// Handles a multi-paragraph inner — each blank `>` line closes the current
+/// paragraph (rendered once into `committed_paras_html`) and starts a new one.
+/// The wrapper (blockquote / alert div + title) is unchanged. The cache
 /// bails (full path takes over) on any of:
 ///   - a line without a `>` marker (lazy continuation or end-of-container),
-///   - a `>`-marker line whose stripped content is blank (paragraph break
-///     inside the container — multi-block inner),
 ///   - a `\r` byte in any processed line (CRLF input — full path handles it).
 ///
 /// Disarmed when footnotes are on, mirroring `TableCache`: cell-level
@@ -281,17 +280,21 @@ struct ContainerCache {
     /// Wrapper opener that always appears: `<blockquote dir?>\n` for blockquote,
     /// or `<div class="...">\n<p class="...title">Title</p>\n` for an alert.
     wrapper_open: String,
-    /// Body paragraph opener: `<p dir?>` — emitted only when the inner has
-    /// content. An empty body must produce no `<p></p>` (matches the full
-    /// renderer, where an empty inner produces no body sub-block).
+    /// Body paragraph opener: `<p dir?>` — emitted only when the current
+    /// paragraph has content. An empty current paragraph must produce no
+    /// `<p></p>` (matches the full renderer's per-sub-block contract).
     body_p_open: String,
     /// Body paragraph closer plus the `\n` that the full renderer emits after
     /// each sub-block: `</p>\n`.
     body_p_close: String,
     /// Wrapper closer: `</blockquote>` or `</div>`.
     wrapper_close: String,
-    /// Stripped inner content built up so far, one `\n`-terminated line per
-    /// processed source line. Grows by O(new line length) per append.
+    /// Pre-rendered HTML of every fully-closed inner paragraph, each in the
+    /// shape `<p dir?>{inline}</p>\n`. Closed paragraphs never re-render
+    /// (each blank `>` line costs one final `render_inline` and one push).
+    committed_paras_html: String,
+    /// Stripped inner content of the CURRENT (still-open) paragraph, one
+    /// `\n`-terminated line per processed source line. Cleared on close.
     inner_buffer: String,
     /// Absolute buffer offset just past the last `\n` we've stripped into
     /// `inner_buffer`. The next complete line at this offset is the next
@@ -299,9 +302,9 @@ struct ContainerCache {
     lines_upto: usize,
     /// Position in `inner_buffer`; bytes in `[0..inner_cut]` are the settled
     /// prefix whose rendered HTML lives in `committed_inner_html` and is
-    /// never re-rendered again.
+    /// never re-rendered again. Resets to 0 when the current paragraph closes.
     inner_cut: usize,
-    /// Rendered inline HTML of `inner_buffer[0..inner_cut]`.
+    /// Rendered inline HTML of `inner_buffer[0..inner_cut]`. Cleared on close.
     committed_inner_html: String,
 }
 
@@ -1179,12 +1182,13 @@ impl StreamParser {
     }
 
     /// O(new bytes) extension of a long open blockquote / alert at the tail.
-    /// Strips the `>` marker from new lines into `inner_buffer`, runs the
-    /// paragraph-cache-style inline-boundary commit on the inner, and
-    /// re-renders only the unsettled tail. Returns `None` (dropping the
-    /// cache) the moment the inner stops being a single growing paragraph
-    /// (blank-after-marker line, a non-`>` line, or `\r`) — the full
-    /// reparse then handles the multi-block / lazy-continuation case.
+    /// Strips the `>` marker from new lines into `inner_buffer` for the open
+    /// paragraph, runs the paragraph-cache-style inline-boundary commit on
+    /// its inner, and re-renders only the unsettled tail. A blank `>` line
+    /// closes the current paragraph into `committed_paras_html` (rendered
+    /// once, never re-rendered) and starts a fresh one. Returns `None`
+    /// (dropping the cache) on a non-`>` line (lazy continuation or
+    /// end-of-container) or `\r`.
     fn try_incremental_container(&mut self) -> Option<Patch> {
         let mut cache = self.container_cache.take()?;
         let bytes = self.buffer.as_bytes();
@@ -1198,10 +1202,16 @@ impl StreamParser {
             return None;
         }
 
-        // Fold every newly-complete `> ` line into `inner_buffer`. Any bail
-        // condition (\r, missing marker, blank inner line) drops the cache
-        // so the full reparse can produce the correct multi-block / lazy-
-        // continuation output.
+        // Inline opts — built once, shared by the close-paragraph render and
+        // the per-append boundary pass. `&""` for the footnote-region pre-pass
+        // matches the paragraph-cache convention (the open container's inner
+        // can't define refs / footnote defs).
+        let opts = self.build_inline_opts("");
+
+        // Fold every newly-complete `> `-marker line. A blank `>` line closes
+        // the current paragraph (rendered once into `committed_paras_html`)
+        // and starts a fresh one; any other line is folded into the current
+        // paragraph's `inner_buffer`. Bails on `\r` or a non-`>` line.
         let mut pos = cache.lines_upto;
         while pos < end {
             let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
@@ -1215,8 +1225,15 @@ impl StreamParser {
             }
             let stripped = strip_blockquote_marker(&bytes[pos..content_end])?;
             if stripped.iter().all(|&b| matches!(b, b' ' | b'\t')) {
-                // `> ` (with no content) → blank inner line → paragraph break.
-                return None;
+                // Blank `>` line → close the current paragraph (if any).
+                // Consecutive blanks collapse: nothing to push when the
+                // current paragraph is empty.
+                if !cache.inner_buffer.is_empty() {
+                    close_container_paragraph(&mut cache, &opts);
+                }
+                cache.lines_upto = next;
+                pos = next;
+                continue;
             }
             let stripped_str = std::str::from_utf8(stripped).ok()?;
             cache.inner_buffer.push_str(stripped_str);
@@ -1238,7 +1255,8 @@ impl StreamParser {
             }
             if let Some(stripped) = strip_blockquote_marker(partial) {
                 // A leading `>` with only whitespace after it is the prefix of
-                // a maybe-blank inner line — stay safe and bail.
+                // a maybe-blank inner line — stay safe and render with what we
+                // have committed so far.
                 if !stripped.is_empty()
                     && !stripped.iter().all(|&b| matches!(b, b' ' | b'\t'))
                 {
@@ -1255,15 +1273,9 @@ impl StreamParser {
         let post_partial_len = cache.inner_buffer.len();
         let committed_inner_end = post_partial_len - partial_pushed;
 
-        // Build inline opts once for the whole append. Inner refs / footnote
-        // defs aren't part of this open container, so `&""` is fine for the
-        // footnote-region pre-pass (matches the paragraph-cache convention).
-        let opts = self.build_inline_opts("");
-
-        // Render boundary on the full active region (committed-tail + partial).
-        // The boundary tells us how far is now settled across resolved
-        // emphasis pairs, closed code spans, etc. Anything past
-        // `committed_inner_end` is partial and must stay uncommitted.
+        // Render boundary on the full active region (committed-tail + partial)
+        // for the CURRENT paragraph only. Closed paragraphs are fully settled
+        // in `committed_paras_html` and never re-rendered.
         let mut active_html = String::new();
         let boundary_rel = render_inline_boundary(
             &cache.inner_buffer[cache.inner_cut..],
@@ -1280,12 +1292,14 @@ impl StreamParser {
             render_inline(&cache.inner_buffer[cache.inner_cut..], &opts, &mut active_html);
         }
 
-        // Assemble in a single buffer with 1× memcpy of `committed_inner_html`
-        // (was 2× via an intermediate `inner_total` String). Trailing
-        // whitespace is trimmed in-place; an empty body has its `<p>` opener
-        // backed out so the output matches the full renderer (no `<p></p>`).
+        // Assemble in a single buffer with 1× memcpy of every committed
+        // paragraph and `committed_inner_html`. Trailing whitespace is trimmed
+        // in-place against the CURRENT paragraph's content only; an empty
+        // current paragraph has its `<p>` opener backed out so the output
+        // matches the full renderer (no `<p></p>`).
         let mut html = String::with_capacity(
             cache.wrapper_open.len()
+                + cache.committed_paras_html.len()
                 + cache.body_p_open.len()
                 + cache.committed_inner_html.len()
                 + active_html.len()
@@ -1293,12 +1307,13 @@ impl StreamParser {
                 + cache.wrapper_close.len(),
         );
         html.push_str(&cache.wrapper_open);
+        html.push_str(&cache.committed_paras_html);
         let body_p_start = html.len();
         html.push_str(&cache.body_p_open);
         let body_content_start = html.len();
         html.push_str(&cache.committed_inner_html);
         html.push_str(&active_html);
-        // Trim trailing whitespace from the body content (not from body_p_open).
+        // Trim trailing whitespace from the current paragraph's content.
         while html.len() > body_content_start
             && matches!(
                 html.as_bytes()[html.len() - 1],
@@ -1308,8 +1323,9 @@ impl StreamParser {
             html.pop();
         }
         if html.len() == body_content_start {
-            // Empty body → back out the `<p>` opener (matches the full
-            // renderer, which emits no body sub-block for an empty inner).
+            // Empty current paragraph → back out the `<p>` opener (matches
+            // the full renderer, which emits no body sub-block for an empty
+            // inner — true whether or not closed paragraphs precede it).
             html.truncate(body_p_start);
         } else {
             html.push_str(&cache.body_p_close);
@@ -1709,6 +1725,25 @@ fn build_table_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> 
     })
 }
 
+/// Close the current paragraph: render its inline once (settled — it will
+/// receive no more bytes) into `committed_paras_html` as `<p dir?>{inline}</p>\n`,
+/// matching `render_paragraph` + the trailing `\n` that `render_blockquote` /
+/// `render_alert` emit after each sub-block. Callers must ensure `inner_buffer`
+/// is non-empty (consecutive blank `>` lines must skip this).
+fn close_container_paragraph(cache: &mut ContainerCache, opts: &RenderOpts) {
+    let trimmed = cache.inner_buffer.trim_end_matches(|c: char| c == '\n' || c == '\r');
+    let mut tmp = String::with_capacity(trimmed.len());
+    render_inline(trimmed, opts, &mut tmp);
+    let final_text =
+        tmp.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r');
+    cache.committed_paras_html.push_str(&cache.body_p_open);
+    cache.committed_paras_html.push_str(final_text);
+    cache.committed_paras_html.push_str(&cache.body_p_close);
+    cache.inner_buffer.clear();
+    cache.inner_cut = 0;
+    cache.committed_inner_html.clear();
+}
+
 /// Arm the container cache for an open blockquote / alert at `start`. Returns
 /// `None` if the first inner line isn't fully present yet (so we can't safely
 /// commit to a kind — Blockquote vs. Alert is a first-line decision) or if
@@ -1771,6 +1806,7 @@ fn build_container_cache(
         body_p_open,
         body_p_close,
         wrapper_close,
+        committed_paras_html: String::new(),
         inner_buffer: String::new(),
         lines_upto,
         inner_cut: 0,
