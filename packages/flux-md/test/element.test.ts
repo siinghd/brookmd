@@ -335,6 +335,48 @@ test("switching from src to a markdown attribute supersedes the in-flight fetch"
   }
 });
 
+test("public append() supersedes an in-flight src fetch (no interleave)", async () => {
+  const streams = new Map<string, ReturnType<typeof makeControllableStream>>();
+  const signals = new Map<string, AbortSignal | undefined>();
+  const realFetch = (globalThis as Record<string, unknown>).fetch;
+  (globalThis as Record<string, unknown>).fetch = (url: string, init?: { signal?: AbortSignal }) => {
+    const s = makeControllableStream();
+    streams.set(url, s);
+    signals.set(url, init?.signal);
+    return Promise.resolve({ body: { getReader: () => s.reader }, text: () => Promise.resolve("") });
+  };
+
+  try {
+    const snap = snapshotSends();
+    const el = document.createElement("flux-markdown");
+    el.setAttribute("src", "a.md");
+    document.body.appendChild(el); // connect → streamFromSrc("a.md"), pends at first read
+    await flush();
+    const { worker: w, sid } = recoverStream(snap);
+
+    // Manually drive the stream — must abort the fetch and win.
+    el.append("MANUAL");
+    await flush();
+    expect(signals.get("a.md")?.aborted).toBe(true);
+
+    // The stale fetch resolving late must not interleave its chunk.
+    streams.get("a.md")!.push("AAA");
+    streams.get("a.md")!.close();
+    await flush();
+
+    const appends = w.sent
+      .filter((m) => m.streamId === sid && m.type === "append")
+      .map((m) => (m as { chunk: string }).chunk)
+      .join("");
+    expect(appends).toContain("MANUAL");
+    expect(appends).not.toContain("AAA");
+
+    el.remove();
+  } finally {
+    (globalThis as Record<string, unknown>).fetch = realFetch;
+  }
+});
+
 test("config attribute change while a caller-owned client is set is ignored (warns)", () => {
   const { client } = makeExternalClient();
   client.append("");

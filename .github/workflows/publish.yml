@@ -56,6 +56,7 @@ jobs:
         working-directory: packages/flux-md
         run: |
           tarball=$(npm pack --silent | tail -1)
+          test -n "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
           tar -tzvf "$tarball" | grep 'src/wasm/flux_md_core_bg\.wasm'
           size=$(tar -tzvf "$tarball" | awk '/src\/wasm\/flux_md_core_bg\.wasm$/ { print $3; exit }')
           test "${size:-0}" -gt 0
