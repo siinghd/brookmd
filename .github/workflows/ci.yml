@@ -47,6 +47,7 @@ jobs:
         # package with no WASM — this step is the tripwire.
         run: |
           tarball=$(npm pack --silent | tail -1)
+          test -n "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
           echo "packed $tarball"
           tar -tzvf "$tarball" | grep 'src/wasm/flux_md_core_bg\.wasm'
           size=$(tar -tzvf "$tarball" | awk '/src\/wasm\/flux_md_core_bg\.wasm$/ { print $3; exit }')
