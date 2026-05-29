@@ -105,12 +105,17 @@ export function defineFluxMarkdown(tag = "flux-markdown"): void {
     // --- Self-owned-client methods -------------------------------------------
 
     append(chunk: string): void {
+      // Manual drive supersedes any in-flight `src` fetch (mixing the two is out
+      // of contract; this makes the manual stream win predictably instead of
+      // interleaving a late fetch chunk into it).
+      this.#cancelSrcStream();
       this.#ensureClient();
       this.#client!.append(chunk);
     }
 
     finalize(): void {
       // Only meaningful for a self-owned stream; a no-op if no client yet.
+      this.#cancelSrcStream();
       this.#client?.finalize();
     }
 
