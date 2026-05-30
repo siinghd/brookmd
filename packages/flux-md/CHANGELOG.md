@@ -4,6 +4,24 @@ Notable changes to flux-md. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.11.0 — 2026-05-30
+
+### Added
+
+- **Opt-in live region + root attributes** on `<FluxMarkdown>` and
+  `mountFluxMarkdown`. The root accepts `className` (appended to `flux-md`),
+  `id`, `role`, and `aria-live` / `aria-atomic`. Set `aria-live="polite"` to
+  announce streamed content to screen readers — `polite` coalesces rapid updates
+  and does **not** read every token. Off by default; covers React and the DOM
+  mount (so the Web Component and the Vue/Svelte/Solid adapters too).
+
+### Docs
+
+- A repository root README, a "Structured block data" guide in the package
+  README, and a runnable **Data Studio** demo in the playground — a
+  sort/filter/CSV table and a live table of contents built entirely from
+  `block.data`, mid-stream.
+
 ## 0.10.0 — 2026-05-30
 
 Server-side rendering safety, plus an opt-in structured-data channel so consumers
