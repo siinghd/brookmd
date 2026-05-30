@@ -40,11 +40,11 @@ try {
 } catch (e) { fail("new FluxClient()", e); }
 
 // 3) React SSR of both modes renders the stable empty placeholder (hydrates clean).
+const { FluxClient } = await import("../src/index.ts");
 try {
   const { createElement } = await import("react");
   const { renderToString } = await import("react-dom/server");
   const { FluxMarkdown } = await import("../src/react.tsx");
-  const { FluxClient } = await import("../src/index.ts");
   const fromClient = renderToString(createElement(FluxMarkdown, { client: new FluxClient() }));
   async function* gen() { yield "# hi"; }
   const fromStream = renderToString(createElement(FluxMarkdown, { stream: gen() }));
@@ -52,6 +52,31 @@ try {
   if (!fromStream.includes("flux-md")) throw new Error("stream mode markup unexpected: " + fromStream);
   ok("renderToString <FluxMarkdown client> + <FluxMarkdown stream>");
 } catch (e) { fail("React renderToString", e); }
+
+// 4) Cross-framework SSR — safe here (dedicated process; no sibling suite to
+//    poison via @vue/runtime-dom's module-level `doc` cache). This is the
+//    load-bearing home for Vue/Solid/Svelte server rendering.
+try {
+  const { createSSRApp } = await import("vue");
+  const { renderToString: renderVue } = await import("vue/server-renderer");
+  const { FluxMarkdown: VueFlux } = await import("../src/vue.ts");
+  const html = await renderVue(createSSRApp(VueFlux, { client: new FluxClient() }));
+  if (typeof html !== "string" || !html.includes("<div")) throw new Error("vue SSR markup unexpected: " + html);
+  ok("Vue renderToString <FluxMarkdown>");
+} catch (e) { fail("Vue SSR", e); }
+
+try {
+  const { FluxMarkdown: SolidFlux } = await import("../src/solid.tsx");
+  const r = SolidFlux({ client: new FluxClient() }); // body runs on server
+  if (r !== undefined) throw new Error("solid server body should return placeholder undefined, got: " + r);
+  ok("Solid FluxMarkdown body (server placeholder)");
+} catch (e) { fail("Solid SSR", e); }
+
+try {
+  const sv = await import("../src/svelte.ts");
+  if (typeof sv.fluxMarkdown !== "function") throw new Error("svelte action export missing");
+  ok("Svelte action module (server-safe, not auto-invoked)");
+} catch (e) { fail("Svelte SSR", e); }
 
 if (failures > 0) {
   console.error(`\nSSR cold-import tripwire: ${failures} failure(s)`);

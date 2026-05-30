@@ -5,42 +5,35 @@ import { FluxClient } from "../src/client";
 import { FluxMarkdown } from "../src/react";
 
 /**
- * SSR-safety harness.
+ * SSR-safety harness (in-process).
  *
- * What this proves: importing every public entrypoint, constructing a
- * `FluxClient`, and server-rendering each framework adapter does NOT throw when
- * no browser globals exist (`window`/`document`/`Worker`/…all undefined) — i.e.
- * flux-md is safe to load and render during server-side rendering. The original
- * bug was `new FluxClient()` eagerly calling `pool.acquire()` →
+ * What this proves: importing the flux entrypoints, constructing a `FluxClient`,
+ * and React-server-rendering each `<FluxMarkdown>` mode does NOT throw when no
+ * browser globals exist (`window`/`document`/`Worker`/… all undefined). The
+ * original bug was `new FluxClient()` eagerly calling `pool.acquire()` →
  * `new Worker(...)` in its constructor, throwing "Worker is not defined" on the
- * server (and during a React SSR render pass via `useFluxStream`'s
- * `useState(() => new FluxClient(...))` initializer). Plus a render-time
- * `document.createElement` in the Solid adapter.
+ * server (and during a React SSR render via `useFluxStream`'s
+ * `useState(() => new FluxClient(...))` initializer).
  *
- * ## The bun shared-process subtlety (why we delete globals)
+ * ## Why no Vue/Solid/Svelte here — and why they live in `test:ssr-cold`
  *
- * `bun test` runs ALL test files in ONE process with ONE shared `globalThis`.
- * The sibling suites (react-stream, vue, solid, svelte, element, dom,
- * wasm-integration) install `window`/`document`/`navigator`/`HTMLElement`/… in
- * their `beforeAll` and never delete them. So by the time this file runs, a
- * leaked `document`/`Worker` may already be present — which would make a naive
- * "is it SSR?" check false. We therefore explicitly snapshot + DELETE the
- * relevant globals around each assertion (so `typeof document === "undefined"`
- * is genuinely true, exactly as on a real server), and restore them byte-exactly
- * in a `finally` — including restoring "was absent" as a delete, not as
- * `undefined` — so we never corrupt a sibling suite's leaked state (file order
- * under bun is not guaranteed).
+ * `bun test` runs ALL files in ONE process with ONE `globalThis`. `@vue/runtime-dom`
+ * (and peers) capture `const doc = typeof document !== "undefined" ? document : null`
+ * ONCE at module load. If this file imported `vue` while `document` is deleted, it
+ * would lock that cache to `null` for the WHOLE process — poisoning a sibling suite
+ * (e.g. vue.test.ts) that mounts a real component later. So this file imports only
+ * React (which does not cache `document` for server rendering) + the flux modules
+ * (which guard every global). The cross-framework SSR proof runs in a dedicated
+ * FRESH process (`bun test/ssr-cold.mjs`, the `test:ssr-cold` script) where importing
+ * a framework under a stripped env can poison nothing.
  *
- * ## Module-cache caveat
+ * ## The shared-process subtlety (why we delete globals)
  *
- * ESM modules evaluate once per process. A module a sibling suite already
- * imported is cached, so re-importing it under the server env will NOT re-run
- * its top-level code. That is fine: the import-safety assertion targets
- * top-level evaluation, which for these modules is import-safe regardless of env
- * (no top-level browser-global deref — cold-verified in a fresh process during
- * development). The construct/render assertions exercise CALL-TIME paths, which
- * read the live (now-deleted) globals — so the server env wraps the
- * construct/render calls, the load-bearing part.
+ * A sibling suite may have leaked `document`/`Worker` into `globalThis`. We snapshot
+ * + DELETE the relevant globals around each assertion (so `typeof document ===
+ * "undefined"` is genuinely true, as on a real server) and restore them byte-exactly
+ * in `finally` — restoring "was absent" as a delete, not `undefined` — so we never
+ * corrupt a sibling suite's state (file order under bun is not guaranteed).
  */
 
 const BROWSER_GLOBALS = [
@@ -96,29 +89,25 @@ async function withServerEnvAsync<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 // --------------------------------------------------------------------------
-// 1. Import-safety: every entrypoint loads without a browser env.
+// 1. Import-safety: the flux entrypoints load without a browser env. (Framework
+//    runtimes are intentionally excluded — see the header note; they are
+//    cold-imported in a fresh process by test:ssr-cold.) Under bun's module
+//    cache a sibling suite may have warm-loaded these; the load-bearing cold
+//    proof is test:ssr-cold. This stands as in-process regression documentation.
 // --------------------------------------------------------------------------
 
-test("every entrypoint imports without a browser env", async () => {
+test("flux entrypoints import without a browser env", async () => {
   await withServerEnvAsync(async () => {
-    // Mirrors package.json `exports` exactly: ".", "./client", "./react",
-    // "./dom", "./element", "./vue", "./svelte", "./solid", "./highlight"→hi,
-    // "./types". A throw fails the test. (Under bun's module cache these may hit
-    // a warm copy from a sibling suite; the load-bearing cold verification was
-    // done in a fresh process during development. This stands as regression
-    // documentation that a *first* server import would be safe.)
     await import("../src/index");
     await import("../src/client");
     await import("../src/react");
     await import("../src/dom");
     await import("../src/element");
-    await import("../src/vue");
-    await import("../src/svelte");
-    await import("../src/solid");
     await import("../src/hi");
     await import("../src/types");
     // NOTE: do NOT import ../src/worker — it is intentionally out of the server
-    // graph (worker-asset ref only); importing it directly is out of scope.
+    // graph (worker-asset ref only). Vue/Solid/Svelte runtimes are cold-imported
+    // by test:ssr-cold in a fresh process to avoid poisoning the shared process.
   });
 });
 
@@ -151,7 +140,7 @@ test("new FluxClient() does not throw on the server and getSnapshot() === []", (
 
 test("React renderToString(<FluxMarkdown client/>) is worker-free and stable", () => {
   withServerEnv(() => {
-    const client = new FluxClient(); // construct-safe (FILE 1)
+    const client = new FluxClient(); // construct-safe (lazy acquire)
     const html1 = renderToString(createElement(FluxMarkdown, { client }));
     const html2 = renderToString(createElement(FluxMarkdown, { client }));
     expect(html1).toBe(html2); // stable (empty snapshot both times)
@@ -174,67 +163,14 @@ test("React renderToString(<FluxMarkdown stream/>) does not throw", () => {
 });
 
 // --------------------------------------------------------------------------
-// 4. Vue server render.
-// --------------------------------------------------------------------------
-
-test("Vue renderToString of <FluxMarkdown> does not throw on the server", async () => {
-  await withServerEnvAsync(async () => {
-    const { createSSRApp } = await import("vue");
-    const { renderToString: renderVue } = await import("vue/server-renderer");
-    const adapter = await import("../src/vue");
-    const client = new FluxClient();
-    // setup() only does ref(null) + lifecycle registration (no DOM); onMounted
-    // never fires on the server → emits an empty <div>.
-    const html = await renderVue(createSSRApp(adapter.FluxMarkdown, { client }));
-    expect(typeof html).toBe("string");
-    expect(html).toContain("<div");
-  });
-});
-
-// --------------------------------------------------------------------------
-// 5. Solid server render — the FILE 2 regression guard.
-//    Calling the component body under the server env must return the server
-//    placeholder (undefined) and NOT throw "document is not defined". A body
-//    call is deterministic and directly exercises line 66's typeof guard,
-//    without wiring up solid-js/web's SSR runtime.
-// --------------------------------------------------------------------------
-
-test("Solid FluxMarkdown body is SSR-safe (returns server placeholder, no throw)", async () => {
-  await withServerEnvAsync(async () => {
-    const { FluxMarkdown: SolidFlux } = await import("../src/solid");
-    const client = new FluxClient();
-    let result: unknown;
-    expect(() => {
-      result = SolidFlux({ client });
-    }).not.toThrow();
-    expect(result).toBeUndefined(); // server placeholder (the FILE 2 guard)
-  });
-});
-
-// --------------------------------------------------------------------------
-// 6. Svelte — the adapter is a `use:` action, never invoked during Svelte SSR.
-//    There is no component to render; the meaningful assertion is that the
-//    module is server-safe and the action export exists but is not auto-run.
-// --------------------------------------------------------------------------
-
-test("Svelte action module is server-safe (action not invoked during SSR)", async () => {
-  await withServerEnvAsync(async () => {
-    const mod = await import("../src/svelte");
-    expect(typeof mod.fluxMarkdown).toBe("function"); // defined, never auto-run
-  });
-});
-
-// --------------------------------------------------------------------------
-// 7. Hydration parity: the server snapshot must equal the client's INITIAL
-//    snapshot so React/Vue/Solid markup matches on hydration. Both are the
-//    stable empty [] from emptyBlockStore() — produced WITHOUT constructing a
-//    worker (lazy acquire), so they match even on a client with no Worker yet.
+// 4. Hydration parity: the server snapshot must equal the client's INITIAL
+//    snapshot so the markup matches on hydration. Both are the stable empty []
+//    from emptyBlockStore() — produced WITHOUT constructing a worker (lazy
+//    acquire), so they match even on a client with no Worker yet.
 // --------------------------------------------------------------------------
 
 test("server snapshot equals the initial client snapshot (hydration parity)", () => {
   const serverSnap = withServerEnv(() => new FluxClient().getSnapshot());
-  // Client side: no append → never acquires → no Worker needed; initial snapshot
-  // is the same stable empty [].
   const clientSnap = new FluxClient().getSnapshot();
   expect(serverSnap).toEqual([]);
   expect(clientSnap).toEqual([]);
