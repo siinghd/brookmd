@@ -61,6 +61,42 @@ export interface HeadingData {
   id: string;
 }
 
+/**
+ * A CodeBlock's `kind.data` when {@link ParserConfig.blockData} is on. `lang` is
+ * the always-on info-string language (`null` for none); `code` is the opt-in
+ * DECODED source inside `<pre><code>…</code></pre>` (only present when `blockData`
+ * is on). Build a copy-to-clipboard string / re-highlight from `code` alone — no
+ * HTML re-parse, no entity-decode. When `blockData` is off, `code` is absent and
+ * `kind.data` is just `{ lang }`, byte-identical to before.
+ */
+export interface CodeBlockData {
+  lang: string | null;
+  code?: string;
+}
+
+/**
+ * A MathBlock's `kind.data` when {@link ParserConfig.blockData} is on. `latex` is
+ * the DECODED LaTeX source (the display-math body, entity-decoded). Re-render with
+ * KaTeX from `latex` alone — no HTML re-parse. When `blockData` is off, a
+ * MathBlock has no `kind.data` at all (byte-identical to before).
+ */
+export interface MathBlockData {
+  latex: string;
+}
+
+/**
+ * A List's `kind.data` when {@link ParserConfig.blockData} is on. `ordered` is the
+ * always-on flag; `start` is the opt-in ordered-list start number (the `start="N"`
+ * HTML attribute; `1` for an unordered list), only present when `blockData` is on.
+ * Renumber / continue a split list from `start` alone — no HTML re-parse. When
+ * `blockData` is off, `start` is absent and `kind.data` is just `{ ordered }`,
+ * byte-identical to before.
+ */
+export interface ListData {
+  ordered: boolean;
+  start?: number;
+}
+
 export interface Block {
   id: number;
   kind: BlockKind;
@@ -119,6 +155,30 @@ export interface BlockComponentProps {
    * DATA — no HTML re-parse.
    */
   heading?: HeadingData;
+  /**
+   * Structured code data — present for `CodeBlock` blocks when
+   * {@link ParserConfig.blockData} is on (otherwise `undefined`). `{ lang, code }`
+   * with `code` the DECODED source. Build a copy-to-clipboard string / re-highlight
+   * from `code` — no HTML re-parse, no entity-decode. (`props.text` / `props.language`
+   * carry the same source / lang and stay populated even when off, via the HTML
+   * regex fallback.)
+   */
+  code?: CodeBlockData;
+  /**
+   * Structured math data — present for `MathBlock` blocks when
+   * {@link ParserConfig.blockData} is on (otherwise `undefined`). `{ latex }` — the
+   * DECODED LaTeX source. Re-render with KaTeX from `latex` — no HTML re-parse.
+   * (`props.text` carries the same source and stays populated even when off, via
+   * the HTML regex fallback.)
+   */
+  math?: MathBlockData;
+  /**
+   * Structured list data — present for `List` blocks when
+   * {@link ParserConfig.blockData} is on (otherwise `undefined`). `{ ordered,
+   * start }` — renumber / continue a split list from `start` (the ordered-list
+   * start number) without re-parsing the `<ol start=…>` attribute.
+   */
+  list?: ListData;
 }
 
 /**

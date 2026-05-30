@@ -16,7 +16,7 @@
 //! same plain-object shape the derive produced — so these `serde_json` goldens
 //! also pin the wire contract `props.table = block.kind.data` depends on.
 
-use flux_md_core::blocks::{AlertKind, BlockKind, HeadingData, TableCell, TableData};
+use flux_md_core::blocks::{AlertKind, BlockKind, HeadingData, MathBlockData, TableCell, TableData};
 use std::rc::Rc;
 
 fn j(k: &BlockKind) -> String {
@@ -39,11 +39,21 @@ fn every_variant_matches_pre_refactor_golden() {
 
     // Unit kinds — no `data` key.
     assert_eq!(j(&BlockKind::Paragraph), r#"{"type":"Paragraph"}"#);
-    assert_eq!(j(&BlockKind::MathBlock), r#"{"type":"MathBlock"}"#);
     assert_eq!(j(&BlockKind::Mermaid), r#"{"type":"Mermaid"}"#);
     assert_eq!(j(&BlockKind::Blockquote), r#"{"type":"Blockquote"}"#);
     assert_eq!(j(&BlockKind::Rule), r#"{"type":"Rule"}"#);
     assert_eq!(j(&BlockKind::Html), r#"{"type":"Html"}"#);
+
+    // The MathBlock carrier: off (None) ⇒ unit `{"type":"MathBlock"}` with no
+    // `data` key, byte-identical to the pre-carrier unit variant; on (Some) ⇒
+    // `{"type":"MathBlock","data":{"latex":…}}`.
+    assert_eq!(j(&BlockKind::MathBlock(None)), r#"{"type":"MathBlock"}"#);
+    assert_eq!(
+        j(&BlockKind::MathBlock(Some(MathBlockData {
+            latex: "E = mc^2".into()
+        }))),
+        r#"{"type":"MathBlock","data":{"latex":"E = mc^2"}}"#
+    );
 
     // The Heading carrier: off (rich: None) ⇒ naked-scalar level (byte-identical
     // to the pre-carrier `Heading(u8)` wire); on (rich: Some) ⇒ the {level,text,
@@ -64,24 +74,51 @@ fn every_variant_matches_pre_refactor_golden() {
         r#"{"type":"Heading","data":{"level":2,"text":"Hello world","id":"hello-world"}}"#
     );
 
-    // Object payloads (derive-checked helper structs).
+    // Object payloads (derive-checked helper structs). The opt-in `code`/`start`
+    // field is OMITTED when `None` (off) via `skip_serializing_if`, so the off
+    // wire is byte-identical to before; present (on) it carries the source/number.
     assert_eq!(
-        j(&BlockKind::CodeBlock { lang: None }),
+        j(&BlockKind::CodeBlock { lang: None, code: None }),
         r#"{"type":"CodeBlock","data":{"lang":null}}"#
     );
     assert_eq!(
         j(&BlockKind::CodeBlock {
-            lang: Some("rust".into())
+            lang: Some("rust".into()),
+            code: None,
         }),
         r#"{"type":"CodeBlock","data":{"lang":"rust"}}"#
     );
+    // ON: the decoded source rides alongside the always-on `lang`.
     assert_eq!(
-        j(&BlockKind::List { ordered: true }),
+        j(&BlockKind::CodeBlock {
+            lang: Some("rust".into()),
+            code: Some("fn main() {}\n".into()),
+        }),
+        r#"{"type":"CodeBlock","data":{"lang":"rust","code":"fn main() {}\n"}}"#
+    );
+    assert_eq!(
+        j(&BlockKind::CodeBlock {
+            lang: None,
+            code: Some("plain\n".into()),
+        }),
+        r#"{"type":"CodeBlock","data":{"lang":null,"code":"plain\n"}}"#
+    );
+    assert_eq!(
+        j(&BlockKind::List { ordered: true, start: None }),
         r#"{"type":"List","data":{"ordered":true}}"#
     );
     assert_eq!(
-        j(&BlockKind::List { ordered: false }),
+        j(&BlockKind::List { ordered: false, start: None }),
         r#"{"type":"List","data":{"ordered":false}}"#
+    );
+    // ON: the ordered-list start number rides alongside the always-on `ordered`.
+    assert_eq!(
+        j(&BlockKind::List { ordered: true, start: Some(5) }),
+        r#"{"type":"List","data":{"ordered":true,"start":5}}"#
+    );
+    assert_eq!(
+        j(&BlockKind::List { ordered: false, start: Some(1) }),
+        r#"{"type":"List","data":{"ordered":false,"start":1}}"#
     );
     assert_eq!(
         j(&BlockKind::Alert {

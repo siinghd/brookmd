@@ -356,6 +356,10 @@ struct ListCache {
     id: u64,
     /// Ordered vs. unordered — locked at the first marker.
     ordered: bool,
+    /// The ordered-list start number (the `start="N"` HTML attribute; `1` for an
+    /// unordered list). Folded onto the active block's `BlockKind::List { start }`
+    /// when `block_data` is on, so the streamed `kind.data` matches the full path.
+    start_num: u32,
     /// Marker family + delimiter (`b'-'`/`b'*'`/`b'+'` for bullets,
     /// `b'.'`/`b')'` for ordered). A sibling must match.
     delim: u8,
@@ -649,6 +653,19 @@ impl StreamParser {
                 Some(Enrichment::Table(td)) => kind = BlockKind::Table(Some(td)),
                 Some(Enrichment::Heading(h)) => {
                     kind = BlockKind::Heading { level: h.level, rich: Some(h) }
+                }
+                // CodeBlock keeps its classified `lang`; only `code` is folded on.
+                Some(Enrichment::CodeBlock(code)) => {
+                    if let BlockKind::CodeBlock { lang, .. } = kind {
+                        kind = BlockKind::CodeBlock { lang, code: Some(code) };
+                    }
+                }
+                Some(Enrichment::MathBlock(md)) => kind = BlockKind::MathBlock(Some(md)),
+                // List keeps its classified `ordered`; only `start` is folded on.
+                Some(Enrichment::List(start)) => {
+                    if let BlockKind::List { ordered, .. } = kind {
+                        kind = BlockKind::List { ordered, start: Some(start) };
+                    }
                 }
                 None => {}
             }
@@ -1006,10 +1023,30 @@ impl StreamParser {
         } else if lines_nonempty || !partial.is_empty() {
             html.push('\n');
         }
+        // Opt-in structured channel: recover the decoded source from the just-
+        // assembled, already-trimmed HTML body (`html[body_start..]`, before the
+        // closer) by inverting `escape_html`. This makes the streamed `kind.data`
+        // byte-identical to the full path / `decodeCodeText`/`decodeMathText`, with
+        // no parallel raw-source state in the cache. Off (or for a Mermaid fence,
+        // which carries no enrichment) ⇒ the frozen `cache.kind` is reused as-is.
+        let kind = if self.block_data {
+            let src = crate::render::unescape_html_body(&html[body_start..]);
+            match &cache.kind {
+                BlockKind::CodeBlock { lang, .. } => {
+                    BlockKind::CodeBlock { lang: lang.clone(), code: Some(src) }
+                }
+                BlockKind::MathBlock(_) => {
+                    BlockKind::MathBlock(Some(crate::blocks::MathBlockData { latex: src }))
+                }
+                other => other.clone(),
+            }
+        } else {
+            cache.kind.clone()
+        };
         html.push_str(cache.closer_html);
         let block = Block {
             id: cache.id,
-            kind: cache.kind.clone(),
+            kind,
             start: cache.start,
             end,
             html,
@@ -1629,7 +1666,12 @@ impl StreamParser {
 
         let block = Block {
             id: cache.id,
-            kind: BlockKind::List { ordered: cache.ordered },
+            // Opt-in structured channel: fold the start number on when block_data
+            // is on (matches the full path); off ⇒ `start: None` (byte-identical).
+            kind: BlockKind::List {
+                ordered: cache.ordered,
+                start: if self.block_data { Some(cache.start_num) } else { None },
+            },
             start: cache.start,
             end,
             html,
@@ -2109,6 +2151,7 @@ fn build_list_cache(
         start,
         id,
         ordered,
+        start_num: list_start_num,
         delim: m.delim,
         edge: m.marker_indent,
         opener_html,

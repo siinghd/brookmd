@@ -244,13 +244,25 @@ function blockKindProps(block: Block): BlockComponentProps {
     speculative: block.speculative,
   };
   const data = block.kind.data as
-    | { lang?: string | null; tag?: string; attrs?: [string, string][] }
+    | { lang?: string | null; code?: string; latex?: string; start?: number; ordered?: boolean; tag?: string; attrs?: [string, string][] }
     | undefined;
   if (block.kind.type === "CodeBlock") {
-    props.text = decodeCodeText(block.html);
+    // Prefer the structured `code` (present when blockData is on) over the HTML
+    // regex — the lossless decoded source. Fall back to the regex when off.
+    props.text = data?.code ?? decodeCodeText(block.html);
     props.language = data?.lang ?? "";
+    if (typeof data?.code === "string") {
+      props.code = { lang: data.lang ?? null, code: data.code };
+    }
   } else if (block.kind.type === "MathBlock") {
-    props.text = decodeMathText(block.html);
+    props.text = data?.latex ?? decodeMathText(block.html);
+    if (typeof data?.latex === "string") {
+      props.math = { latex: data.latex };
+    }
+  } else if (block.kind.type === "List") {
+    if (data && typeof data.start === "number") {
+      props.list = { ordered: !!data.ordered, start: data.start };
+    }
   } else if (block.kind.type === "Component") {
     props.tag = data?.tag ?? "";
     // React-form attribute names, so `{...attrs}` spreads cleanly onto an element

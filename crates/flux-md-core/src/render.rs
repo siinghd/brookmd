@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::blocks::{AlertKind, BlockKind, HeadingData, TableCell, TableData};
+use crate::blocks::{AlertKind, BlockKind, HeadingData, MathBlockData, TableCell, TableData};
 use crate::inline::render_inline;
 use crate::scanner::{
     component_inner_range, indent_cols, is_blank_line, line_end, line_slice, scan, scan_marker,
@@ -180,15 +180,15 @@ pub fn classify(raw: &RawBlockKind, slice: &str, gfm_alerts: bool) -> BlockKind 
         RawBlockKind::CodeFence { info, .. } => {
             let lang = info.split_whitespace().next().unwrap_or("");
             match lang {
-                "math" | "latex" | "tex" => BlockKind::MathBlock,
+                "math" | "latex" | "tex" => BlockKind::MathBlock(None),
                 "mermaid" => BlockKind::Mermaid,
-                "" => BlockKind::CodeBlock { lang: None },
-                other => BlockKind::CodeBlock { lang: Some(other.to_string()) },
+                "" => BlockKind::CodeBlock { lang: None, code: None },
+                other => BlockKind::CodeBlock { lang: Some(other.to_string()), code: None },
             }
         }
-        RawBlockKind::IndentedCode => BlockKind::CodeBlock { lang: None },
-        RawBlockKind::MathFence { .. } => BlockKind::MathBlock,
-        RawBlockKind::List { ordered, .. } => BlockKind::List { ordered: *ordered },
+        RawBlockKind::IndentedCode => BlockKind::CodeBlock { lang: None, code: None },
+        RawBlockKind::MathFence { .. } => BlockKind::MathBlock(None),
+        RawBlockKind::List { ordered, .. } => BlockKind::List { ordered: *ordered, start: None },
         RawBlockKind::Blockquote => BlockKind::Blockquote,
         RawBlockKind::Table => BlockKind::Table(None),
         RawBlockKind::HorizontalRule => BlockKind::Rule,
@@ -214,6 +214,16 @@ pub enum Enrichment {
     Table(TableData),
     /// ATX or Setext heading — folds onto `BlockKind::Heading { rich: Some(_) }`.
     Heading(HeadingData),
+    /// Fenced or indented code block — folds the decoded source onto
+    /// `BlockKind::CodeBlock { code: Some(_), .. }` (the classified `lang` is
+    /// preserved).
+    CodeBlock(String),
+    /// Display-math block — folds onto `BlockKind::MathBlock(Some(_))`.
+    MathBlock(MathBlockData),
+    /// Ordered/unordered list — folds the start number onto
+    /// `BlockKind::List { start: Some(_), .. }` (the classified `ordered` is
+    /// preserved).
+    List(u32),
 }
 
 /// Render one block to HTML. Returns `Some(Enrichment)` only for a top-level
@@ -232,12 +242,38 @@ pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut S
         }
         RawBlockKind::Paragraph => render_paragraph(slice, opts, out),
         RawBlockKind::CodeFence { info, fence_char, fence_len, terminated } => {
-            render_code_fence(slice, info, *fence_char, *fence_len, *terminated, out)
+            // A ```math/```latex/```tex fence classifies to MathBlock (a ```mermaid
+            // fence to Mermaid, which carries no enrichment); route the decoded
+            // source onto the matching carrier so it rides the right `data`.
+            let src = render_code_fence(slice, info, *fence_char, *fence_len, *terminated, opts, out);
+            if let Some(code) = src {
+                let lang = info.split_whitespace().next().unwrap_or("");
+                match lang {
+                    "math" | "latex" | "tex" => {
+                        return Some(Enrichment::MathBlock(MathBlockData { latex: code }))
+                    }
+                    // A ```mermaid fence classifies to the unit `Mermaid` kind,
+                    // which is intentionally NOT enriched (see report) — drop the
+                    // source so it is not mis-routed onto a CodeBlock carrier.
+                    "mermaid" => {}
+                    _ => return Some(Enrichment::CodeBlock(code)),
+                }
+            }
         }
-        RawBlockKind::IndentedCode => render_indented_code(slice, out),
-        RawBlockKind::MathFence { terminated } => render_math_block(slice, *terminated, out),
+        RawBlockKind::IndentedCode => {
+            return render_indented_code(slice, opts, out).map(Enrichment::CodeBlock)
+        }
+        RawBlockKind::MathFence { terminated } => {
+            return render_math_block(slice, *terminated, opts, out)
+                .map(|latex| Enrichment::MathBlock(MathBlockData { latex }))
+        }
         RawBlockKind::Blockquote => render_blockquote(slice, opts, out),
-        RawBlockKind::List { ordered, start } => render_list(slice, *ordered, *start, opts, out),
+        RawBlockKind::List { ordered, start } => {
+            render_list(slice, *ordered, *start, opts, out);
+            if opts.block_data {
+                return Some(Enrichment::List(*start));
+            }
+        }
         RawBlockKind::Table => return render_table(slice, opts, out).map(Enrichment::Table),
         RawBlockKind::HorizontalRule => out.push_str("<hr>"),
         RawBlockKind::HtmlBlock { .. } => render_html_block(slice, opts, out),
@@ -386,14 +422,19 @@ fn render_paragraph(slice: &str, opts: &RenderOpts, out: &mut String) {
     out.push_str("</p>");
 }
 
+/// Render a fenced code block. When `opts.block_data` is on, also returns the
+/// DECODED source (the exact `content` it escapes into the `<pre><code>` body) so
+/// the enrichment carries the same text `decodeCodeText` re-derives from the HTML;
+/// returns `None` when off (zero extra allocation).
 fn render_code_fence(
     slice: &str,
     info: &str,
     _fence_char: u8,
     _fence_len: usize,
     _terminated: bool,
+    opts: &RenderOpts,
     out: &mut String,
-) {
+) -> Option<String> {
     let bytes = slice.as_bytes();
     let first_nl = bytes.iter().position(|&b| b == b'\n').map(|i| i + 1).unwrap_or(bytes.len());
     let content_start = first_nl;
@@ -427,6 +468,69 @@ fn render_code_fence(
         out.push('\n');
     }
     out.push_str("</code></pre>");
+    // Opt-in source: the bytes BETWEEN the tags, decoded — which here is `content`
+    // itself plus the SAME trailing-`\n` normalization the HTML body carries, so
+    // `data.code` is byte-identical to `decodeCodeText(block.html)`. Off ⇒ no work.
+    if opts.block_data {
+        Some(code_body_source(content))
+    } else {
+        None
+    }
+}
+
+/// Inverse of [`escape_html`]: decode the four entities it can emit (`&lt; &gt;
+/// &amp; &quot;`) back to their literals. Used by the streaming fence cache to
+/// recover the decoded code/LaTeX source from an already-assembled, already-
+/// trimmed HTML body — guaranteeing `kind.data.code`/`.latex` is byte-identical to
+/// the full path (and to the client's `decodeCodeText`/`decodeMathText`). `&amp;`
+/// is decoded LAST so `&amp;lt;` → `&lt;` (not `<`), mirroring the client's
+/// `decodeEntities` ordering. The body never contains `&#39;` (`escape_html` does
+/// not emit it), so it is not handled.
+pub(crate) fn unescape_html_body(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if body[i..].starts_with("&lt;") {
+                out.push('<');
+                i += 4;
+                continue;
+            } else if body[i..].starts_with("&gt;") {
+                out.push('>');
+                i += 4;
+                continue;
+            } else if body[i..].starts_with("&quot;") {
+                out.push('"');
+                i += 6;
+                continue;
+            } else if body[i..].starts_with("&amp;") {
+                out.push('&');
+                i += 5;
+                continue;
+            }
+        }
+        let ch = body[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// The decoded source the `<pre><code>` body holds for a `content` string: empty
+/// stays empty; otherwise a trailing `\n` is guaranteed (mirroring the HTML the
+/// code renderers emit), so it equals `decodeCodeText(block.html)` byte-for-byte.
+fn code_body_source(content: &str) -> String {
+    if content.is_empty() {
+        String::new()
+    } else if content.ends_with('\n') {
+        content.to_string()
+    } else {
+        let mut s = String::with_capacity(content.len() + 1);
+        s.push_str(content);
+        s.push('\n');
+        s
+    }
 }
 
 /// Emit a code-fence opening tag `<pre><code…>` for the given info string.
@@ -486,7 +590,11 @@ pub(crate) fn is_fence_close_line(line: &[u8]) -> bool {
 /// LaTeX from the element's text content. We never process the body as
 /// markdown. An open (still-streaming) block has no closer yet, so its content
 /// is everything after the opener.
-fn render_math_block(slice: &str, terminated: bool, out: &mut String) {
+/// Render a display-math fence (`$$…$$` / `\[…\]`). When `opts.block_data` is on,
+/// also returns the decoded LaTeX source (the trimmed `content` it escapes into
+/// the `<div class="math math-display">` body), matching `decodeMathText(block
+/// .html)`; `None` when off.
+fn render_math_block(slice: &str, terminated: bool, opts: &RenderOpts, out: &mut String) -> Option<String> {
     // Leading indent is ≤3 spaces (guaranteed by the scanner); trim it plus any
     // trailing newline so we can match the opener delimiter.
     let s = slice.trim_start_matches([' ', '\t']);
@@ -511,6 +619,13 @@ fn render_math_block(slice: &str, terminated: bool, out: &mut String) {
     out.push_str("<div class=\"math math-display\">");
     escape_html(content, out);
     out.push_str("</div>");
+    // The HTML body is exactly `escape_html(content)`, so the decoded LaTeX source
+    // is `content` — byte-identical to `decodeMathText(block.html)`. Off ⇒ no work.
+    if opts.block_data {
+        Some(content.to_string())
+    } else {
+        None
+    }
 }
 
 fn render_setext_heading(slice: &str, level: u8, opts: &RenderOpts, out: &mut String) -> Option<HeadingData> {
@@ -547,7 +662,10 @@ fn render_setext_heading(slice: &str, level: u8, opts: &RenderOpts, out: &mut St
     heading_data(level, inner)
 }
 
-fn render_indented_code(slice: &str, out: &mut String) {
+/// Render an indented code block. When `opts.block_data` is on, also returns the
+/// decoded source (the de-indented body + the trailing `\n` the HTML always
+/// carries), matching `decodeCodeText(block.html)`; `None` when off.
+fn render_indented_code(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<String> {
     let mut content = String::with_capacity(slice.len());
     for line in slice.split_inclusive('\n') {
         let bytes = line.as_bytes();
@@ -573,6 +691,16 @@ fn render_indented_code(slice: &str, out: &mut String) {
     escape_html(trimmed, out);
     out.push('\n');
     out.push_str("</code></pre>");
+    // The HTML body is `trimmed` + an always-present trailing `\n`, so the decoded
+    // source is `trimmed + "\n"` — byte-identical to `decodeCodeText(block.html)`.
+    if opts.block_data {
+        let mut s = String::with_capacity(trimmed.len() + 1);
+        s.push_str(trimmed);
+        s.push('\n');
+        Some(s)
+    } else {
+        None
+    }
 }
 
 /// Strip the blockquote prefix (≤3 spaces, one `>`, one optional space) from

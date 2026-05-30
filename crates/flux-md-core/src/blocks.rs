@@ -56,10 +56,36 @@ pub enum BlockKind {
     /// `Table(Option<TableData>)`, a single `Option`-bearing field — not a paired
     /// bare/with-data variant — covers both wire shapes (the generic carrier).
     Heading { level: u8, rich: Option<HeadingData> },
-    CodeBlock { lang: Option<String> },
-    MathBlock,
+    /// A fenced or indented code block. `lang` is the always-on info-string
+    /// language (`None` for none). `code` is the opt-in structured channel
+    /// (`setBlockData`): `None` (default-off) ⇒ serializes as
+    /// `{"type":"CodeBlock","data":{"lang":<...>}}`, byte-identical to before;
+    /// `Some(src)` (on) ⇒ `{"type":"CodeBlock","data":{"lang":<...>,"code":"<src>"}}`
+    /// carrying the DECODED source text inside `<pre><code>…</code></pre>` so a
+    /// consumer can build a copy-to-clipboard string / re-highlight from DATA
+    /// without re-parsing (and entity-decoding) the rendered HTML. The opt-in
+    /// `code` rides behind `#[serde(skip_serializing_if)]` so the off wire stays
+    /// byte-identical.
+    CodeBlock { lang: Option<String>, code: Option<String> },
+    /// A display-math block (`$$…$$` / `\[…\]` / a fenced `math` block). The
+    /// `Option<MathBlockData>` is the opt-in structured channel (`setBlockData`):
+    /// `None` (default-off) ⇒ serializes as `{"type":"MathBlock"}` with no `data`
+    /// key, byte-identical to before; `Some(md)` (on) ⇒
+    /// `{"type":"MathBlock","data":{"latex":"<src>"}}` carrying the DECODED LaTeX
+    /// source so a consumer can re-render with KaTeX from DATA without re-parsing
+    /// (and entity-decoding) the display HTML. The single `Option`-bearing variant
+    /// is the generic carrier (like `Table(Option<TableData>)`).
+    MathBlock(Option<MathBlockData>),
     Mermaid,
-    List { ordered: bool },
+    /// An ordered or unordered list. `ordered` is the always-on flag. `start` is
+    /// the opt-in structured channel (`setBlockData`): `None` (default-off) ⇒
+    /// serializes as `{"type":"List","data":{"ordered":<bool>}}`, byte-identical
+    /// to before; `Some(n)` (on) ⇒ `{"type":"List","data":{"ordered":<bool>,
+    /// "start":<n>}}` carrying the ordered-list start number (the `start="N"` HTML
+    /// attribute) so a consumer can renumber / continue a split list from DATA
+    /// without re-parsing the `<ol start=…>` attribute. The opt-in `start` rides
+    /// behind `#[serde(skip_serializing_if)]` so the off wire stays byte-identical.
+    List { ordered: bool, start: Option<u32> },
     Blockquote,
     /// GitHub-style alert / admonition (a `> [!NOTE]` blockquote). `kind`
     /// serializes to a lowercase string ("note", "tip", …) so the JS layer can
@@ -94,10 +120,20 @@ pub enum BlockKind {
 #[derive(Serialize)]
 struct CodeBlockData<'a> {
     lang: &'a Option<String>,
+    /// Opt-in decoded source (`setBlockData`); omitted entirely when off so the
+    /// wire stays byte-identical (`{"lang":…}`), present when on (`{"lang":…,
+    /// "code":"…"}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: &'a Option<String>,
 }
 #[derive(Serialize)]
 struct ListData {
     ordered: bool,
+    /// Opt-in ordered-list start (`setBlockData`); omitted when off so the wire
+    /// stays byte-identical (`{"ordered":…}`), present when on (`{"ordered":…,
+    /// "start":N}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<u32>,
 }
 #[derive(Serialize)]
 struct AlertData {
@@ -141,7 +177,6 @@ impl Serialize for BlockKind {
         match self {
             // True unit kinds — `{"type": tag}` with no `data` key.
             BlockKind::Paragraph
-            | BlockKind::MathBlock
             | BlockKind::Mermaid
             | BlockKind::Blockquote
             | BlockKind::Rule
@@ -153,10 +188,14 @@ impl Serialize for BlockKind {
                 Some(h) => with_data(s, "Heading", h),
                 None => with_data(s, "Heading", level),
             },
-            // Object payloads via the derive-checked helper structs.
-            BlockKind::CodeBlock { lang } => with_data(s, "CodeBlock", &CodeBlockData { lang }),
-            BlockKind::List { ordered } => {
-                with_data(s, "List", &ListData { ordered: *ordered })
+            // Object payloads via the derive-checked helper structs. The opt-in
+            // `code`/`start` field is omitted when `None` (off) via
+            // `skip_serializing_if`, so the off wire stays byte-identical.
+            BlockKind::CodeBlock { lang, code } => {
+                with_data(s, "CodeBlock", &CodeBlockData { lang, code })
+            }
+            BlockKind::List { ordered, start } => {
+                with_data(s, "List", &ListData { ordered: *ordered, start: *start })
             }
             BlockKind::Alert { kind } => with_data(s, "Alert", &AlertData { kind: *kind }),
             BlockKind::Component { tag, attrs } => {
@@ -166,6 +205,10 @@ impl Serialize for BlockKind {
             BlockKind::Table(opt) => match opt {
                 Some(td) => with_data(s, "Table", td),
                 None => no_data(s, "Table"),
+            },
+            BlockKind::MathBlock(opt) => match opt {
+                Some(md) => with_data(s, "MathBlock", md),
+                None => no_data(s, "MathBlock"),
             },
         }
     }
@@ -187,6 +230,20 @@ pub struct HeadingData {
     pub level: u8,
     pub text: String,
     pub id: String,
+}
+
+/// Structured math payload for the opt-in `kind.data` channel (the `Some` payload
+/// of `BlockKind::MathBlock`). Serializes to `{ latex: <source> }`.
+///
+/// `latex` is the DECODED LaTeX source — the same text the client's
+/// `decodeMathText` re-derives from `block.html` by extracting the
+/// `<div class="math math-display">…</div>` (or `<pre><code>…</code></pre>` for a
+/// fenced `math`/`latex`/`tex` block) body and entity-decoding it, done once in
+/// Rust here so a `components.MathBlock` override can re-render with KaTeX from
+/// DATA — no HTML re-parse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MathBlockData {
+    pub latex: String,
 }
 
 /// Structured table payload for the opt-in `kind.data` channel (the
@@ -275,7 +332,7 @@ impl BlockKind {
             BlockKind::Paragraph => "Paragraph",
             BlockKind::Heading { .. } => "Heading",
             BlockKind::CodeBlock { .. } => "CodeBlock",
-            BlockKind::MathBlock => "MathBlock",
+            BlockKind::MathBlock(_) => "MathBlock",
             BlockKind::Mermaid => "Mermaid",
             BlockKind::List { .. } => "List",
             BlockKind::Blockquote => "Blockquote",
