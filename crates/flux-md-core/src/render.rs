@@ -1018,6 +1018,7 @@ pub(crate) const FN_TOK_TAG: u8 = b'F';
 /// O(src.len()).
 pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, out: &mut String) {
     let bytes = src.as_bytes();
+    let out_start = out.len();
     let mut i = 0;
     while i < bytes.len() {
         // A token starts with `\u{0}F\u{1}`.
@@ -1053,8 +1054,12 @@ pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, 
                 i = k + 1; // skip past the closing NUL
                 continue;
             }
-            // Malformed token (truncated) — should never happen; copy the open
-            // byte verbatim and continue so we never panic or lose bytes.
+            // Malformed/truncated token — unreachable from generated output
+            // (try_footnote_ref emits tokens atomically), but if it ever occurs
+            // (e.g. a forged sentinel via unsafe_html) DROP the lone reserved
+            // open byte rather than leaking a control char into user HTML.
+            i += 1;
+            continue;
         }
         // Copy this byte verbatim (UTF-8 safe: tokens are ASCII-delimited and we
         // only ever advance past whole tokens or single bytes; non-token bytes
@@ -1063,6 +1068,15 @@ pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, 
         out.push_str(&src[i..i + ch_len]);
         i += ch_len;
     }
+    // Invariant: no unresolved footnote placeholder token may survive into
+    // user-facing HTML. Debug-only (zero release cost); the streaming fuzz
+    // corpus exercises this across thousands of docs/feature combos.
+    debug_assert!(
+        !out.as_bytes()[out_start..]
+            .windows(3)
+            .any(|w| w == [FN_TOK_OPEN, FN_TOK_TAG, FN_TOK_SEP]),
+        "unresolved footnote placeholder token survived resolution",
+    );
 }
 
 /// Length in bytes of the UTF-8 character whose lead byte is `b`.
