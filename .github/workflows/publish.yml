@@ -26,6 +26,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+      - name: Install nightly + rust-src for the size-optimized WASM build
+        # build:wasm uses -Z build-std + panic=immediate-abort (nightly only) to
+        # shrink the binary; that needs the nightly toolchain with the rust-src
+        # component and the wasm target. Native cargo (test:rust) stays on stable.
+        run: rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: crates/flux-md-core
