@@ -80,6 +80,17 @@ pub struct RenderOpts {
     /// through every render_inline caller) is far more invasive. Seeded from
     /// the committed occurrence counts so ids stay unique across the stream.
     pub footnote_occ: RefCell<HashMap<String, usize>>,
+    /// Footnote-ref PLACEHOLDER mode (streaming caches). When on, an inline
+    /// `[^label]` whose label is numbered emits the `href="#fn-N"` + visible `N`
+    /// exactly as normal, but the occurrence-dependent `id="fnref-…"` value is
+    /// emitted as an opaque sentinel token carrying both `N` and the raw label
+    /// (`\u{0}F\u{1}{N}\u{1}{label}\u{0}`) and the `footnote_occ` counter is NOT
+    /// advanced. A later [`resolve_footnote_ids`] pass replaces every token with
+    /// the real `fnref-N`/`fnref-N-K` suffix in document order. This lets the
+    /// tail caches freeze occurrence-INDEPENDENT html once (the only per-stream
+    /// state — the occurrence index — is resolved on commit). Off (default) =
+    /// behavior byte-identical to before.
+    pub footnote_placeholder: bool,
     /// Opt-in component-tag allowlist, carried so recursive sub-block scans
     /// (inside lists/quotes/components) recognize nested component tags too.
     pub component_tags: Vec<Box<str>>,
@@ -959,12 +970,13 @@ pub(crate) fn collect_footnote_refs(
     });
 }
 
-/// Count every reference occurrence per label (for backref generation).
-pub(crate) fn count_footnote_refs(text: &str, counts: &mut HashMap<String, usize>) {
-    for_each_footnote_ref(text, |label| {
-        *counts.entry(label.to_string()).or_insert(0) += 1;
-    });
-}
+// Note: a raw `count_footnote_refs(committed_slice)` used to advance the
+// committed occurrence map, but it counted `[^x]` inside code spans / escaped
+// text (which emit no ref) → over-count → broken backrefs. The committed advance
+// is now derived from the RESOLVED placeholder-token replay of the committed
+// blocks (see `resolve_block_footnotes` + `occ_after_block` in `parser.rs`), so
+// seed == tokens by construction. `for_each_footnote_ref` stays in use for the
+// numbering passes (`collect_footnote_refs`).
 
 /// Collect footnote definitions (label → rendered-inline HTML) from `text`.
 /// First definition wins.
@@ -981,6 +993,90 @@ pub(crate) fn collect_footnote_defs(text: &str, defs: &mut HashMap<String, Strin
                 defs.insert(label, html);
             }
         }
+    }
+}
+
+// --- Footnote-ref placeholder tokens (streaming-cache path) ---------------
+//
+// A footnote ref's only occurrence-dependent slot is `id="fnref-{suffix}"`.
+// In placeholder mode `try_footnote_ref` emits, in place of the suffix, the
+// token `\u{0}F\u{1}{N}\u{1}{label}\u{0}`. NUL/SOH are control chars that the
+// HTML escaper passes through verbatim and that never occur in normal rendered
+// output, so the linear [`resolve_footnote_ids`] pass can find every token and
+// rewrite it to the real `fnref-N`/`fnref-N-K` suffix in document order. If a
+// label itself contains NUL or SOH (pathological markdown source) the emitter
+// falls back to the normal non-placeholder path, so the tokens stay unambiguous.
+pub(crate) const FN_TOK_OPEN: u8 = 0x00; // \u{0}
+pub(crate) const FN_TOK_SEP: u8 = 0x01; // \u{1}
+pub(crate) const FN_TOK_TAG: u8 = b'F';
+
+/// Replace every footnote-ref placeholder token in `src` with its resolved
+/// `fnref` suffix, copying all other bytes verbatim, into `out`. `occ` is the
+/// running per-label occurrence map and is advanced exactly once per token (so
+/// the token replay is the SOLE source of truth for the occurrence count — it
+/// matches what the non-placeholder path would have produced byte-for-byte).
+/// O(src.len()).
+pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, out: &mut String) {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // A token starts with `\u{0}F\u{1}`.
+        if bytes[i] == FN_TOK_OPEN
+            && bytes.get(i + 1) == Some(&FN_TOK_TAG)
+            && bytes.get(i + 2) == Some(&FN_TOK_SEP)
+        {
+            // Parse `{N}` up to the next SOH.
+            let n_start = i + 3;
+            let mut j = n_start;
+            while j < bytes.len() && bytes[j] != FN_TOK_SEP {
+                j += 1;
+            }
+            // Parse `{label}` up to the closing NUL.
+            let label_start = j + 1;
+            let mut k = label_start;
+            while k < bytes.len() && bytes[k] != FN_TOK_OPEN {
+                k += 1;
+            }
+            if j < bytes.len() && k < bytes.len() {
+                let n = &src[n_start..j];
+                let label = &src[label_start..k];
+                let c = occ.entry(label.to_string()).or_insert(0);
+                let occurrence = *c;
+                *c += 1;
+                // The token sits inside `id="fnref-<token>"`, so emit ONLY the
+                // occurrence suffix (`N` or `N-K`), not the `fnref-` prefix.
+                out.push_str(n);
+                if occurrence != 0 {
+                    out.push('-');
+                    out.push_str(&(occurrence + 1).to_string());
+                }
+                i = k + 1; // skip past the closing NUL
+                continue;
+            }
+            // Malformed token (truncated) — should never happen; copy the open
+            // byte verbatim and continue so we never panic or lose bytes.
+        }
+        // Copy this byte verbatim (UTF-8 safe: tokens are ASCII-delimited and we
+        // only ever advance past whole tokens or single bytes; non-token bytes
+        // are copied through unchanged, preserving multi-byte sequences).
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&src[i..i + ch_len]);
+        i += ch_len;
+    }
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is `b`.
+fn utf8_char_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b >> 5 == 0b110 {
+        2
+    } else if b >> 4 == 0b1110 {
+        3
+    } else if b >> 3 == 0b11110 {
+        4
+    } else {
+        1 // continuation/invalid lead — copy one byte, never panic
     }
 }
 

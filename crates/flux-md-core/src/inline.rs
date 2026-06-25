@@ -1291,20 +1291,43 @@ fn try_footnote_ref(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut Str
     let label = std::str::from_utf8(&bytes[start + 2..j]).ok()?;
     let num = *opts.footnotes.get(label)?;
     let n = num.to_string();
-    // Occurrence index for this label (0-based). The Kth (K≥1) reference gets a
-    // unique id `fnref-N-(K+1)` so repeated references don't collide.
-    let occurrence = {
-        let mut occ = opts.footnote_occ.borrow_mut();
-        let c = occ.entry(label.to_string()).or_insert(0);
-        let k = *c;
-        *c += 1;
-        k
-    };
-    let id = if occurrence == 0 { n.clone() } else { format!("{n}-{}", occurrence + 1) };
     out.push_str("<sup class=\"footnote-ref\"><a href=\"#fn-");
     out.push_str(&n);
     out.push_str("\" id=\"fnref-");
-    out.push_str(&id);
+    // Placeholder mode (streaming caches): emit an occurrence-INDEPENDENT
+    // sentinel token for the `fnref-…` suffix instead of computing it now (and
+    // do NOT advance the per-label occurrence counter). A later
+    // `resolve_footnote_ids` pass rewrites it in document order. Falls back to
+    // the normal path if the label carries the token delimiters (so the tokens
+    // stay unambiguous). When the flag is off, behavior is byte-identical to
+    // before.
+    if opts.footnote_placeholder && !label.contains(['\u{0}', '\u{1}']) {
+        out.push('\u{0}');
+        out.push('F');
+        out.push('\u{1}');
+        out.push_str(&n);
+        out.push('\u{1}');
+        out.push_str(label);
+        out.push('\u{0}');
+    } else {
+        // Occurrence index for this label (0-based). The Kth (K≥1) reference gets
+        // a unique id `fnref-N-(K+1)` so repeated references don't collide.
+        let occurrence = {
+            let mut occ = opts.footnote_occ.borrow_mut();
+            let c = occ.entry(label.to_string()).or_insert(0);
+            let k = *c;
+            *c += 1;
+            k
+        };
+        // Emit ONLY the occurrence suffix — the `id="fnref-` prefix is already
+        // written above (mirrors the placeholder token, which also carries just
+        // the suffix).
+        out.push_str(&n);
+        if occurrence != 0 {
+            out.push('-');
+            out.push_str(&(occurrence + 1).to_string());
+        }
+    }
     out.push_str("\">");
     out.push_str(&n);
     out.push_str("</a></sup>");
