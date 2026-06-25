@@ -1,5 +1,6 @@
 import type { FluxClient } from "./client";
 import { highlight } from "./hi";
+import { morph } from "./morph";
 import type { Align, Block, BlockComponentProps, BlockKindTag, ListData, RenderMetricsHook, TableData } from "./types-core";
 import { blockProps, extractLang } from "./block-props";
 
@@ -61,6 +62,16 @@ export interface MountOptions {
   highlightCode?: boolean;
   /** Coalesce patches into one DOM write per animation frame. Default true. */
   batch?: boolean;
+  /**
+   * Opt-in (default false). When a generic open/streaming block grows, morph its
+   * existing DOM subtree **in place** toward the new HTML instead of rebuilding
+   * the whole node with `innerHTML`. The browser then only repaints/relayouts
+   * the parts that changed, and focus/text-selection inside the streaming tail
+   * survive a token append. The default path (full rebuild) is byte-identical
+   * and unchanged; this only affects generic blocks rendered via the `innerHTML`
+   * fast path (not code/math/mermaid/component overrides). The morphed subtree is
+   * equivalent to the rebuilt one. */
+  morphOpenBlocks?: boolean;
   /** Appended to the root's `className` (the `flux-md` class is always present). */
   className?: string;
   /** Set on the root element. */
@@ -147,6 +158,7 @@ export function mountFluxMarkdown(
   const hasPerf = typeof performance !== "undefined";
   const highlightCode = options.highlightCode !== false && !components?.CodeBlock;
   const batch = options.batch !== false && typeof requestAnimationFrame === "function";
+  const morphOpenBlocks = options.morphOpenBlocks === true;
 
   const root = document.createElement("div");
   root.className = options.className ? `flux-md ${options.className}` : "flux-md";
@@ -225,6 +237,30 @@ export function mountFluxMarkdown(
           existing.speculative = b.speculative;
           continue;
         }
+      }
+      // Opt-in morph fast path: an open generic block that only grew its HTML
+      // (same kind, still routed through the innerHTML path) is morphed in place,
+      // preserving the node's identity, focus, and selection. Falls through to a
+      // full rebuild for anything not eligible (commit transition, kind change,
+      // code/math/mermaid/override blocks). This is still a render of the node, so
+      // it feeds the render-churn probe.
+      if (
+        morphOpenBlocks &&
+        b.open &&
+        existing.open &&
+        existing.generic &&
+        existing.kind === b.kind.type &&
+        usesGenericPath(b)
+      ) {
+        morph(existing.node, sanitize ? sanitize(b.html) : b.html);
+        if (onRenderMetrics) noteRender(existing, b, t0);
+        existing.html = b.html;
+        existing.speculative = b.speculative;
+        existing.node.className = genericClassName(b);
+        // The node stays the generic innerHTML mirror, so it remains eligible for
+        // the prefix-append / morph fast paths on later patches.
+        existing.generic = !sanitize;
+        continue;
       }
       // Prefix-extension tail-append fast path (generic blocks only, no
       // sanitizer). When the new html merely *appends* one or more WHOLE
@@ -378,11 +414,7 @@ export function mountFluxMarkdown(
 
     // 3. Generic fast path.
     const node = document.createElement("div");
-    node.className =
-      "flux-block flux-block-" +
-      kind.toLowerCase() +
-      (b.open ? " flux-open" : "") +
-      (b.speculative ? " flux-speculative" : "");
+    node.className = genericClassName(b);
     // Streaming-tail keyed path: an OPEN Blockquote / Alert with structured
     // `nested` data (blockData on) builds its wrapper with one child node per
     // inner sub-block instead of a single full-wrapper `innerHTML`. Each child's
@@ -540,6 +572,36 @@ export function mountFluxMarkdown(
     // Route cell html through the same sanitize path the generic block uses.
     cell.innerHTML = sanitize ? sanitize(html) : html;
     return cell;
+  }
+
+  // The class string for a generic-path block node. Shared by the initial
+  // render and the in-place morph branch so a morphed node keeps the exact
+  // class string (e.g. dropping `flux-speculative`) a rebuild would have set.
+  function genericClassName(b: Block): string {
+    return (
+      "flux-block flux-block-" +
+      b.kind.type.toLowerCase() +
+      (b.open ? " flux-open" : "") +
+      (b.speculative ? " flux-speculative" : "")
+    );
+  }
+
+  // True when a block renders through the generic `innerHTML` fast path — the
+  // only path the in-place morph applies to. Mirrors the dispatch order in
+  // renderBlockContent: an override (block-kind or Component tag) or a dedicated
+  // renderer (highlighted code / math / mermaid) all opt OUT of morphing.
+  function usesGenericPath(b: Block): boolean {
+    const kind = b.kind.type;
+    if (components) {
+      if (kind === "Component") {
+        const tag = (b.kind.data as { tag?: string } | undefined)?.tag;
+        if ((tag && components[tag]) || components.Component) return false;
+      }
+      if (components[kind]) return false;
+    }
+    if (kind === "CodeBlock") return !highlightCode;
+    if (kind === "MathBlock" || kind === "Mermaid") return false;
+    return true;
   }
 
   // An override may return an element (used directly) or an HTML string (wrapped
