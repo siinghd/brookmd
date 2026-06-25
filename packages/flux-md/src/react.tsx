@@ -6,6 +6,7 @@ import {
   useRef,
   useState,
   useSyncExternalStore,
+  useDeferredValue,
   type CSSProperties,
   type ReactElement,
 } from "react";
@@ -120,6 +121,19 @@ interface FluxMarkdownProps {
   "aria-live"?: "off" | "polite" | "assertive";
   /** Live-region atomicity; pair with `aria-live`. Off by default. */
   "aria-atomic"?: boolean;
+  /**
+   * **Opt-in, off by default.** Render the block list through React's
+   * `useDeferredValue`, so a burst of patches can yield to higher-priority
+   * updates and the streaming tail commits at a lower priority. When a deferred
+   * render is in flight the root carries an extra `flux-deferred` class (style it
+   * however you like). This is a *no-op on a single patch*, has no effect during
+   * SSR (`useDeferredValue` is a client-only concern), and **does not change
+   * output** — only commit timing. Leaving it unset is recommended; rAF
+   * coalescing (the DOM adapter's batched path) is the preferred way to absorb
+   * high-frequency patches. Provided for callers who specifically want React's
+   * concurrent deferral of the visible tail.
+   */
+  deferTail?: boolean;
 }
 
 // The original render path: subscribe to a (required, caller- or hook-owned)
@@ -135,20 +149,35 @@ function FluxMarkdownFromClient({
   role,
   "aria-live": ariaLive,
   "aria-atomic": ariaAtomic,
+  deferTail,
 }: FluxMarkdownProps & { client: FluxClient }) {
   const blocks = useSyncExternalStore(client.subscribe, client.getSnapshot, client.getSnapshot);
+  // Opt-in (off by default): defer the tail through React's concurrent priority
+  // so a burst of patches can yield. `useDeferredValue` is a no-op on the server
+  // (it returns its argument during SSR) and a no-op on a single patch, so the
+  // default (`deferTail` unset) path is byte- and timing-identical to before.
+  const deferred = useDeferredValue(blocks);
+  const rendered = deferTail ? deferred : blocks;
+  const isDeferring = deferTail ? rendered !== blocks : false;
   // Normalize "no overrides" to a stable `undefined` so memo comparisons and
   // the fast path don't churn on an empty object identity.
   const comps = components && Object.keys(components).length > 0 ? components : undefined;
+  const rootClass = isDeferring
+    ? className
+      ? `flux-md flux-deferred ${className}`
+      : "flux-md flux-deferred"
+    : className
+      ? `flux-md ${className}`
+      : "flux-md";
   return (
     <div
-      className={className ? `flux-md ${className}` : "flux-md"}
+      className={rootClass}
       id={id}
       role={role}
       aria-live={ariaLive}
       aria-atomic={ariaAtomic}
     >
-      {blocks.map((b) => (
+      {rendered.map((b) => (
         <BlockView key={b.id} block={b} components={comps} virtualize={virtualize} sanitize={sanitize} />
       ))}
       {stickToBottom && <div aria-hidden="true" style={{ scrollSnapAlign: "end" }} className="flux-bottom-anchor" />}
