@@ -185,8 +185,13 @@ function FluxMarkdownFromClient({
   const rendered = deferTail ? deferred : blocks;
   const isDeferring = deferTail ? rendered !== blocks : false;
   // Normalize "no overrides" to a stable `undefined` so memo comparisons and
-  // the fast path don't churn on an empty object identity.
-  const comps = components && Object.keys(components).length > 0 ? components : undefined;
+  // the fast path don't churn on an empty object identity. Memoized on
+  // [components] so the Object.keys scan runs only when the prop changes, not
+  // on every tail patch (identity is unchanged, so blocksEqual still holds).
+  const comps = useMemo(
+    () => (components && Object.keys(components).length > 0 ? components : undefined),
+    [components],
+  );
   // Wrap the user hook so each fire also advances the client's aggregate
   // renderCount. Memoized on (client, hook) so its identity stays stable across
   // tail patches — a fresh closure would bust every block's memo. When no hook
@@ -329,9 +334,10 @@ export function useFluxMarkdownString(
 
   // Reconcile the parser to the controlled string. setContent diffs internally,
   // so this stays correct whether `content` grows by a token or is swapped wholesale.
+  const streaming = options?.streaming;
   useEffect(() => {
-    client.setContent(content, { done: options?.streaming === false });
-  }, [client, content, options?.streaming]);
+    client.setContent(content, { done: streaming === false });
+  }, [client, content, streaming]);
 
   return client;
 }
@@ -931,7 +937,7 @@ function renderBlockContent({
     const items = ld?.items;
     const tagOverride =
       !!components && (!!components.ul || !!components.ol || !!components.li);
-    if (items && items.length > 0 && !tagOverride) {
+    if (Array.isArray(items) && items.length > 0 && !tagOverride) {
       return (
         <KeyedList
           className={className}

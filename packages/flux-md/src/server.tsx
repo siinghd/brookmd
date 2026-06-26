@@ -68,7 +68,13 @@ export function initFlux(opts?: { wasm?: BufferSource | WebAssembly.Module }): P
         await initWasmAsync({ module_or_path: wasmUrl });
         ready = true;
       }
-    })();
+    })().catch((err) => {
+      // Drop the cached rejected promise so a transient failure (e.g. a flaky
+      // .wasm fetch on the web path) can be retried by the next initFlux()
+      // instead of poisoning every subsequent call until a process restart.
+      initPromise = null;
+      throw err;
+    });
   }
   return initPromise;
 }

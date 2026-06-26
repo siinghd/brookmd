@@ -455,7 +455,7 @@ export function mountFluxMarkdown(
   function renderKeyedList(b: Block): HTMLElement | null {
     const ld = b.kind.data as ListData | undefined;
     const items = ld?.items;
-    if (!items || items.length === 0) return null;
+    if (!Array.isArray(items) || items.length === 0) return null;
     const node = document.createElement("div");
     node.className =
       "flux-block flux-block-list" +
@@ -803,7 +803,18 @@ export function mountFluxMarkdown(
 function tableData(b: Block): TableData | undefined {
   if (b.kind.type !== "Table") return undefined;
   const data = b.kind.data as TableData | undefined;
-  return data && Array.isArray(data.rows) ? data : undefined;
+  // Validate the shapes the keyed path indexes (rows/aligns/headers) so a
+  // drifted/malformed blockData wire falls back to the full-HTML path instead
+  // of crashing makeRow/makeCell on `aligns[j]`/`headers.map` of undefined.
+  if (
+    !data ||
+    !Array.isArray(data.rows) ||
+    !Array.isArray(data.aligns) ||
+    !Array.isArray(data.headers)
+  ) {
+    return undefined;
+  }
+  return data;
 }
 
 // HTML void elements: they self-terminate, so they never push element depth.

@@ -385,7 +385,13 @@ export function defineFluxMarkdown(tag = "flux-markdown"): void {
         // A supersede/disconnect aborts the fetch — intentional, not an error.
         if (abort.signal.aborted || !current()) return;
         // eslint-disable-next-line no-console
-        console.error("<flux-markdown>: failed to stream src", src, err);
+        // Log only the message — `src` can carry a tokenized URL and `err` can be
+        // a large structured body; both would otherwise be shipped verbatim by any
+        // console-forwarding monitoring. (src is still on the element for debugging.)
+        console.error(
+          "<flux-markdown>: failed to stream src",
+          err instanceof Error ? err.message : String(err),
+        );
       }
     }
   }

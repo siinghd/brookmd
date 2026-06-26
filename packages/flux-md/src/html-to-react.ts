@@ -149,11 +149,19 @@ function safeStyle(style: Record<string, string>): Record<string, string> {
   return out;
 }
 
+// Single-char classifiers for parseOpenTag, hoisted to module scope so the
+// scan loops don't re-evaluate a fresh regex literal per character on every
+// block render (parseTrustedHtml runs this for every open streaming block).
+const TAG_CHAR = /[a-zA-Z0-9-]/;
+const WS_CHAR = /\s/;
+const ATTR_NAME_END = /[\s=>/]/;
+const UNQUOTED_VALUE_END = /[\s>]/;
+
 /** Parse one opening tag starting at `start` (the `<`). */
 function parseOpenTag(html: string, start: number) {
   let i = start + 1;
   let j = i;
-  while (j < html.length && /[a-zA-Z0-9-]/.test(html[j])) j++;
+  while (j < html.length && TAG_CHAR.test(html[j])) j++;
   // Preserve the tag's ORIGINAL case so an inline custom-component element (e.g.
   // `<Cite>`) dispatches to `components.Cite`. Standard elements the core emits
   // are already lowercase; the semantic checks below (VOID, `input`, close-tag
@@ -163,18 +171,18 @@ function parseOpenTag(html: string, start: number) {
   const attrs: Record<string, string | true> = {};
   while (i < html.length) {
     const loopStart = i;
-    while (i < html.length && /\s/.test(html[i])) i++;
+    while (i < html.length && WS_CHAR.test(html[i])) i++;
     if (html[i] === ">") return { tag, attrs, selfClose: false, next: i + 1 };
     if (html[i] === "/" && html[i + 1] === ">") return { tag, attrs, selfClose: true, next: i + 2 };
     if (i >= html.length) break;
     let k = i;
-    while (k < html.length && !/[\s=>/]/.test(html[k])) k++;
+    while (k < html.length && !ATTR_NAME_END.test(html[k])) k++;
     const name = html.slice(i, k);
     i = k;
-    while (i < html.length && /\s/.test(html[i])) i++;
+    while (i < html.length && WS_CHAR.test(html[i])) i++;
     if (html[i] === "=") {
       i++;
-      while (i < html.length && /\s/.test(html[i])) i++;
+      while (i < html.length && WS_CHAR.test(html[i])) i++;
       let value = "";
       const q = html[i];
       if (q === '"' || q === "'") {
@@ -184,7 +192,7 @@ function parseOpenTag(html: string, start: number) {
         i = e === -1 ? html.length : e + 1;
       } else {
         let v = i;
-        while (v < html.length && !/[\s>]/.test(html[v])) v++;
+        while (v < html.length && !UNQUOTED_VALUE_END.test(html[v])) v++;
         value = html.slice(i, v);
         i = v;
       }
