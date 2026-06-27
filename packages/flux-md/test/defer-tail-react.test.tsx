@@ -69,7 +69,7 @@ test("deferTail off (default): output unchanged, no flux-deferred class", async 
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] }),
       ...PATCH_META,
     });
   });
@@ -91,7 +91,7 @@ test("deferTail on: renders without error, no-op on a single patch", async () =>
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>two</p>", true)] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>two</p>", true)] }),
       ...PATCH_META,
     });
   });
@@ -116,7 +116,7 @@ test("deferTail on: caller className preserved", async () => {
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>x</p>", false)], active: [] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>x</p>", false)], active: [] }),
       ...PATCH_META,
     });
   });

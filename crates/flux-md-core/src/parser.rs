@@ -24,7 +24,18 @@ use crate::url::escape_html;
 /// block quotes and list items (definitions are document-wide, §4.7). `ctx`
 /// keeps the block split identical to the render-time scan (e.g. a `$$…$$`
 /// math fence stays one block instead of being mis-read).
-fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx) {
+/// Max container-nesting depth for the link-reference-definition sweep. This
+/// recursion descends into blockquote/list inner content during `append`, so —
+/// like the renderer's [`render::MAX_RENDER_DEPTH`] — it must be bounded or an
+/// adversarial `">".repeat(10_000)` overflows the WASM shadow stack (an
+/// uncatchable trap). 100 is far beyond any real document and well under the
+/// 256 KB stack; a link reference nested >100 containers deep is meaningless.
+const MAX_REF_DEPTH: usize = 100;
+
+fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx, depth: usize) {
+    if depth >= MAX_REF_DEPTH {
+        return;
+    }
     let bytes = text.as_bytes();
     for raw in scan(text, ctx) {
         match &raw.kind {
@@ -35,14 +46,14 @@ fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx) {
             }
             RawBlockKind::Blockquote => {
                 let inner = blockquote_inner(&text[raw.range.clone()]);
-                collect_refs(&inner, refs, ctx);
+                collect_refs(&inner, refs, ctx, depth + 1);
             }
             RawBlockKind::List { .. } => {
                 // Re-split the list into items and recurse into each body.
                 let slice = &text[raw.range.clone()];
                 for item in split_list_items(slice) {
                     if let Some(body) = item_body(item.as_bytes()) {
-                        collect_refs(&body, refs, ctx);
+                        collect_refs(&body, refs, ctx, depth + 1);
                     }
                 }
             }
@@ -839,7 +850,7 @@ impl StreamParser {
         // lookup time (first-definition-wins).
         let committed_refs = Rc::clone(&self.committed_refs);
         let mut tail_refs = HashMap::new();
-        collect_refs(tail, &mut tail_refs, ctx);
+        collect_refs(tail, &mut tail_refs, ctx, 0);
 
         // Renderable blocks: skip link-ref defs (no output) and, when footnotes
         // are on, footnote definitions (collected into the section instead).
@@ -1305,7 +1316,7 @@ impl StreamParser {
             // future change stashes a clone of the committed table, this fires in
             // tests before the silent O(n²) regression ships.
             debug_assert_eq!(Rc::strong_count(&self.committed_refs), 1);
-            collect_refs(committed_slice, Rc::make_mut(&mut self.committed_refs), ctx);
+            collect_refs(committed_slice, Rc::make_mut(&mut self.committed_refs), ctx, 0);
         }
 
         Patch { newly_committed, active: new_active }

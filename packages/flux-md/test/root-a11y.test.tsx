@@ -110,12 +110,12 @@ test("hydrateRoot over server markup produces no hydration mismatch", async () =
   worker.fire({
     type: "patch",
     streamId: 1,
-    patch: {
+    patch: JSON.stringify({
       newly_committed: [
         { id: 1, kind: { type: "Paragraph" }, start: 0, end: 0, html: "<p>hello</p>", open: false, speculative: false },
       ],
       active: [],
-    },
+    }),
     appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
   });
 

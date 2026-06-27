@@ -1,11 +1,15 @@
-import type { FromWorker, ParserConfig, Patch, ToWorker } from "./types-core";
+import type { FromWorker, ParserConfig, ToWorker } from "./types-core";
 
 /** The slice of `FluxParser` the worker drives — narrowed to an interface so the
  *  message/readiness state machine is unit-testable with a fake parser, no WASM.
- *  (Same testability move as {@link FluxPool} taking an injected worker factory.) */
+ *  (Same testability move as {@link FluxPool} taking an injected worker factory.)
+ *
+ *  `append`/`finalize` return the patch as a **JSON string**, not an object: the
+ *  worker forwards it verbatim to the main thread (a string structuredClones far
+ *  cheaper than an object graph) where it is `JSON.parse`d exactly once. */
 export interface ParserLike {
-  append(chunk: string): Patch;
-  finalize(): Patch;
+  append(chunk: string): string;
+  finalize(): string;
   free(): void;
   retainedBytes(): number;
 }
@@ -113,7 +117,7 @@ export class WorkerCore {
     this.totalAppended.delete(streamId);
   }
 
-  private emitPatch(streamId: number, patch: Patch, parser: ParserLike, parseMicros: number): void {
+  private emitPatch(streamId: number, patch: string, parser: ParserLike, parseMicros: number): void {
     this.deps.post({
       type: "patch",
       streamId,
@@ -144,7 +148,7 @@ export class WorkerCore {
         // can't hit the init race, but any other construction failure becomes a
         // posted error rather than an uncaught exception that kills the worker.
         const parser = this.getOrCreate(streamId);
-        const patch = parser.append(chunk) as Patch;
+        const patch = parser.append(chunk);
         const dt = (performance.now() - t0) * 1000;
         this.totalAppended.set(streamId, (this.totalAppended.get(streamId) ?? 0) + chunk.length);
         this.emitPatch(streamId, patch, parser, dt);
@@ -165,7 +169,7 @@ export class WorkerCore {
         parser.append(buffered);
         this.totalAppended.set(streamId, (this.totalAppended.get(streamId) ?? 0) + buffered.length);
       }
-      const patch = parser.finalize() as Patch;
+      const patch = parser.finalize();
       this.emitPatch(streamId, patch, parser, 0);
     } catch (e: unknown) {
       this.deps.post({ type: "error", streamId, message: e instanceof Error ? e.message : String(e) });

@@ -59,7 +59,7 @@ const firePatch = (w: FakeWorker, sid: number, patch: { newly_committed: Block[]
   w.fire({
     type: "patch",
     streamId: sid,
-    patch,
+    patch: JSON.stringify(patch),
     appendedBytes: 0,
     parseMicros: 0,
     retainedBytes: 0,

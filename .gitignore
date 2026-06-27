@@ -7,7 +7,14 @@ crates/*/target/
 
 # Web build output
 web/dist/
+web/dist-flux/
 *.tsbuildinfo
+
+# Compiled package output (built on demand by `bun run --cwd packages/flux-md build`
+# and by prepublishOnly). Ignored at the repo root — ABOVE the package — so it
+# stays out of git but is still shipped by `npm pack` (files=["dist"]); see the
+# WASM note below for why repo-root ignores don't reach npm-packlist.
+/packages/flux-md/dist/
 
 # Generated WASM (wasm-pack output) — built on demand, never committed.
 # Ignored here at the repo root, ABOVE the package, so it stays out of git but

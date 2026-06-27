@@ -259,7 +259,14 @@ export function useFluxStream(
   // initializer in DEV, constructing a throwaway second client whose worker
   // slot isn't reclaimed — a minor dev-only artifact; production runs it once.
   // The committed client is what's used, and its lifecycle below is correct.)
-  const [client] = useState(() => new FluxClient({ config: options?.config }));
+  // Coalesce store emits to one notify per frame (rAF) by default — matches the
+  // framework-neutral DOM adapter's `batch` default and collapses streaming
+  // patch bursts into a single React render per frame (fewer commits under load /
+  // many concurrent streams). Falls back to synchronous when rAF is unavailable
+  // (SSR / tests), and `finalize()` always flushes synchronously so stream
+  // completion is never deferred. Callers who own their own FluxClient keep full
+  // control of `coalesce`.
+  const [client] = useState(() => new FluxClient({ config: options?.config, coalesce: true }));
   // Read onError through a ref so its identity never re-subscribes the stream.
   const onErrorRef = useRef(options?.onError);
   onErrorRef.current = options?.onError;
@@ -321,7 +328,14 @@ export function useFluxMarkdownString(
   content: string,
   options?: { config?: ParserConfig; streaming?: boolean },
 ): FluxClient {
-  const [client] = useState(() => new FluxClient({ config: options?.config }));
+  // Coalesce store emits to one notify per frame (rAF) by default — matches the
+  // framework-neutral DOM adapter's `batch` default and collapses streaming
+  // patch bursts into a single React render per frame (fewer commits under load /
+  // many concurrent streams). Falls back to synchronous when rAF is unavailable
+  // (SSR / tests), and `finalize()` always flushes synchronously so stream
+  // completion is never deferred. Callers who own their own FluxClient keep full
+  // control of `coalesce`.
+  const [client] = useState(() => new FluxClient({ config: options?.config, coalesce: true }));
 
   // Own the client's pool attachment (StrictMode dev double-mount destroys on the
   // simulated unmount then remounts the SAME instance; reattach re-registers and

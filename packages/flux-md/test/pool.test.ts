@@ -69,7 +69,7 @@ test("messages are demuxed to the owning stream's handler only", () => {
   const w = created[0];
 
   const patch = (streamId: number): FromWorker => ({
-    type: "patch", streamId, patch: { newly_committed: [], active: [] },
+    type: "patch", streamId, patch: JSON.stringify({ newly_committed: [], active: [] }),
     appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
   });
   w.fire(patch(s1.streamId));
@@ -307,7 +307,7 @@ test("onBlock fires once per committed block in document order, not for the acti
   });
   created[0].fire({
     type: "patch", streamId: sid,
-    patch: { newly_committed: [blk(1), blk(2)], active: [blk(3)] },
+    patch: JSON.stringify({ newly_committed: [blk(1), blk(2)], active: [blk(3)] }),
     appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
   });
   expect(got).toEqual([1, 2]); // committed in order; the active block (3) does not fire
@@ -339,7 +339,7 @@ test("release frees the stream slot, sends dispose, keeps the worker warm", () =
   expect(pool.workerCount).toBe(1);
   // After release, messages for the freed stream are dropped (no handler).
   created[0].fire({
-    type: "patch", streamId: s.streamId, patch: { newly_committed: [], active: [] },
+    type: "patch", streamId: s.streamId, patch: JSON.stringify({ newly_committed: [], active: [] }),
     appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
   });
   // (No throw = pass; the handler map no longer has streamId.)
@@ -403,14 +403,14 @@ test("outline() and toPlaintext() derive from the streamed snapshot", () => {
 
   created[0].fire({
     type: "patch", streamId: sid,
-    patch: {
+    patch: JSON.stringify({
       newly_committed: [
         heading(1, 1, "Title"),
         para(2, "<p>Hello &amp; <strong>world</strong></p>"),
         heading(3, 2, "Sub"),
       ],
       active: [],
-    },
+    }),
     appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
   });
 

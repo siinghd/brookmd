@@ -713,8 +713,22 @@ export class FluxClient {
 
   private onMessage(msg: FromWorker) {
     switch (msg.type) {
-      case "patch":
-        applyPatch(this.store, msg.patch);
+      case "patch": {
+        // The worker forwards the WASM patch as a JSON string (cheap to clone);
+        // parse it once here on the main thread. A malformed patch must surface
+        // via onError, not throw inside the message handler (which would break the
+        // pool's dispatch loop for every stream on the worker).
+        let patch: Patch;
+        try {
+          patch = JSON.parse(msg.patch) as Patch;
+        } catch (e) {
+          const message = e instanceof Error ? e.message : String(e);
+          if (this.onError) this.onError({ message: `flux: malformed patch (${message})` });
+          // eslint-disable-next-line no-console
+          else console.error("flux: malformed patch:", message);
+          break;
+        }
+        applyPatch(this.store, patch);
         this.appendedBytes = msg.appendedBytes;
         this.totalParseMicros += msg.parseMicros;
         this.retainedBytes = msg.retainedBytes;
@@ -730,9 +744,10 @@ export class FluxClient {
         // anything that just committed (document order). A throw here is
         // isolated by the pool's dispatch boundary and won't skip emit().
         if (this.onBlock) {
-          for (const b of msg.patch.newly_committed) this.onBlock(b);
+          for (const b of patch.newly_committed) this.onBlock(b);
         }
         break;
+      }
       case "error":
         if (this.onError) {
           this.onError({ message: msg.message, fatal: msg.fatal });

@@ -76,7 +76,7 @@ function patch(committed: Block[], active: Block[], streamId: number): FromWorke
   return {
     type: "patch",
     streamId,
-    patch: { newly_committed: committed, active },
+    patch: JSON.stringify({ newly_committed: committed, active }),
     appendedBytes: 0,
     parseMicros: 0,
     retainedBytes: 0,

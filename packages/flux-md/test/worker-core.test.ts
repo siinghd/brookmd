@@ -14,14 +14,14 @@ const EMPTY_PATCH: Patch = { newly_committed: [], active: [] };
 class FakeParser implements ParserLike {
   calls: string[] = [];
   appended = "";
-  append(chunk: string): Patch {
+  append(chunk: string): string {
     this.calls.push(`append:${chunk}`);
     this.appended += chunk;
-    return EMPTY_PATCH;
+    return JSON.stringify(EMPTY_PATCH);
   }
-  finalize(): Patch {
+  finalize(): string {
     this.calls.push("finalize");
-    return EMPTY_PATCH;
+    return JSON.stringify(EMPTY_PATCH);
   }
   free(): void {
     this.calls.push("free");
@@ -152,13 +152,13 @@ test("a parser-construction failure becomes a posted error, not an uncaught thro
 class TerminalParser implements ParserLike {
   text = "";
   private done = false;
-  append(c: string): Patch {
+  append(c: string): string {
     if (!this.done) this.text += c;
-    return EMPTY_PATCH;
+    return JSON.stringify(EMPTY_PATCH);
   }
-  finalize(): Patch {
+  finalize(): string {
     this.done = true;
-    return EMPTY_PATCH;
+    return JSON.stringify(EMPTY_PATCH);
   }
   free(): void {}
   retainedBytes(): number {

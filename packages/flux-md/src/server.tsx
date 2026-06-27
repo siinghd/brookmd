@@ -121,7 +121,8 @@ export function parseToBlocks(markdown: string, opts?: { config?: ParserConfig }
   try {
     p.append(markdown);
     p.finalize();
-    return p.allBlocks() as Block[];
+    // allBlocks() returns a JSON string (see the Rust core); parse it once.
+    return JSON.parse(p.allBlocks() as unknown as string) as Block[];
   } finally {
     p.free();
   }

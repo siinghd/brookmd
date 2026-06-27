@@ -35,11 +35,32 @@ beforeAll(async () => {
   FluxParser = mod.FluxParser;
 });
 
+// The real WASM `append`/`finalize`/`allBlocks` return the patch/blocks as a JSON
+// STRING (the wire format the worker forwards verbatim and the main thread
+// JSON.parses). This test inspects the decoded objects, so wrap the parser to
+// JSON.parse those three methods while passing every setter through untouched.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function newParser(): any {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const p = new FluxParser() as any;
+  return new Proxy(p, {
+    get(target, prop) {
+      const v = target[prop];
+      if (typeof v !== "function") return v;
+      if (prop === "append" || prop === "finalize" || prop === "allBlocks") {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        return (...args: any[]) => JSON.parse(v.apply(target, args));
+      }
+      return v.bind(target);
+    },
+  });
+}
+
 // Parse a whole input in one append + finalize and return the final block set,
 // deduped by stable id (finalize's closed version of a block wins).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseAll(input: string, configure?: (p: any) => void) {
-  const p = new FluxParser();
+  const p = newParser();
   configure?.(p);
   const a = p.append(input);
   const f = p.finalize();
@@ -122,7 +143,7 @@ test.skipIf(!haveWasm)("real WASM: a STREAMING open Table grows kind.data row-by
   // append adds the new body row to `kind.data.rows` and the ALREADY-EMITTED rows
   // keep byte-identical cell html (only the trailing row grows). This is what lets
   // the renderer reconcile/append only the last row instead of rebuilding the table.
-  const p = new FluxParser();
+  const p = newParser();
   p.setBlockData(true);
   const openTableOf = (patch: { newly_committed: unknown[]; active: unknown[] }) =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -231,7 +252,7 @@ test.skipIf(!haveWasm)("real WASM: WITHOUT setBlockData a Heading's kind.data is
 });
 
 test.skipIf(!haveWasm)("real WASM: setInlineComponentTags dispatches inline + allBlocks() returns the array", () => {
-  const p = new FluxParser();
+  const p = newParser();
   p.setInlineComponentTags(["tik"]);
   p.append('a <tik symbol="AAPL">**A**</tik> b\n');
   p.finalize();

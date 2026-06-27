@@ -277,12 +277,51 @@ pub enum Enrichment {
 }
 
 /// Render one block to HTML. Returns `Some(Enrichment)` only for a top-level
+/// Maximum container-nesting depth for the recursive descent below. Blockquotes,
+/// list items, alerts, and component blocks all recurse through [`render_block`];
+/// each level consumes a WASM shadow-stack frame, and a stack overflow in WASM is
+/// an uncatchable **trap** (it poisons the whole instance), not a recoverable
+/// error. This cap turns a deeply-nested adversarial input (e.g.
+/// `">".repeat(10_000)`) into graceful flat output instead of a crash, and keeps
+/// the worst-case stack well under the (now 256 KB) shadow stack. 100 is far above
+/// any real document — CommonMark/GFM spec examples nest <10 — so it never affects
+/// legitimate content. See also the inline cap `MAX_BRACKET_DEPTH`.
+const MAX_RENDER_DEPTH: usize = 100;
+
+thread_local! {
+    /// Live nesting depth of the [`render_block`] recursion. WASM is
+    /// single-threaded so this is just a module global; on a native multi-threaded
+    /// host each thread gets its own counter, which is also correct.
+    static RENDER_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores [`RENDER_DEPTH`] on *every* exit path of [`render_block`] — which has
+/// many early `return`s — so the counter can never leak across calls.
+struct DepthGuard(usize);
+impl Drop for DepthGuard {
+    fn drop(&mut self) {
+        RENDER_DEPTH.with(|d| d.set(self.0));
+    }
+}
+
 /// block whose kind has an opt-in `kind.data` payload (Table, Heading) when
 /// `opts.block_data` is on; `None` for every other kind and whenever the flag is
 /// off. Nested (recursive) call sites ignore the return — only blocks that
 /// appear at the document top level get a `kind.data`.
 pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut String) -> Option<Enrichment> {
     let slice = &source[raw.range.clone()];
+    // Depth guard: every recursive call (blockquote / list-item / alert /
+    // component inner blocks) funnels back through here. Past the cap, stop
+    // descending and emit the remaining inner source as escaped text — content is
+    // preserved, just not further structured — rather than risk a stack-overflow
+    // trap. No legitimate document reaches this depth.
+    let depth = RENDER_DEPTH.with(|d| d.get());
+    if depth >= MAX_RENDER_DEPTH {
+        escape_html(slice, out);
+        return None;
+    }
+    RENDER_DEPTH.with(|d| d.set(depth + 1));
+    let _depth_guard = DepthGuard(depth);
     match &raw.kind {
         RawBlockKind::Heading { level } => {
             return render_heading(slice, *level, opts, out).map(Enrichment::Heading)

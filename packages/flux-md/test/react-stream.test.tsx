@@ -223,12 +223,12 @@ test("React StrictMode: the owned client still receives patches (no blank render
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: {
+      patch: JSON.stringify({
         newly_committed: [
           { id: 1, kind: { type: "Paragraph" }, start: 0, end: 0, html: "<p>a</p>", open: false, speculative: false },
         ],
         active: [],
-      },
+      }),
       appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
     });
   });
@@ -257,12 +257,12 @@ test("#5: tag-level overrides apply to OPEN (streaming) blocks, not just settled
     created[0].fire({
       type: "patch",
       streamId: sid,
-      patch: {
+      patch: JSON.stringify({
         newly_committed: [],
         active: [
           { id: 1, kind: { type: "Paragraph" }, start: 0, end: 0, html: '<p>see <a href="/x">link</a></p>', open: true, speculative: false },
         ],
-      },
+      }),
       appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
     });
   });
@@ -287,12 +287,12 @@ test("#5: a supplied sanitize runs on component-rendered blocks (closes the bypa
     created[0].fire({
       type: "patch",
       streamId: sid,
-      patch: {
+      patch: JSON.stringify({
         newly_committed: [
           { id: 1, kind: { type: "Paragraph" }, start: 0, end: 0, html: "<p>SECRET data</p>", open: false, speculative: false },
         ],
         active: [],
-      },
+      }),
       appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
     });
   });

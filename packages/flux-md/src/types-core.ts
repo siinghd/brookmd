@@ -374,9 +374,11 @@ export type ToWorker =
 export type FromWorker =
   | { type: "ready" }
   | {
+      // `patch` is a JSON-encoded Patch (the worker forwards the WASM string
+      // verbatim); the main thread JSON.parses it once. See FluxClient.onMessage.
       type: "patch";
       streamId: number;
-      patch: Patch;
+      patch: string;
       appendedBytes: number;
       parseMicros: number;
       retainedBytes: number;

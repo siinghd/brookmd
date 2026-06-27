@@ -12,12 +12,14 @@ Parsing runs entirely **off the main thread** — each stream gets its own poole
 bun add flux-md     # or: npm i flux-md / pnpm add flux-md
 ```
 
-flux-md ships as **source** (TypeScript + the compiled WASM). The worker and
-WASM asset are referenced with the **web-standard `new URL(asset,
+flux-md ships **compiled, non-minified ESM** (`dist/*.js` + `.d.ts` types) plus
+the compiled WASM — no raw `.ts`/`.tsx` source. The worker and WASM asset are
+referenced with the **web-standard `new URL(asset,
 import.meta.url)`** pattern, so any bundler with asset-module support resolves
 them: **Vite** (the reference setup), **webpack 5**, **Rollup** (with asset
 modules), **Parcel**, and **Next.js** (App Router — Turbopack *and* webpack;
-**verified on Next.js 16**, see the [Next.js callout](#nextjs) below). It is
+**verified on Next.js 16**, see the [Next.js callout](#nextjs) below).
+
 The streaming client (`<FluxMarkdown>` / `FluxClient`) is **browser-only** (it
 constructs Web Workers). For **server-side / static rendering of finished
 content** — SSR, React Server Components, build steps — use the worker-free,
@@ -999,42 +1001,71 @@ genuinely hostile content where CSS-overlay/clickjacking matters, render inside
 a sandboxed `<iframe>` instead — sanitization stops injection, not every
 visual-overlay trick.
 
-### Supply-chain transparency
+### Supply chain & security posture
 
-flux-md is **zero runtime dependency** — no third-party packages are pulled in
-at runtime. The parsing core is Rust compiled to WebAssembly, reproducibly
-buildable from `crates/flux-md-core/` via `bun run build:wasm`.
+flux-md ships **zero runtime dependencies** — `dependencies` and
+`optionalDependencies` in `package.json` are both empty. The parsing core is Rust
+compiled to WebAssembly, reproducibly buildable from `crates/flux-md-core/` via
+`bun run build:wasm`. The package publishes **compiled, non-minified ESM**
+(`dist/*.js` + `.d.ts`); it does not ship raw `.ts`/`.tsx` source.
 
-**Native code (WebAssembly).** The shipped `flux_md_core_bg.wasm` (~200 KB) is
-first-party, built from the Rust source in this repo, and runs inside a sandboxed
-Web Worker (browser) or Node worker thread. Supply-chain scanners such as
-[Socket.dev](https://socket.dev) will flag it as `nativeCode` — this is accurate
-and expected. The WASM is not a vendored third-party binary; it is reproducible
-from source.
+**Frameworks are optional peers, by design.** `react`, `vue`, `svelte`, and
+`solid-js` are declared as `peerDependencies` with
+`peerDependenciesMeta.optional: true`. You install only the one you use — or none
+(the `flux-md/dom` and `flux-md/element` entries need no framework at all). This
+is the most important supply-chain property of the package: **a React-only
+consumer never installs `vue` or `solid-js`, so those frameworks' transitive
+internals never enter that consumer's lockfile.** `npm i flux-md` on its own pulls
+in nothing else.
 
-**Network access.** flux-md performs network I/O in exactly two scenarios, both
-caller-driven:
+**Why a registry scan may flag `seroval` and `@vue/compiler-*`.** When a scanner
+resolves *all* declared peers, it surfaces alerts on framework internals reachable
+only through the optional peers — **none of which is flux-md code, and none of
+which is installed unless you opt into that framework:**
 
-- `<flux-markdown src="URL">` — the Web Component fetches the URL you supply and
-  streams the response. No URL is ever chosen by flux-md itself.
-- The wasm-bindgen glue (`wasm/flux_md_core.js`) loads the co-located `.wasm`
-  asset via `fetch(new URL("…_bg.wasm", import.meta.url))` — bundlers resolve
-  this to a local build artifact, not a remote endpoint.
+- `seroval` (transitive of **solid-js**) — its `deserialize()` uses
+  `(0, eval)(source)` and touches the network. This is Solid's SSR serialization
+  layer; it is also the package some scanners label a "potential vulnerability".
+- `@vue/compiler-core` (transitive of **vue**) — uses the `Function` constructor
+  for template codegen.
+- `@vue/compiler-sfc` (transitive of **vue**) — references `globalThis["fetch"]`.
+- minified esm-bundler builds of those compilers read as "obfuscated code".
 
-flux-md has no telemetry, no analytics, and no first-party remote endpoints.
-Socket will flag the `networkAccess` signal — it is accurate and expected. In
-privileged contexts (browser extensions, Electron, environments where the
-same-origin policy may not apply), treat the `src` attribute value as you would
-any external URL and allowlist it in your CSP / security policy.
+flux-md's own source contains **no `eval` and no `Function(...)` constructor**
+(`grep -rnE '\beval\s*\(|\bnew Function\b|\bFunction\s*\(' packages/flux-md/src`
+returns nothing). The
+repository's [`socket.yml`](https://github.com/siinghd/flux-md/blob/main/socket.yml)
+documents this and disables those upstream-framework alert types for flux-md's own
+CI (which installs every framework as a devDependency for cross-framework tests).
+If you prefer surgical handling, ignore the specific transitive packages instead
+(e.g. `@SocketSecurity ignore seroval@<version>`).
 
-**Filesystem access (Node/SSR only).** `flux-md/server` reads the package's
-own `.wasm` file off disk on Node.js (Node's `fetch` cannot load `file://`
-URLs). This is a Node-only path; it reads only the package-internal asset and
-never touches caller-supplied paths. Socket will flag `filesystemAccess` — also
-accurate and expected.
+**flux-md is browser-oriented (Web Worker + WASM).** The default path runs the
+WASM parser inside a Web Worker — ideal for browsers and modern Node
+(`worker_threads`), but **not** intended for non-browser or older environments
+that lack Workers/WASM. If you need a worker-free, synchronous path (Node SSR /
+React Server Components), use **`flux-md/server`** — it loads the same WASM
+synchronously off disk and renders to a string without spawning a worker.
 
-The `socket.yml` at the repository root documents these signals with their
-justifications for Socket's GitHub app.
+**First-party signals a scanner will (correctly) show.** These describe flux-md
+itself and are kept *visible* rather than silenced:
+
+- **Native code (`hasNativeCode`).** The first-party `dist/wasm/flux_md_core_bg.wasm`
+  (~180 KB) is built from the Rust source in this repo and runs inside a sandboxed
+  Web Worker (browser) or Node worker thread. It is reproducible from source, not a
+  vendored third-party binary.
+- **Network access (`networkAccess`).** Only `<flux-markdown src="URL">` (the URL
+  *you* supply) and the wasm-bindgen glue loading the co-located `.wasm` via
+  `fetch(new URL("…_bg.wasm", import.meta.url))` — which bundlers resolve to a
+  local build artifact. No telemetry, no analytics, no first-party remote
+  endpoints. In privileged contexts (browser extensions, Electron) treat the `src`
+  value as any external URL and allowlist it in your CSP.
+- **Filesystem access (`filesystemAccess`).** Node/SSR only: `flux-md/server` reads
+  the package's own `.wasm` off disk (Node's `fetch` cannot load `file://` URLs).
+  It reads only the package-internal asset, never a caller-supplied path.
+
+The `socket.yml` at the repository root documents every signal with its
+justification for Socket's GitHub app.
 
 ## Scaling
 

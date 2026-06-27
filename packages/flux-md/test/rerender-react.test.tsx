@@ -86,7 +86,7 @@ test("react-3: a committed block's override renders exactly once across tail-onl
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] }),
       ...PATCH_META,
     });
   });
@@ -99,7 +99,7 @@ test("react-3: a committed block's override renders exactly once across tail-onl
       w.fire({
         type: "patch",
         streamId: sid,
-        patch: { newly_committed: [], active: [para(2, html, true)] },
+        patch: JSON.stringify({ newly_committed: [], active: [para(2, html, true)] }),
         ...PATCH_META,
       });
     });
@@ -238,7 +238,7 @@ test("react-render-probe: committed block fires onRenderMetrics once; open tail 
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] }),
       ...PATCH_META,
     });
   });
@@ -249,7 +249,7 @@ test("react-render-probe: committed block fires onRenderMetrics once; open tail 
       w.fire({
         type: "patch",
         streamId: sid,
-        patch: { newly_committed: [], active: [para(2, html, true)] },
+        patch: JSON.stringify({ newly_committed: [], active: [para(2, html, true)] }),
         ...PATCH_META,
       });
     });
@@ -287,7 +287,7 @@ test("react-render-probe-zero: renderCount stays 0 when no onRenderMetrics hook 
     w.fire({
       type: "patch",
       streamId: sid,
-      patch: { newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] },
+      patch: JSON.stringify({ newly_committed: [para(1, "<p>one</p>", false)], active: [para(2, "<p>tw</p>", true)] }),
       ...PATCH_META,
     });
   });
@@ -317,7 +317,7 @@ test("react-render-probe-toggle: speculativeToggleCount counts speculative flips
   // Render 3: flips back to false (+1). Render 4: stays false (+0).
   for (const b of [spec("<p>a</p>", false), spec("<p>b</p>", true), spec("<p>c</p>", false), spec("<p>d</p>", false)]) {
     await act(async () => {
-      w.fire({ type: "patch", streamId: sid, patch: { newly_committed: [], active: [b] }, ...PATCH_META });
+      w.fire({ type: "patch", streamId: sid, patch: JSON.stringify({ newly_committed: [], active: [b] }), ...PATCH_META });
     });
   }
   expect(last).toBe(2);

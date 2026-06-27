@@ -1,5 +1,5 @@
 import { defineComponent, h, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
-import type { PropType, Ref } from "vue";
+import type { DefineComponent, PropType, Ref } from "vue";
 import { FluxClient } from "./client";
 import type { ParserConfig } from "./types-core";
 import {
@@ -100,11 +100,27 @@ export function useTailBlockId(client: FluxClient): Ref<number | null> {
   return tail;
 }
 
+/** Public props of the {@link FluxMarkdown} Vue component. */
+export interface FluxMarkdownVueProps {
+  client: FluxClient;
+  components?: DomComponents;
+  sanitize?: (html: string) => string;
+  virtualize?: boolean;
+  stickToBottom?: boolean;
+}
+
 /**
  * Component wrapper around {@link useFluxMarkdown}. Renders a single `<div>`
  * whose ref is the mount container.
+ *
+ * The return type is annotated with an explicit, single-type-argument
+ * `DefineComponent<FluxMarkdownVueProps>` instead of letting `tsc` inline
+ * `defineComponent`'s inferred type. The inferred form bakes the *build-time*
+ * Vue version's `DefineComponent` arity into the emitted `.d.ts`, which breaks
+ * consumers on an older Vue within the declared `vue >=3` peer range (TS2707).
+ * A single explicit type arg is portable across all of Vue 3.x.
  */
-export const FluxMarkdown = defineComponent({
+export const FluxMarkdown: DefineComponent<FluxMarkdownVueProps> = defineComponent({
   name: "FluxMarkdown",
   props: {
     client: { type: Object as PropType<FluxClient>, required: true },

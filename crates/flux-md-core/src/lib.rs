@@ -46,18 +46,22 @@ impl FluxParser {
         FluxParser { inner: StreamParser::new() }
     }
 
+    /// Returns the patch as a **JSON string** (parsed with `JSON.parse` on the
+    /// main thread), not a live JS object. This is deliberate: serializing once to
+    /// a string in Rust avoids serde-wasm-bindgen's per-node boundary calls, and a
+    /// string is far cheaper than an object graph to `structuredClone` across the
+    /// worker→main `postMessage` (the worker forwards the string verbatim).
     #[wasm_bindgen]
-    pub fn append(&mut self, chunk: &str) -> Result<JsValue, JsValue> {
+    pub fn append(&mut self, chunk: &str) -> Result<String, JsValue> {
         let patch = self.inner.append(chunk);
-        serde_wasm_bindgen::to_value(&PatchJs::from(patch))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_json::to_string(&PatchJs::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
+    /// JSON-string patch — see [`FluxParser::append`].
     #[wasm_bindgen]
-    pub fn finalize(&mut self) -> Result<JsValue, JsValue> {
+    pub fn finalize(&mut self) -> Result<String, JsValue> {
         let patch = self.inner.finalize();
-        serde_wasm_bindgen::to_value(&PatchJs::from(patch))
-            .map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_json::to_string(&PatchJs::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = bufferLen)]
@@ -66,13 +70,14 @@ impl FluxParser {
     }
 
     /// All blocks currently parsed (committed + active), in document order — the
-    /// whole rendered document as a JS array of `Block`. The one-shot /
-    /// server-side render primitive: feed the full markdown via `append`, call
-    /// `finalize`, then read `allBlocks()` (no worker, no patch accumulation).
+    /// whole rendered document as a **JSON string** of a `Block[]` (parse with
+    /// `JSON.parse`). The one-shot / server-side render primitive: feed the full
+    /// markdown via `append`, call `finalize`, then read `allBlocks()` (no worker,
+    /// no patch accumulation).
     #[wasm_bindgen(js_name = allBlocks)]
-    pub fn all_blocks(&self) -> Result<JsValue, JsValue> {
+    pub fn all_blocks(&self) -> Result<String, JsValue> {
         let blocks: Vec<&Block> = self.inner.all_blocks().collect();
-        serde_wasm_bindgen::to_value(&blocks).map_err(|e| JsValue::from_str(&e.to_string()))
+        serde_json::to_string(&blocks).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// Total bytes the parser is retaining: source buffer + all rendered

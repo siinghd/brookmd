@@ -70,7 +70,43 @@ fn compute_cut(candidates: &[usize], unstable: usize, stack: &[Delim], pairs: &[
     best
 }
 
+/// Max inline-nesting depth. Nested inline-component tags recurse through
+/// [`render_inline_core`] (`<x>…<x>…` — one stack frame per level via
+/// `write_inline_component`). Like the block renderer's `render::MAX_RENDER_DEPTH`,
+/// this MUST be bounded or adversarial input (`"<x>".repeat(10_000)` with `x`
+/// registered via `setInlineComponentTags`) overflows the WASM shadow stack — an
+/// uncatchable trap that poisons the whole worker. 100 is far above any real
+/// nesting and well under the 256 KB stack. (Link/image bracket nesting is
+/// separately bounded by [`MAX_BRACKET_DEPTH`].)
+const MAX_INLINE_DEPTH: usize = 100;
+
+thread_local! {
+    /// Live depth of the [`render_inline_core`] recursion (inline-component
+    /// nesting). WASM is single-threaded so this is just a module global; a native
+    /// multi-threaded host gets a correct per-thread counter.
+    static INLINE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Restores [`INLINE_DEPTH`] on every exit path of [`render_inline_core`].
+struct InlineDepthGuard(usize);
+impl Drop for InlineDepthGuard {
+    fn drop(&mut self) {
+        INLINE_DEPTH.with(|d| d.set(self.0));
+    }
+}
+
 fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: bool) -> usize {
+    // Depth guard: nested inline-component tags recurse here (via
+    // write_inline_component). Past the cap, emit the remaining inner as escaped
+    // text instead of descending another shadow-stack frame. No legitimate inline
+    // content nests this deep.
+    let depth = INLINE_DEPTH.with(|d| d.get());
+    if depth >= MAX_INLINE_DEPTH {
+        escape_html(input, out);
+        return input.len();
+    }
+    INLINE_DEPTH.with(|d| d.set(depth + 1));
+    let _inline_depth_guard = InlineDepthGuard(depth);
     let bytes = input.as_bytes();
     let mut pos = 0;
     let mut deli_stack: Vec<Delim> = Vec::new();

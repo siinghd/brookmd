@@ -1,89 +1,155 @@
 # Socket.dev configuration for flux-md
 #
-# flux-md triggers several Socket supply-chain alerts that are INHERENT to the
-# package's design and cannot be removed without eliminating core features.
-# This file documents each alert with its justification so that Socket's GitHub
-# app can surface the explanation alongside the signal rather than blocking PRs.
+# Two CLASSES of Socket signal show up against flux-md. They are handled
+# differently on purpose:
+#
+#   A. FIRST-PARTY, INHERENT signals (hasNativeCode / networkAccess /
+#      filesystemAccess). These accurately describe flux-md itself: a Rust->WASM
+#      parser that runs in a Web Worker, fetches a caller-supplied `src` URL, and
+#      (on Node/SSR) reads its own co-located .wasm off disk. We KEEP these
+#      ENABLED (`true`) and document them. Silencing an accurate first-party
+#      signal would be dishonest; visibility + a written justification is the
+#      correct posture.
+#
+#   B. UPSTREAM-FRAMEWORK-INTERNAL signals (usesEval / obfuscatedFile /
+#      dynamicRequire / potentialVulnerability / gptSecurity). These do NOT
+#      originate in flux-md. flux-md ships ZERO runtime dependencies (package.json
+#      `dependencies` and `optionalDependencies` are both empty). The eval /
+#      obfuscation / "potential vulnerability" alerts come from TRANSITIVE
+#      internals of the OPTIONAL framework peers:
+#        * seroval (transitive of solid-js): `(0,eval)(source)` in deserialize();
+#          this is also the package Socket's human + AI review flag as a
+#          "potential vulnerability".
+#        * @vue/compiler-core (transitive of vue): Function-constructor codegen.
+#        * @vue/compiler-sfc (transitive of vue): globalThis["fetch"].
+#        * minified esm-bundler builds of those compilers -> "Obfuscated code".
+#      react / vue / svelte / solid-js are declared `peerDependenciesMeta.optional`,
+#      so a React-only (or DOM/element/no-framework) consumer NEVER installs vue or
+#      solid-js and these packages never enter THEIR lockfile. The real fix is
+#      architectural (optional peers) and is already in place. We additionally set
+#      the BEHAVIORAL alert types (usesEval / obfuscatedFile / dynamicRequire) to
+#      `false` so framework internals don't block flux-md's OWN monorepo CI, where
+#      devDependencies install all four frameworks for cross-framework tests and
+#      thus pull seroval + @vue/compiler-* in.
+#
+#      We deliberately do NOT globally mute the VULNERABILITY-CLASS alerts
+#      (potentialVulnerability / gptSecurity): those catch CVE-class issues and AI
+#      security findings across the WHOLE tree (including any future first-party
+#      runtime dependency), and the "no first-party eval" argument does not cover
+#      them. seroval's specific "potential vulnerability" flag is handled with a
+#      PER-PACKAGE ignore instead (see below) — pinned to the exact offending
+#      package+version, so it re-activates automatically if seroval changes and
+#      leaves vulnerability detection on for everything else.
+#
+# HONESTY CAVEAT: socket.yml `issueRules` are GLOBAL per-alert-type toggles; they
+# cannot scope to "only seroval" or "only @vue/*". Setting `usesEval:false`
+# therefore also disables eval detection for flux-md's own first-party source.
+# That is acceptable here ONLY because flux-md's source contains no `eval` and no
+# `Function(...)` constructor — verified (returns nothing; excludes the
+# wasm-bindgen glue, which also has none):
+#   grep -rnE '\beval\s*\(|\bnew Function\b|\bFunction\s*\(' packages/flux-md/src \
+#     --include='*.ts' --include='*.tsx'
+# If flux-md ever adds first-party dynamic code, REMOVE these `false` toggles and
+# use per-package ignores instead — the Socket dashboard "ignore for this package",
+# or PR comments like `@SocketSecurity ignore seroval@1.5.4` /
+# `@SocketSecurity ignore @vue/compiler-core@3.5.39` — which are the precise,
+# non-blunt mechanism.
+#
+# Real-threat detection (malware / install scripts / shell / env-var / typosquat)
+# stays ENABLED so genuine supply-chain signal is preserved.
 #
 # Schema reference: https://docs.socket.dev/docs/socket-yml
+# Alert-type ids:   https://docs.socket.dev/docs/alert-types
 
 version: 2
 
-# ---------------------------------------------------------------------------
-# Issue rules — document the three inherent signals that Socket will flag.
-# Each rule is left ENABLED (`true`, the default) so the signal stays visible in
-# connected-repo checks; the justification lives in the comments below and in the
-# README "Security" section. Flip any to `false` to suppress it in PR checks if
-# your workflow prefers that. (Values are booleans per the v2 schema.)
-# ---------------------------------------------------------------------------
 issueRules:
-  # -------------------------------------------------------------------------
-  # nativeCode
+  # =========================================================================
+  # A. FIRST-PARTY INHERENT SIGNALS — kept ENABLED (visible + documented)
+  # =========================================================================
+
+  # hasNativeCode
   #
   # flux-md ships a precompiled WebAssembly binary:
-  #   packages/flux-md/src/wasm/flux_md_core_bg.wasm  (~200 KB)
-  #
-  # This is the Rust→WASM parser core — the entire markdown parsing pipeline
-  # runs inside this module. It is:
-  #   • Reproducibly buildable from source:
-  #     crates/flux-md-core/ (Rust) → `bun run build:wasm`
-  #   • Loaded exclusively via the wasm-bindgen glue file
-  #     (packages/flux-md/src/wasm/flux_md_core.js) using a co-located
-  #     `new URL("flux_md_core_bg.wasm", import.meta.url)` reference.
-  #   • Executed inside a sandboxed Web Worker (browser) or a Node.js
-  #     worker_threads context — never on the main thread.
-  #   • Not fetched from any remote endpoint at runtime; bundlers resolve
-  #     the asset at build time.
-  #
-  # There is no way to ship a WASM-core parser without a compiled binary.
-  # The alert is expected and correct; the binary is first-party, auditable,
-  # and not a vendored third-party native add-on.
-  # -------------------------------------------------------------------------
-  nativeCode: true
+  #   packages/flux-md/dist/wasm/flux_md_core_bg.wasm  (~180 KB)
+  # the Rust->WASM parser core. It is reproducibly buildable from
+  # crates/flux-md-core/ via `bun run build:wasm`, loaded only via the co-located
+  # wasm-bindgen glue (dist/wasm/flux_md_core.js) using
+  # `new URL("flux_md_core_bg.wasm", import.meta.url)`, executed inside a sandboxed
+  # Web Worker (browser) or worker_threads (Node), and never fetched from a remote
+  # endpoint. A WASM-core parser cannot exist without a compiled binary; the alert
+  # is accurate and the binary is first-party + auditable.
+  # (NOTE: the correct issue id is `hasNativeCode`, not `nativeCode`.)
+  hasNativeCode: true
 
-  # -------------------------------------------------------------------------
   # networkAccess
   #
-  # flux-md performs network I/O in exactly two caller-driven scenarios:
-  #
-  #   1. <flux-markdown src="URL"> (Web Component, element.ts)
-  #      The element fetches the caller-supplied URL and streams the response
-  #      through a FluxClient. This is intentional — it is the element's
-  #      primary "load from URL" API.  The URL is provided by the application
-  #      developer, not determined by flux-md itself.
-  #
-  #   2. wasm-bindgen glue (wasm/flux_md_core.js) on first WASM load
-  #      The glue calls fetch() to load the co-located .wasm asset using the
-  #      `import.meta.url`-relative path that the bundler resolves at build
-  #      time to a local asset (e.g. /_next/static/media/flux_md_core_bg.wasm).
-  #      This is standard wasm-bindgen practice; it is not a first-party
-  #      telemetry or analytics endpoint.
-  #
-  # flux-md has NO telemetry, NO analytics, NO first-party remote endpoints,
-  # and NO automatic outbound requests of its own.  All network calls are
-  # 100% caller-driven (src attribute) or bundler-resolved local assets
-  # (WASM glue).
-  #
-  # In privileged contexts (browser extensions, Electron, environments where
-  # the same-origin policy does not apply), callers should allowlist the `src`
-  # URLs they pass to <flux-markdown> — see the Security section of the README.
-  # -------------------------------------------------------------------------
+  # flux-md's OWN network I/O is exactly two caller-driven cases:
+  #   1. <flux-markdown src="URL"> (element.ts) fetches the URL the application
+  #      developer supplies and streams it; flux-md never chooses a URL.
+  #   2. wasm-bindgen glue fetch() of the co-located .wasm on first load, which
+  #      bundlers resolve to a LOCAL build asset at build time.
+  # No telemetry, no analytics, no first-party remote endpoints.
+  # (@vue/compiler-sfc's `globalThis["fetch"]` network signal — transitive of the
+  # OPTIONAL vue peer — also rides under this type. It is the Vue template
+  # compiler, not flux-md, and is absent from any consumer that does not install
+  # vue. We keep this type ENABLED because flux-md's own networkAccess is real and
+  # worth surfacing; the vue-compiler instance is documented as upstream.)
   networkAccess: true
 
-  # -------------------------------------------------------------------------
   # filesystemAccess
   #
-  # server.tsx (the flux-md/server SSR entry) reads the WASM binary from the
-  # local filesystem on Node.js using an `import.meta.url`-relative path:
-  #
-  #   new URL("./wasm/flux_md_core_bg.wasm", import.meta.url)
-  #
-  # Node's fetch() cannot load file:// URLs, so the server entry falls back
-  # to fs.readFile for the package's own co-located .wasm file. This is a
-  # Node-only branch; it is not present in the browser build and reads ONLY
-  # the package-internal asset, not any caller-supplied path.
-  #
-  # This is the standard pattern for Node.js WASM loading with wasm-bindgen
-  # and is not used to access arbitrary filesystem paths.
-  # -------------------------------------------------------------------------
+  # flux-md/server (server.tsx) reads the package's OWN .wasm off disk on Node via
+  # `new URL("./wasm/flux_md_core_bg.wasm", import.meta.url)` + fs, because Node's
+  # fetch() cannot load file:// URLs. Node-only branch; reads only the
+  # package-internal asset, never a caller-supplied path. Standard wasm-bindgen
+  # Node loading. Kept ENABLED + documented.
   filesystemAccess: true
+
+  # =========================================================================
+  # B. UPSTREAM-FRAMEWORK-INTERNAL SIGNALS — suppressed (NOT flux-md code)
+  #    These fire ONLY on transitive deps of the OPTIONAL framework peers
+  #    (seroval via solid-js; @vue/compiler-* via vue). flux-md itself has zero
+  #    runtime deps and no first-party eval / Function / dynamic-require.
+  # =========================================================================
+
+  # usesEval — seroval `(0,eval)(source)` (solid-js serializer deserialize) and
+  # @vue/compiler-core Function-constructor codegen (vue template compiler).
+  # Neither is flux-md; flux-md's own source has no eval/Function (verified above).
+  usesEval: false
+
+  # obfuscatedFile — minified esm-bundler builds of the framework
+  # compilers/serializers read as "obfuscated". flux-md ships readable, compiled,
+  # non-minified ESM (dist/*.js) — these instances are upstream-framework only.
+  obfuscatedFile: false
+
+  # dynamicRequire — dynamic module resolution inside the framework
+  # compiler/runtime internals (optional peers). Not present in flux-md source;
+  # server.tsx's only dynamic import is a single literal `import("node:fs/promises")`.
+  dynamicRequire: false
+
+  # NOTE: potentialVulnerability and gptSecurity are intentionally NOT set here —
+  # they stay ENABLED (see the REAL-THREAT block below). Socket's human + AI review
+  # flagged seroval (the solid-js serializer) as a possible vulnerability for its
+  # eval-based deserialize(); that is upstream, optional-peer-only code, but muting
+  # the whole vulnerability/AI-review alert CLASS repo-wide would also hide future
+  # first-party or new-dependency CVEs. Handle the seroval instance precisely with a
+  # PER-PACKAGE ignore instead of a global toggle:
+  #   • Socket dashboard: "Ignore for this package" on seroval, or
+  #   • PR comment:  @SocketSecurity ignore seroval@1.5.4
+  # (and, if desired, @SocketSecurity ignore @vue/compiler-core@3.5.39 /
+  #  @SocketSecurity ignore @vue/compiler-sfc@3.5.39). These pin to the exact
+  # package+version and auto-reactivate if the dependency changes.
+
+  # =========================================================================
+  # REAL-THREAT / VULNERABILITY DETECTION — left ENABLED. Listed explicitly so the
+  # intent is on the record: genuine supply-chain threats and vulnerability/AI
+  # findings are NOT suppressed (the seroval instance is handled per-package above).
+  # =========================================================================
+  potentialVulnerability: true
+  gptSecurity: true
+  malware: true
+  installScripts: true
+  shellAccess: true
+  envVars: true
+  didYouMean: true
