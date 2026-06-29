@@ -4,6 +4,25 @@ Notable changes to flux-md. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.18.2 — 2026-06-29
+
+### Fixed
+
+- **Streaming O(n²) cliff on a paragraph followed by a long link-reference /
+  footnote definition run** (e.g. reference-heavy LLM output: prose, then a
+  block of `[id]: url` definitions). The paragraph stayed speculative until
+  `finalize()` — a definition is not a renderable block, so the paragraph never
+  became "the last block" and `committed_offset` stalled, re-scanning the whole
+  growing definition run on every append. A 235 KB document streamed at a
+  256-byte chunk took **~59 s**; it now takes **~20 ms**, and streaming is linear
+  in document size across all chunk sizes. A renderable block followed by a
+  definition run now commits (a definition only parses at a block boundary, so
+  the block is closed). Narrow behavior note, within the existing
+  forward-reference limitation: the single paragraph immediately before such a
+  run now commits before the later definitions, so a *forward* reference from it
+  renders literally instead of resolving at finalize — consistent with every
+  earlier paragraph, which already commits mid-stream.
+
 ## 0.18.1 — 2026-06-29
 
 Performance + size pass. No API or output changes — CommonMark 652/652 and

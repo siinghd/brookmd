@@ -1076,6 +1076,15 @@ impl StreamParser {
             0
         } else if commit_all {
             produced.len()
+        } else if renderable[n - 1].range.end < raw_blocks.last().map_or(0, |r| r.range.end) {
+            // The last renderable block is followed by a trailing run of
+            // (non-renderable) link-ref / footnote definitions. A definition only
+            // parses at a block boundary, so the renderable block is CLOSED — it
+            // can't grow or merge backward — and must commit. Otherwise it never
+            // becomes "the last block" (the defs aren't renderable), so it stays
+            // speculative forever, stalling `committed_offset` and re-scanning the
+            // whole growing def run on every append (the ref_heavy O(n²) cliff).
+            produced.len()
         } else if n >= 2
             && ((matches!(renderable[n - 1].kind, RawBlockKind::Paragraph)
                 && is_resumable(&renderable[n - 2].kind))

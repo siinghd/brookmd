@@ -59,6 +59,35 @@ fn long_ref_def_run_at_tail() {
 }
 
 #[test]
+fn paragraph_before_def_run_commits_incrementally() {
+    // Regression for the ref_heavy O(n²) cliff. A paragraph immediately before a
+    // long run of link-ref definitions used to stay speculative forever — a def
+    // is not "renderable", so the paragraph never became "the last block", which
+    // stalled `committed_offset`, so the whole growing def run was re-scanned on
+    // every append (235 KB streamed at chunk=256 took ~59 s). Stream char-by-char:
+    // O(n²) would take many seconds, O(n) is milliseconds.
+    let mut md = String::from("Intro paragraph immediately before the definitions.\n\n");
+    for i in 0..1500 {
+        md.push_str(&format!("[r{i}]: https://example.com/page/{i} \"Title {i}\"\n"));
+    }
+    // Backward references that must still resolve after the (now committed) run.
+    md.push_str("\nUses [a][r0] and [b][r1499].\n");
+    let t = std::time::Instant::now();
+    let streamed = render_streamed_with(&md, false);
+    let elapsed = t.elapsed();
+    assert_eq!(streamed, render_with(&md, false), "streamed != one-shot");
+    assert!(
+        streamed.contains("href=\"https://example.com/page/0\"")
+            && streamed.contains("href=\"https://example.com/page/1499\""),
+        "backward references did not resolve",
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "def run after a paragraph must commit incrementally (O(n)); took {elapsed:?} — the O(n²) cliff is back"
+    );
+}
+
+#[test]
 fn multiline_title_defs() {
     // The critical case for "commit all but the last def": each title is on the
     // line *after* its def, so a def isn't complete until the next line proves
