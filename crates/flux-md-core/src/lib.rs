@@ -20,6 +20,41 @@ mod url;
 pub use blocks::{Block, BlockKind};
 pub use parser::{Patch, StreamParser};
 
+/// Deterministic perf instrumentation — feature `perf_counters`, off by default
+/// and never compiled into the WASM build (no `[features]` flag is set there).
+///
+/// Counts the tail bytes the *slow path* re-scans across a stream. The
+/// incremental caches (fence/paragraph/table/container/list/indented/html)
+/// extend an open block in O(new bytes) and never reach this counter; only a
+/// cache miss falls through to `scan(tail)`, whose cost is `tail.len()`. Summed
+/// over a whole stream this is exactly the quantity that goes quadratic when a
+/// block fails to commit — so a complexity-scaling test can assert the parser
+/// stays sub-quadratic *deterministically*, with no dependence on wall-clock
+/// timing (which is too noisy to gate on in CI). See `tests/scaling.rs`.
+#[cfg(feature = "perf_counters")]
+pub mod perf {
+    use std::cell::Cell;
+
+    thread_local! {
+        static SCAN_BYTES: Cell<u64> = Cell::new(0);
+    }
+
+    /// Reset the per-thread counter before a measurement.
+    pub fn reset() {
+        SCAN_BYTES.with(|c| c.set(0));
+    }
+
+    /// Total tail bytes the slow path has scanned since the last [`reset`].
+    pub fn scanned_bytes() -> u64 {
+        SCAN_BYTES.with(|c| c.get())
+    }
+
+    #[inline]
+    pub(crate) fn add_scan(n: usize) {
+        SCAN_BYTES.with(|c| c.set(c.get().wrapping_add(n as u64)));
+    }
+}
+
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 

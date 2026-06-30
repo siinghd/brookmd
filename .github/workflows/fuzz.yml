@@ -1,0 +1,43 @@
+name: Fuzz
+
+# Coverage-guided streaming-parity fuzzing (cargo-fuzz / libFuzzer). Runs nightly
+# and on demand — kept out of PR CI because it is non-deterministic and slow; the
+# fast deterministic counterpart (the chunk-independence proptest) gates every PR.
+on:
+  schedule:
+    - cron: "17 3 * * *" # nightly, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to fuzz"
+        default: "300"
+        required: false
+
+jobs:
+  fuzz:
+    name: cargo-fuzz parity (chunk-independence + no-panic)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly (cargo-fuzz requires it)
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/flux-md-core/fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run the parity target on the seed corpus + fuzz
+        working-directory: crates/flux-md-core
+        # -max_total_time bounds the run; the seed corpus is replayed first so a
+        # regression in a known shape fails fast. A crash writes a minimized
+        # reproducer to fuzz/artifacts/, uploaded below.
+        run: |
+          T="${{ github.event.inputs.max_total_time || '300' }}"
+          cargo +nightly fuzz run parity -- -max_total_time="$T" -timeout=15 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: crates/flux-md-core/fuzz/artifacts/
+          if-no-files-found: ignore

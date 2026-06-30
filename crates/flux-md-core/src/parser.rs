@@ -860,6 +860,13 @@ impl StreamParser {
         let tail_start = self.committed_offset;
         let tail = &self.buffer[tail_start..];
 
+        // Deterministic complexity probe (feature `perf_counters` only; compiled
+        // out of every real build). The fast paths above returned early, so every
+        // byte counted here is genuine slow-path tail re-scan work — the quantity
+        // a scaling test bounds to keep streaming sub-quadratic.
+        #[cfg(feature = "perf_counters")]
+        crate::perf::add_scan(tail.len());
+
         let ctx = ScanCtx {
             math: self.gfm_math,
             component_tags: &self.component_tags,
