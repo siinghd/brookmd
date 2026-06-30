@@ -1428,7 +1428,7 @@ fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
 /// as `ListItemData` without a second render; returns `None` when off.
 fn render_list_item(item: &[u8], ordered: bool, loose: bool, opts: &RenderOpts, out: &mut String) -> Option<(usize, usize)> {
     let _ = ordered;
-    let mut body = match item_body(item) {
+    let body = match item_body(item) {
         Some(b) => b,
         None => {
             let lo = out.len();
@@ -1436,7 +1436,19 @@ fn render_list_item(item: &[u8], ordered: bool, loose: bool, opts: &RenderOpts, 
             return opts.block_data.then(|| (lo + 4, lo + 4));
         }
     };
+    render_item_body(body, loose, opts, out)
+}
 
+/// Render the inner of one `<li>…</li>` from an item's ALREADY-de-indented body
+/// (the [`item_body`] output) into `out`. Shared by the full path
+/// ([`render_list_item`]) and the streaming `ListCache` (`fold_item_body` in
+/// `parser.rs`) so both paths emit byte-identical `<li>` HTML — a nested sub-list
+/// is just a block the body `scan` finds and `render_block` renders recursively,
+/// which is what lets the cache stream nested lists in O(n) without re-implementing
+/// the item engine. Returns the inner-HTML `(lo, hi)` byte span within `out` when
+/// `block_data` is on (so the caller can surface it as `ListItemData` without a
+/// second render); returns `None` when off.
+pub(crate) fn render_item_body(mut body: String, loose: bool, opts: &RenderOpts, out: &mut String) -> Option<(usize, usize)> {
     // GFM task list: item body opening with "[ ] " / "[x] ".
     let mut task_state: Option<bool> = None;
     {
@@ -1470,8 +1482,8 @@ fn render_list_item(item: &[u8], ordered: bool, loose: bool, opts: &RenderOpts, 
     // a11y: wrap a task checkbox + its text in a <label> for programmatic
     // association — but ONLY for a tight, non-empty, single-paragraph item,
     // the one shape where a <label> is valid (it must not wrap a nested list /
-    // block). The streaming ListCache mirrors this exact condition, so the two
-    // paths stay byte-identical (see render_item_line in parser.rs).
+    // block). The streaming ListCache mirrors this exact condition (it shares
+    // this very function), so the two paths stay byte-identical.
     let inline_task =
         !loose && sub.len() == 1 && matches!(sub[0].kind, RawBlockKind::Paragraph);
     let wrap_label = opts.a11y && task_state.is_some() && inline_task;

@@ -183,6 +183,13 @@ fn linear_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
         // full reparse every append); now streams linearly.
         ("alert_with_list", big_alert),
         ("blockquote_with_list", blockquote_with_list),
+        // Nested loose list (loose outer bullets with 2-space nested subs) ->
+        // ListCache (multi-line item bodies, incremental). Was O(n²) (the 0.18.3
+        // flicker fix bailed the list cache to a full reparse on every nested
+        // sub-bullet); the cache now renders each item's full body — nested
+        // sub-lists included — via the shared `render_item_body`, so it streams
+        // linearly.
+        ("nested_loose_list", nested_loose_list),
         ("big_table", big_table),
         ("big_code", big_code),
         ("big_math", big_math),
@@ -191,13 +198,13 @@ fn linear_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
 
 /// KNOWN O(n²) shapes — the next perf target. An open block that holds
 /// *structured* inner content that is one atomic, never-committing block whose
-/// incremental cache currently *bails to a full reparse* every append. The
-/// blockquote/alert-with-structured-body shapes were fixed (recursive
-/// container-block cache → now in `linear_shapes`); `nested_loose_list` is the
-/// remaining one (the LIST cache, a separate fix). This test still guards
-/// against it getting *worse* than quadratic (e.g. an accidental O(n³)).
+/// incremental cache currently *bails to a full reparse* every append. Both the
+/// blockquote/alert-with-structured-body shapes (recursive container-block cache)
+/// and `nested_loose_list` (multi-line-body list cache) have been fixed and moved
+/// into `linear_shapes`, so this list is now empty. The guard below still runs
+/// (vacuously) and is kept so the next discovered cliff has a home.
 fn known_quadratic_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
-    vec![("nested_loose_list", nested_loose_list)]
+    vec![]
 }
 
 /// Sizes spanning 16x. A linear parser's work grows ~16x across this span; a
@@ -236,15 +243,17 @@ fn streaming_stays_subquadratic() {
     assert!(failures.is_empty(), "complexity regression(s):\n  {}", failures.join("\n  "));
 }
 
-/// Documents the two known O(n²) cliffs (nested lists, containers-with-blocks)
-/// and guards against them regressing *past* quadratic. When the recursive
-/// inner-parser fix lands, move the fixed shape into `linear_shapes()`.
+/// Guards any remaining known-O(n²) shape against regressing *past* quadratic
+/// (e.g. an accidental O(n³)). `known_quadratic_shapes()` is currently empty —
+/// every shape that lived here has been made linear and promoted to
+/// `linear_shapes()` — so this runs vacuously; it stays as the home for the next
+/// discovered cliff.
 #[test]
 fn known_quadratic_open_containers_not_worse() {
-    // These are O(n²), so use a smaller 8x span (8 KB -> 64 KB) to keep the test
-    // fast. Quadratic ≈ 64x work across an 8x span; allow up to 160x (well over
-    // quadratic) so this trips only on a worse-than-quadratic (e.g. cubic)
-    // regression — the quadratic itself is the documented limit, not a failure.
+    // Uses a smaller 8x span (8 KB -> 64 KB) to keep the test fast. Quadratic ≈
+    // 64x work across an 8x span; allow up to 160x (well over quadratic) so this
+    // trips only on a worse-than-quadratic (e.g. cubic) regression — the
+    // quadratic itself is the documented limit, not a failure.
     const SMALL_Q: usize = 8 * 1024;
     const LARGE_Q: usize = 64 * 1024;
     const SPAN_Q: f64 = (LARGE_Q / SMALL_Q) as f64; // 8.0

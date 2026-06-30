@@ -8,8 +8,8 @@ use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
     is_fence_close_line, is_footnote_def_block, item_body, normalize_label,
     parse_alignments, push_code_fence_open, push_table_cell, render_block,
-    render_footnote_section, resolve_footnote_ids, split_table_cells, trim_trailing_newlines,
-    Enrichment, LinkRef, RenderOpts,
+    render_footnote_section, render_item_body, resolve_footnote_ids, split_table_cells,
+    trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
 use crate::scanner::{
@@ -597,27 +597,44 @@ struct ListCache {
     /// Marker family + delimiter (`b'-'`/`b'*'`/`b'+'` for bullets,
     /// `b'.'`/`b')'` for ordered). A sibling must match.
     delim: u8,
-    /// `content_indent` of the first item — the column where its content starts.
-    /// A later marker is a SIBLING only if `marker_indent < content_indent`; a
-    /// marker at or past the content column begins a NESTED sub-list, which this
-    /// flat-list cache can't render — so it bails to the full reparse instead of
-    /// flattening the sub-list (CommonMark §5.2 / §5.3).
-    content_indent: usize,
+    /// `marker_indent` of the first item (the list's left edge). A sibling marker
+    /// must be indented `≤ edge + 3` (deeper than that is a continuation, not a
+    /// new item), mirroring `render_list`'s split.
+    edge: usize,
+    /// `content_indent` of the CURRENT (open) item — the boundary that decides
+    /// whether a following line nests (≥ `cur_ci`) or is a shallower sibling /
+    /// continuation. Updated each time a sibling opens, so items with differing
+    /// content columns classify exactly like the full path's `cur_ci`.
+    cur_ci: usize,
     /// `<ul>` / `<ol start=N>` opener + `\n`, frozen at arm time. Kept separate
     /// from item HTML so the tight→loose rebuild only touches items.
     opener_html: String,
     /// Pre-rendered HTML: opener + every fully-cached `<li>…</li>\n`. No
-    /// trailing `</ul>` / `</ol>`.
+    /// trailing `</ul>` / `</ol>`. Holds only CLOSED items (a later sibling
+    /// marker has settled their full multi-line body); the open (last) item and
+    /// any trailing partial marker are re-rendered speculatively each append.
     cached_prefix: String,
-    /// Absolute offset just past the last cached complete item line's `\n`
-    /// (or past any blanks the lookahead consumed when transitioning loose).
+    /// Absolute offset just past the last COMPLETE line the boundary scan has
+    /// classified. Everything from here to EOF is the trailing partial line.
     lines_upto: usize,
+    /// Absolute byte offset of the OPEN (last, not-yet-closed) item's first line.
+    /// The open item — possibly a multi-line body with nested sub-lists — spans
+    /// `[open_item_start..lines_upto]`; it is committed (folded into
+    /// `cached_prefix`) only when a later sibling marker closes it.
+    open_item_start: usize,
+    /// `true` when the last classified complete line was blank. A following
+    /// sibling marker then makes the list loose (§5.3, "blank between siblings");
+    /// a following non-sibling line is an interior blank (the item is directly
+    /// loose) — the cache bails there and the full reparse owns the accounting.
+    prev_blank: bool,
     /// `true` once any two siblings are separated by a blank line (§5.3).
     /// Sticky — never flips back; new items render with the loose `<p>` wrap.
     loose: bool,
-    /// Source spans `(start, end)` of every cached item line in `buffer`.
-    /// `end` is the byte just before that line's `\n` (so `&buffer[s..e]` is
-    /// the line content). Used to re-render on the tight→loose transition.
+    /// Source spans `(start, end)` of every CLOSED item in `buffer`. `end` is the
+    /// next sibling marker's line start (exclusive), so `&buffer[s..e]` is the
+    /// item's whole multi-line body including nested sub-lines and trailing blank
+    /// lines — fed to `item_body` + `render_item_body` to re-render on the
+    /// tight→loose transition (byte-identical to the full path).
     items: Vec<(usize, usize)>,
     /// Per-item inner `<li>` HTML for the opt-in `kind.data` channel — one entry
     /// per `items` span, parallel to `cached_prefix`. Empty unless `block_data` is
@@ -2559,13 +2576,17 @@ impl StreamParser {
         })
     }
 
-    /// O(new bytes) extension of a long open flat list at the tail. Each
-    /// newly-complete sibling line renders directly as `<li>…</li>` (tight or
-    /// loose, per `cache.loose`) folded into `cached_prefix`; the trailing
-    /// partial-marker line renders speculatively. A blank line between two
-    /// siblings flips the list to loose (§5.3) and triggers a one-time
-    /// O(items so far) rebuild — sticky once set. The cache bails on a
-    /// non-sibling-marker line, foreign family / over-edge marker, or `\r`.
+    /// O(new bytes) extension of a long open list at the tail — flat OR nested.
+    /// Each item is tracked as the FULL multi-line source span between two
+    /// sibling markers; a sibling marker CLOSES the current item (its body, with
+    /// any nested sub-lists, is now settled) and folds it into `cached_prefix`
+    /// once via `item_body` + `render_item_body` (the same engine the full path
+    /// uses, so byte-parity is structural). The open (last) item and any trailing
+    /// partial marker render speculatively each append. A blank line between two
+    /// siblings flips the list loose (§5.3) with a one-time O(items so far)
+    /// rebuild — sticky once set. The cache bails on an interior blank (directly
+    /// loose), a foreign-family / shallower-than-content marker, `\r`, or a
+    /// document-global scoping marker (`[^` footnote / `]:` link-ref def).
     fn try_incremental_list(&mut self) -> Option<Patch> {
         let mut cache = self.list_cache.take()?;
         let bytes = self.buffer.as_bytes();
@@ -2578,169 +2599,189 @@ impl StreamParser {
         {
             return None;
         }
+
+        // `open_tail` mirrors the full path's per-block gate for the (final,
+        // abuts-EOF) open list: force it on inside a nested container-block
+        // parser; otherwise speculate the open tail unless a trailing blank line
+        // has settled the list. A wrong value would mis-render an incomplete
+        // `[x](` / `` `code `` / `$math` at the very end of the open item.
+        let buffer_ends_blank =
+            self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n");
+        let open_tail = self.force_open_tail || !buffer_ends_blank;
+        let footnotes = self.gfm_footnotes;
+        let block_data = self.block_data;
+
         // The open list's OWN items may carry the first reference to a footnote
         // label, so the numbering pre-pass scans the whole list region (mirrors
         // the full path).
-        let opts = self.build_inline_opts(&self.buffer[cache.start..end]);
+        let mut opts = self.build_inline_opts(&self.buffer[cache.start..end]);
+        opts.open_tail = open_tail;
 
-        // Helper: a marker line `line` qualifies as a SIBLING of this list. A
-        // marker indented to/past the first item's content column nests a
-        // sub-list (it is NOT a sibling) — returning false there makes the caller
-        // bail to the full reparse, which renders the nesting correctly. Using
-        // `<= edge + 3` here flattened 2-space-indented sub-bullets into siblings.
-        let sibling_match = |m: &MarkerScan, cache: &ListCache| {
-            m.ordered == cache.ordered
-                && m.delim == cache.delim
-                && m.marker_indent < cache.content_indent
+        // Sibling test (the family half; the indent half is inline so it can use
+        // the live `cur_ci`). Copy captures so the loop can hold `&mut cache`.
+        let (c_ordered, c_delim, c_edge) = (cache.ordered, cache.delim, cache.edge);
+        let same_family = |m: &MarkerScan| m.ordered == c_ordered && m.delim == c_delim;
+        // A line/slice that forces the full reparse: `\r` (CRLF) or a
+        // document-global scoping marker the region-scoped cache opts can't get
+        // right — a footnote ref/def `[^` (footnotes on) or a link-ref def `]:`.
+        let line_bails = |s: &[u8]| -> bool {
+            s.contains(&b'\r')
+                || (footnotes && s.windows(2).any(|w| w == b"[^"))
+                || s.windows(2).any(|w| w == b"]:")
         };
 
-        // Fold every newly-complete sibling line into `cached_prefix`. Any
-        // unrecoverable shape drops the cache so the full reparse handles
-        // nested / lazy / multi-block items.
+        // Walk every COMPLETE line, classifying it exactly as the full path's
+        // `render_list` split + `scan`'s list-extent rule do: a same-family
+        // shallower marker is a SIBLING (closes the open item, opens the next, and
+        // updates `cur_ci`); content at/below `cur_ci` NESTS into the open item's
+        // body; a plain shallow line with no preceding blank is a lazy
+        // continuation (absorbed). Anything else — a different-family marker (a new
+        // list `scan` splits), a shallow block-interrupt (heading/fence/quote/…
+        // that ENDS the list), an interior blank (directly loose), or a shallow
+        // line after a blank (a new outside-the-list paragraph) — bails.
         let mut pos = cache.lines_upto;
-        'outer: while pos < end {
+        while pos < end {
             let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
                 None => break, // trailing partial — handled below
                 Some(r) => r,
             };
             let content_end = pos + r;
-            let next = pos + r + 1;
-            if bytes[pos..content_end].contains(&b'\r') {
-                return None;
-            }
+            let next = content_end + 1;
             let line = &bytes[pos..content_end];
-
-            if line.iter().all(|&b| matches!(b, b' ' | b'\t')) {
-                // Blank between siblings = loose (§5.3). Look ahead past
-                // further blanks for a sibling-marker line, transition if
-                // needed, then resume the outer loop at that marker.
-                let mut look = next;
-                loop {
-                    if look >= end {
-                        // Trailing blanks only. Stay armed; the next chunk
-                        // brings either more content (we'll re-scan) or
-                        // finalize (full path takes over).
-                        break 'outer;
-                    }
-                    let r2 = match bytes[look..end].iter().position(|&b| b == b'\n') {
-                        None => {
-                            // Trailing non-blank without `\n` — a partial line
-                            // after one or more blank lines. If it's already a
-                            // sibling marker, the list IS loose: that decision
-                            // is settled by the blank+marker pair even though
-                            // the marker body isn't complete. Skip past the
-                            // blanks and let the partial section render the
-                            // trailing marker.
-                            let tail = &bytes[look..end];
-                            if tail.contains(&b'\r') {
-                                return None;
-                            }
-                            if tail.iter().all(|&b| matches!(b, b' ' | b'\t')) {
-                                // Only whitespace; no marker visible yet.
-                                break 'outer;
-                            }
-                            let m = scan_marker(tail)?;
-                            if !sibling_match(&m, &cache) {
-                                return None;
-                            }
-                            if !cache.loose {
-                                rebuild_loose(&mut cache, bytes, &opts)?;
-                            }
-                            cache.lines_upto = look;
-                            break 'outer;
-                        }
-                        Some(r2) => r2,
-                    };
-                    let look_end = look + r2;
-                    let look_next = look + r2 + 1;
-                    if bytes[look..look_end].contains(&b'\r') {
-                        return None;
-                    }
-                    let look_line = &bytes[look..look_end];
-                    if look_line.iter().all(|&b| matches!(b, b' ' | b'\t')) {
-                        look = look_next;
-                        continue;
-                    }
-                    let m = scan_marker(look_line)?;
-                    if !sibling_match(&m, &cache) {
-                        return None;
-                    }
-                    if !cache.loose {
-                        rebuild_loose(&mut cache, bytes, &opts)?;
-                    }
-                    fold_item_line(
-                        look_line,
-                        &m,
-                        true,
-                        &opts,
-                        &mut cache.cached_prefix,
-                        Some(&mut cache.item_html),
-                        &mut cache.fn_occ,
-                    )?;
-                    cache.lines_upto = look_next;
-                    cache.items.push((look, look_end));
-                    pos = look_next;
-                    continue 'outer;
-                }
-            }
-
-            let m = scan_marker(line)?;
-            if !sibling_match(&m, &cache) {
+            if line_bails(line) {
                 return None;
             }
-            let loose = cache.loose;
-            fold_item_line(
-                line,
-                &m,
-                loose,
-                &opts,
-                &mut cache.cached_prefix,
-                Some(&mut cache.item_html),
-                &mut cache.fn_occ,
-            )?;
+            if line.iter().all(|&b| matches!(b, b' ' | b'\t')) {
+                cache.prev_blank = true;
+                cache.lines_upto = next;
+                pos = next;
+                continue;
+            }
+            let ind = indent_cols(line);
+            if ind >= cache.cur_ci {
+                // Nested content of the open item — `scan` keeps it; `item_body` +
+                // `render_item_body` render it recursively. A preceding blank is an
+                // interior blank (the item is directly loose) → bail.
+                if cache.prev_blank {
+                    return None;
+                }
+            } else if let Some(m) = scan_marker(line) {
+                if ind <= c_edge + 3 && same_family(&m) {
+                    // SIBLING: the current open item [open_item_start..pos] is now
+                    // complete. A blank between them makes the whole list loose —
+                    // rebuild the already-closed items once, then fold this one.
+                    if pos > cache.open_item_start {
+                        if cache.prev_blank && !cache.loose {
+                            rebuild_loose(&mut cache, bytes, &opts)?;
+                        }
+                        let s = cache.open_item_start;
+                        fold_item_body(
+                            &bytes[s..pos],
+                            cache.loose,
+                            &opts,
+                            &mut cache.cached_prefix,
+                            Some(&mut cache.item_html),
+                            &mut cache.fn_occ,
+                        )?;
+                        cache.items.push((s, pos));
+                        cache.open_item_start = pos;
+                    }
+                    // else: the first item's own marker line — nothing to close.
+                    cache.cur_ci = m.content_indent;
+                    cache.prev_blank = false;
+                } else {
+                    // A different-family marker (a NEW list `scan` splits) or one
+                    // indented oddly between `edge + 3` and the content column (not
+                    // a clean sibling) — the cache can't reproduce either; bail.
+                    return None;
+                }
+            } else if container_inner_breaks_paragraph(line, opts.scan_ctx()) {
+                // A shallow NON-marker line that starts/implies a block (heading,
+                // fence, quote, thematic break, HTML, setext underline, table
+                // delimiter, …) ENDS the list — `scan` stops here; bail.
+                return None;
+            } else if cache.prev_blank {
+                // A shallow plain-text line after a blank is a NEW paragraph
+                // outside the list (a blank breaks lazy continuation) — bail.
+                return None;
+            }
+            // else: a shallow plain-text lazy continuation of the open item's
+            // paragraph (no preceding blank) — absorbed into its body.
             cache.lines_upto = next;
-            cache.items.push((pos, content_end));
             pos = next;
         }
 
-        // Speculatively render the trailing partial line as an item. Three
-        // shapes are valid: empty (no partial), all whitespace including `\n`
-        // (trailing blanks after a settled item — emit nothing; cache armed),
-        // or a sibling marker line (render in the cache's current style). The
-        // partial item's inner HTML rides on the active block's `items` too (so
-        // the keyed renderer sees the streaming tail item), but is NOT folded into
-        // the cache's committed `item_html` — it may be revised next chunk.
+        // The trailing partial line (no `\n` yet): classify it like a complete line
+        // against the CURRENT item's content column, but never commit it — the open
+        // region is re-rendered fresh each append. A same-family shallower marker
+        // opens a new speculative sibling (settling loose when a blank precedes it);
+        // everything else either continues the open item's body or bails.
         let partial = &bytes[cache.lines_upto..end];
+        if line_bails(partial) {
+            return None;
+        }
+        let partial_nonblank = !partial.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n'));
+        let mut partial_is_sibling = false;
+        if partial_nonblank {
+            let p_ind = indent_cols(partial);
+            if p_ind >= cache.cur_ci {
+                // Nested partial → part of the open item's body (interior blank → bail).
+                if cache.prev_blank {
+                    return None;
+                }
+            } else if let Some(m) = scan_marker(partial) {
+                if p_ind <= c_edge + 3 && same_family(&m) {
+                    partial_is_sibling = true;
+                } else {
+                    return None; // new-list / odd-indent marker
+                }
+            } else if container_inner_breaks_paragraph(partial, opts.scan_ctx()) {
+                return None; // shallow block-interrupt ends the list
+            } else if cache.prev_blank {
+                return None; // shallow plain text after a blank ends the list
+            }
+            // else: shallow lazy continuation → part of the open item.
+        }
+
         let mut partial_html = String::new();
         let mut partial_item: Vec<ListItemData> = Vec::new();
-        if !partial.is_empty() {
-            if partial.contains(&b'\r') {
-                return None;
+        if partial_is_sibling {
+            // The open item [open_item_start..lines_upto] is complete; the partial
+            // starts a new sibling. A preceding blank settles the list loose
+            // (matching `scan`, which already classifies the partial as a bullet).
+            if cache.prev_blank && !cache.loose {
+                rebuild_loose(&mut cache, bytes, &opts)?;
             }
-            if partial.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n')) {
-                // Trailing blank(s) / whitespace; emit nothing.
-            } else {
-                let m = scan_marker(partial)?;
-                if !sibling_match(&m, &cache) {
-                    return None;
-                }
-                // Speculative trailing item: resolve from a CLONE of the
-                // frozen-prefix occurrence map (does NOT advance it).
-                let mut partial_occ = cache.fn_occ.clone();
-                if fold_item_line(
-                    partial,
-                    &m,
-                    cache.loose,
-                    &opts,
-                    &mut partial_html,
-                    Some(&mut partial_item),
-                    &mut partial_occ,
-                )
-                .is_none()
-                {
-                    return None;
-                }
-            }
+            let mut partial_occ = cache.fn_occ.clone();
+            fold_item_body(
+                &bytes[cache.open_item_start..cache.lines_upto],
+                cache.loose,
+                &opts,
+                &mut partial_html,
+                Some(&mut partial_item),
+                &mut partial_occ,
+            )?;
+            fold_item_body(
+                partial,
+                cache.loose,
+                &opts,
+                &mut partial_html,
+                Some(&mut partial_item),
+                &mut partial_occ,
+            )?;
+        } else {
+            // The partial (continuation, nested marker, trailing blanks, or
+            // nothing) belongs to the open item; render the whole open region from
+            // a CLONE of the frozen-prefix occurrence map (does NOT advance it).
+            let mut partial_occ = cache.fn_occ.clone();
+            fold_item_body(
+                &bytes[cache.open_item_start..end],
+                cache.loose,
+                &opts,
+                &mut partial_html,
+                Some(&mut partial_item),
+                &mut partial_occ,
+            )?;
         }
 
         let close = if cache.ordered { "</ol>" } else { "</ul>" };
@@ -2752,11 +2793,10 @@ impl StreamParser {
         html.push_str(close);
 
         // Opt-in structured channel: surface the per-item inner HTML (committed
-        // items + the speculative trailing item) on the active block so the keyed
-        // renderer reuses unchanged item nodes mid-stream. Off ⇒ empty (omitted on
-        // the wire, byte-identical). The committed `cache.item_html` is borrowed by
-        // reference + the trailing partial appended without disturbing the cache.
-        let items: Vec<ListItemData> = if self.block_data {
+        // items + the speculative open/partial item(s)) on the active block so the
+        // keyed renderer reuses unchanged item nodes mid-stream. Off ⇒ empty
+        // (omitted on the wire, byte-identical).
+        let items: Vec<ListItemData> = if block_data {
             let mut v = Vec::with_capacity(cache.item_html.len() + partial_item.len());
             v.extend_from_slice(&cache.item_html);
             v.append(&mut partial_item);
@@ -2770,7 +2810,7 @@ impl StreamParser {
             // is on (matches the full path); off ⇒ `start: None` (byte-identical).
             kind: BlockKind::List {
                 ordered: cache.ordered,
-                start: if self.block_data { Some(cache.start_num) } else { None },
+                start: if block_data { Some(cache.start_num) } else { None },
                 items,
             },
             start: cache.start,
@@ -2785,105 +2825,12 @@ impl StreamParser {
     }
 }
 
-/// Render one flat list item from its raw line bytes. Mirrors the single-
-/// paragraph branch of `render_list_item` (GFM task-list `[ ] ` / `[x] `
-/// checkbox prefix supported), in either tight or loose form:
-///   tight: `<li dir?>{checkbox?}{inline}</li>`
-///   loose: `<li dir?>{checkbox?}\n<p dir?>{inline}</p></li>`
-/// (`render_list` emits the trailing `\n` after each item; the cache also
-/// pushes that `\n`, so byte layout is identical in both branches.)
-/// Returns `None` on any invalid-UTF-8 path so the cache can bail; on success
-/// returns `Some((lo, hi))` — the byte range *within `out`* of this item's inner
-/// `<li>` HTML (the bytes between `<li…>` and `</li>`), so the cache can surface it
-/// as `ListItemData` for the keyed renderer without a second render.
-fn render_item_line(
-    line: &[u8],
-    m: &MarkerScan,
-    loose: bool,
-    opts: &RenderOpts,
-    out: &mut String,
-) -> Option<(usize, usize)> {
-    let content_bytes = &line[m.content_byte..];
-    let content_str = std::str::from_utf8(content_bytes).ok()?;
-    // Trim trailing whitespace to match `render_list_item`'s `body_trimmed`.
-    let trimmed = content_str.trim_end_matches(|c: char| matches!(c, '\n' | '\r' | ' ' | '\t'));
-
-    // GFM task list: a body opening with `[ ] ` / `[x] ` (case-insensitive `x`)
-    // becomes a disabled checkbox + remainder.
-    let (checkbox, rest) = {
-        let b = trimmed.as_bytes();
-        if b.len() >= 4 && b[0] == b'[' && b[2] == b']' && b[3] == b' ' {
-            match b[1] {
-                b' ' => (Some(false), &trimmed[4..]),
-                b'x' | b'X' => (Some(true), &trimmed[4..]),
-                _ => (None, trimmed),
-            }
-        } else {
-            (None, trimmed)
-        }
-    };
-
-    // An empty body short-circuits to `<li></li>` in both tight and loose —
-    // matches `render_list_item`'s `sub.is_empty()` branch, which never enters
-    // the `<p>` wrap path. A pure-checkbox item keeps the wrapper / checkbox
-    // but still skips the `<p>` (the scanner sees no paragraph to wrap).
-    if rest.is_empty() && checkbox.is_none() {
-        let lo = out.len();
-        out.push_str("<li></li>");
-        // Inner span is empty, just past the 4-byte `<li>` opener.
-        return Some((lo + 4, lo + 4));
-    }
-
-    // a11y: mirror `render_list_item`'s `<label>` wrap — ONLY the tight,
-    // non-empty task item (the single-paragraph inline shape) qualifies, so the
-    // cached and full-reparse paths stay byte-identical.
-    let wrap_label = opts.a11y && checkbox.is_some() && !loose && !rest.is_empty();
-
-    out.push_str("<li");
-    out.push_str(opts.dir());
-    out.push('>');
-    // Inner-HTML span starts just past the `<li…>` opening tag.
-    let inner_lo = out.len();
-    if wrap_label {
-        out.push_str("<label>");
-    }
-    if let Some(checked) = checkbox {
-        out.push_str(if checked {
-            "<input type=\"checkbox\" checked disabled> "
-        } else {
-            "<input type=\"checkbox\" disabled> "
-        });
-    }
-    if loose && !rest.is_empty() {
-        // Mirrors the loose branch in `render_list_item`: leading `\n` after
-        // any checkbox, then `<p dir?>{inline}</p>`, no trailing `\n` before
-        // `</li>` (a trailing newline normalizes to a stray space pre-`</li>`).
-        out.push('\n');
-        out.push_str("<p");
-        out.push_str(opts.dir());
-        out.push('>');
-        render_inline(rest, opts, out);
-        out.push_str("</p>");
-    } else if !rest.is_empty() {
-        render_inline(rest, opts, out);
-    }
-    if wrap_label {
-        out.push_str("</label>");
-    }
-    // Inner-HTML span ends just before `</li>`.
-    let inner_hi = out.len();
-    out.push_str("</li>");
-    Some((inner_lo, inner_hi))
-}
-
 /// Tight→loose one-time rebuild. Re-renders `cached_prefix` from the source
-/// spans in `cache.items`, each item now wrapped in `<p>…</p>`. Sets
-/// `cache.loose`. O(items so far) — paid once per list, never again. Spans
-/// were validated by `scan_marker` when they were appended; the only way
-/// rendering can fail here is invalid UTF-8 inside a span, which means
-/// `scan_marker` saw non-ASCII before the content byte (impossible because
-/// markers are ASCII). Returns `None` on the impossible path so the caller
-/// bails for safety.
+/// spans in `cache.items`, each item's body now rendered loose (`<p>…</p>`-wrapped
+/// paragraphs). Sets `cache.loose`. O(items so far) — paid once per list, never
+/// again. Spans started with a marker validated by `scan_marker` when they were
+/// closed; the only way `item_body` fails here is invalid UTF-8 before the content
+/// byte (impossible — markers are ASCII), so `None` is the bail-for-safety path.
 fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Option<()> {
     cache.loose = true;
     cache.cached_prefix.clear();
@@ -2898,11 +2845,8 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
     // Borrow `items` separately so `cached_prefix`/`item_html` can be mutated.
     let spans = std::mem::take(&mut cache.items);
     for &(s, e) in &spans {
-        let line = &bytes[s..e];
-        let m = scan_marker(line)?;
-        if fold_item_line(
-            line,
-            &m,
+        if fold_item_body(
+            &bytes[s..e],
             true,
             opts,
             &mut cache.cached_prefix,
@@ -3499,10 +3443,13 @@ fn build_list_cache(
         ordered,
         start_num: list_start_num,
         delim: m.delim,
-        content_indent: m.content_indent,
+        edge: m.marker_indent,
+        cur_ci: m.content_indent,
         opener_html,
         cached_prefix,
         lines_upto: start,
+        open_item_start: start,
+        prev_blank: false,
         loose: false,
         items: Vec::new(),
         item_html: Vec::new(),
@@ -3511,38 +3458,38 @@ fn build_list_cache(
     })
 }
 
-/// Fold one item line into `cached_prefix` and, when `block_data` is on, capture
-/// its inner `<li>` HTML into `item_html` (the keyed-renderer channel). Mirrors
-/// the raw `render_item_line` + `push('\n')` the cache did before, so byte layout
-/// is unchanged. Returns `None` (so the caller can truncate + bail) on the
-/// invalid-UTF-8 path. `out`/`html_sink` are passed separately so the trailing
-/// (speculative) item can capture into a scratch buffer without committing it to
-/// the cache's `item_html`.
-fn fold_item_line(
-    line: &[u8],
-    m: &MarkerScan,
+/// Fold one item — given its raw multi-line source span `item` (marker line +
+/// any nested-list / continuation body lines, the same slice the full path's
+/// `render_list_item` receives) — into `cached_prefix`, plus its trailing `\n`,
+/// and when `block_data` is on capture its inner `<li>` HTML into `item_html`
+/// (the keyed-renderer channel). De-indents via `item_body` and renders via the
+/// SHARED `render_item_body`, so a nested sub-list is rendered recursively exactly
+/// as the full path does (byte-identical). Footnote refs render as occurrence-
+/// independent placeholder tokens resolved into `out` advancing `occ`; the inner
+/// `<li>` span is resolved from a CLONE taken at item start (matching ids, no
+/// double-count). When footnotes are off this is a token-free byte copy. Returns
+/// `None` (so the caller can bail) on the invalid-UTF-8 / no-marker path.
+/// `out`/`html_sink` are passed separately so the speculative open/partial item
+/// can capture into a scratch buffer without committing it to the cache.
+fn fold_item_body(
+    item: &[u8],
     loose: bool,
     opts: &RenderOpts,
     out: &mut String,
     html_sink: Option<&mut Vec<ListItemData>>,
     occ: &mut HashMap<String, usize>,
 ) -> Option<()> {
-    // Render the item into a scratch buffer (placeholder footnote tokens when on),
-    // resolve its tokens into `out` advancing `occ`, and resolve the inner `<li>`
-    // span for the keyed-renderer DATA from a CLONE taken at item start (same
-    // content, same order → matching ids, no double-count). When footnotes are
-    // off this is a token-free byte copy.
+    let body = item_body(item)?;
     let mut tmp = String::new();
-    let (lo, hi) = render_item_line(line, m, loose, opts, &mut tmp)?;
+    // `span` is `Some((lo, hi))` only when `block_data` is on.
+    let span = render_item_body(body, loose, opts, &mut tmp);
     let data_seed = occ.clone();
     resolve_footnote_ids(&tmp, occ, out);
-    if let Some(sink) = html_sink {
-        if opts.block_data {
-            let mut seed = data_seed;
-            let mut inner = String::with_capacity(hi - lo);
-            resolve_footnote_ids(&tmp[lo..hi], &mut seed, &mut inner);
-            sink.push(ListItemData { html: inner });
-        }
+    if let (Some(sink), Some((lo, hi))) = (html_sink, span) {
+        let mut seed = data_seed;
+        let mut inner = String::with_capacity(hi - lo);
+        resolve_footnote_ids(&tmp[lo..hi], &mut seed, &mut inner);
+        sink.push(ListItemData { html: inner });
     }
     out.push('\n');
     Some(())
