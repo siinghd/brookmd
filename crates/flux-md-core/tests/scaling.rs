@@ -113,12 +113,27 @@ fn big_blockquote(target: usize) -> String {
 }
 
 fn big_alert(target: usize) -> String {
-    // The 0.18.4 shape: a `> [!NOTE]` alert with structured inner blocks.
+    // The 0.18.4 shape: a `> [!NOTE]` alert with structured inner blocks. The
+    // recursive container-block cache renders the `>`-stripped inner through a
+    // nested StreamParser, so it now streams linearly instead of re-parsing the
+    // whole growing alert body every append.
     let mut s = String::from("> [!NOTE]\n");
     let mut i = 0usize;
     while s.len() < target {
         s.push_str(&format!("> - point {i} with **bold**\n> - point {} more\n", i + 1));
         i += 2;
+    }
+    s
+}
+
+fn blockquote_with_list(target: usize) -> String {
+    // A plain `>` blockquote whose body is a list — the other structured-inner
+    // container shape the recursive container-block cache makes linear.
+    let mut s = String::with_capacity(target + 32);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("> - point {i} with **bold** and `code`\n"));
+        i += 1;
     }
     s
 }
@@ -163,6 +178,11 @@ fn linear_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
         ("many_paragraphs", many_paragraphs),
         ("big_list", big_list),         // flat list -> ListCache (incremental)
         ("big_blockquote", big_blockquote), // prose quote -> ContainerCache (incremental)
+        // Structured-inner containers -> ContainerBlockCache (recursive nested
+        // parser, incremental). Was O(n²) (the 0.18.4 flicker fix bailed to a
+        // full reparse every append); now streams linearly.
+        ("alert_with_list", big_alert),
+        ("blockquote_with_list", blockquote_with_list),
         ("big_table", big_table),
         ("big_code", big_code),
         ("big_math", big_math),
@@ -170,18 +190,14 @@ fn linear_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
 }
 
 /// KNOWN O(n²) shapes — the next perf target. An open block that holds
-/// *structured* inner content (a nested sub-list, or a blockquote/alert whose
-/// body is a list / table / nested quote) is one atomic, never-committing block,
-/// and its incremental cache currently *bails to a full reparse* every append
-/// (the 0.18.3/0.18.4 fixes traded the flicker for this cost). Fixing it needs
-/// incremental rendering of structured inner content (a recursive inner parser);
-/// until then these are documented, not gated. This test still guards against
-/// getting *worse* than quadratic (e.g. an accidental O(n³)).
+/// *structured* inner content that is one atomic, never-committing block whose
+/// incremental cache currently *bails to a full reparse* every append. The
+/// blockquote/alert-with-structured-body shapes were fixed (recursive
+/// container-block cache → now in `linear_shapes`); `nested_loose_list` is the
+/// remaining one (the LIST cache, a separate fix). This test still guards
+/// against it getting *worse* than quadratic (e.g. an accidental O(n³)).
 fn known_quadratic_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
-    vec![
-        ("nested_loose_list", nested_loose_list),
-        ("alert_with_list", big_alert),
-    ]
+    vec![("nested_loose_list", nested_loose_list)]
 }
 
 /// Sizes spanning 16x. A linear parser's work grows ~16x across this span; a

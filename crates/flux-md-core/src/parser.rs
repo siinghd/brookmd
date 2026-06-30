@@ -8,8 +8,8 @@ use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
     is_fence_close_line, is_footnote_def_block, item_body, normalize_label,
     parse_alignments, push_code_fence_open, push_table_cell, render_block,
-    render_footnote_section, resolve_footnote_ids, split_table_cells, Enrichment, LinkRef,
-    RenderOpts,
+    render_footnote_section, resolve_footnote_ids, split_table_cells, trim_trailing_newlines,
+    Enrichment, LinkRef, RenderOpts,
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
 use crate::scanner::{
@@ -52,6 +52,14 @@ use crate::url::escape_html;
 /// uncatchable trap). 100 is far beyond any real document and well under the
 /// 256 KB stack; a link reference nested >100 containers deep is meaningless.
 const MAX_REF_DEPTH: usize = 100;
+
+/// Max recursion depth for the [`ContainerBlockCache`] nested-parser fast path.
+/// Each level owns a real [`StreamParser`] (a heavier stack frame than the
+/// render recursion), so this is set well below [`MAX_REF_DEPTH`]: past it the
+/// container falls back to the full reparse (itself bounded by
+/// `render::MAX_RENDER_DEPTH`). No real document nests structured containers
+/// anywhere near this deep.
+const MAX_CONTAINER_DEPTH: usize = 24;
 
 fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx, depth: usize) {
     if depth >= MAX_REF_DEPTH {
@@ -242,8 +250,27 @@ pub struct StreamParser {
     para_cache: Option<ParagraphCache>,
     /// Fast path for a long open GFM table at the tail (see [`TableCache`]).
     table_cache: Option<TableCache>,
-    /// Fast path for a long open blockquote / alert at the tail (see [`ContainerCache`]).
+    /// Fast path for a long open blockquote / alert whose inner content is PLAIN
+    /// PARAGRAPHS (see [`ContainerCache`]).
     container_cache: Option<ContainerCache>,
+    /// Fast path for a long open blockquote / alert whose inner content has BLOCK
+    /// structure — a list, nested quote, heading, table, fence (see
+    /// [`ContainerBlockCache`]). Renders the `>`-stripped inner via a recursive
+    /// nested `StreamParser` so structured containers stream in O(total bytes)
+    /// instead of re-parsing the whole growing tail every append.
+    container_block_cache: Option<ContainerBlockCache>,
+    /// True only for a NESTED parser owned by a [`ContainerBlockCache`]. When set,
+    /// every block this parser produces (committed AND active) renders with
+    /// `open_tail = true`, matching `render_blockquote` / `render_alert`, which
+    /// propagate the open container's `open_tail` to ALL inner sub-blocks. The
+    /// top-level parser leaves this `false` (open_tail is per-block, last-only).
+    force_open_tail: bool,
+    /// Container-nesting depth of THIS parser (0 = top level; a nested
+    /// container-block parser is +1). Bounds the recursive
+    /// [`ContainerBlockCache`] so an adversarial `">".repeat(N)` can't overflow
+    /// the WASM shadow stack — past [`MAX_CONTAINER_DEPTH`] we fall back to the
+    /// (depth-bounded) full reparse.
+    container_depth: usize,
     /// Fast path for a long open tight, flat list at the tail (see [`ListCache`]).
     list_cache: Option<ListCache>,
     /// Fast path for a long open indented-code block at the tail (see [`IndentedCodeCache`]).
@@ -296,6 +323,10 @@ struct FenceCache {
     trim_body: bool,
     /// Escaped HTML of the complete body lines, joined by `\n`, no trailing `\n`.
     escaped_lines: String,
+    /// Whether ≥1 complete body line has been folded in. Drives the `\n` line
+    /// JOIN separator — NOT `!escaped_lines.is_empty()`, which would swallow a
+    /// LEADING blank body line (` ```\n\nx ` must keep its `\n` before `x`).
+    has_body_line: bool,
     /// Absolute offset just past the last complete body line's `\n`.
     lines_upto: usize,
 }
@@ -421,6 +452,12 @@ struct ContainerCache {
     /// Wrapper opener that always appears: `<blockquote dir?>\n` for blockquote,
     /// or `<div class="...">\n<p class="...title">Title</p>\n` for an alert.
     wrapper_open: String,
+    /// True for a blockquote: the trailing `\n` of `wrapper_open` is the
+    /// CONDITIONAL body-leading newline (`render_blockquote`'s
+    /// `if !sub.is_empty()`), which must vanish for a totally empty body so the
+    /// output is `<blockquote></blockquote>`, not `<blockquote>\n</blockquote>`.
+    /// False for an alert (that `\n` is the always-present title separator).
+    body_leading_nl: bool,
     /// Body paragraph opener: `<p dir?>` — emitted only when the current
     /// paragraph has content. An empty current paragraph must produce no
     /// `<p></p>` (matches the full renderer's per-sub-block contract).
@@ -473,6 +510,55 @@ struct ContainerCache {
 enum ContainerCacheKind {
     Blockquote,
     Alert(crate::blocks::AlertKind),
+}
+
+/// Incremental render state for an open blockquote / alert whose inner content
+/// has BLOCK STRUCTURE (a list, nested quote, heading, table, fence, …) — the
+/// shape the plain-paragraph [`ContainerCache`] bails on. The whole container is
+/// one atomic, never-committing block, so the full reparse re-scans its growing
+/// tail every append (O(n²)); this cache renders the `>`-stripped inner through
+/// a RECURSIVE nested [`StreamParser`] that streams in O(new bytes).
+///
+/// Byte-parity rests on `render_blockquote` / `render_alert` (render.rs) being
+/// the SAME `scan()` + `render_block()` engine run on the `>`-stripped inner: a
+/// fresh `StreamParser` fed that identical stripped inner reproduces the inner
+/// HTML exactly (chunk-independence), and `force_open_tail` makes its committed
+/// sub-blocks match the full path's all-blocks-open_tail propagation. The cache
+/// BAILS to the full reparse (correct, just O(n²)) on anything the nested parser
+/// can't reproduce identically: a `\r` (CRLF), a non-`>` lazy continuation line,
+/// a footnote ref/def (`[^`, document-global numbering), a link-reference
+/// definition (`]:`, document-global resolution), or `block_data` (the nested
+/// `ContainerData` channel is not populated in v1).
+struct ContainerBlockCache {
+    /// Absolute byte offset of the container's first line in `buffer`.
+    start: usize,
+    /// Stable id of the container block (preserved across appends and the close).
+    id: u64,
+    /// Container variant — only drives which wrapper strings were precomputed.
+    kind: ContainerCacheKind,
+    /// Wrapper opener WITHOUT the conditional body-leading `\n`: `<blockquote dir?>`
+    /// for a blockquote, or the full `<div …>\n<p …title>Title</p>\n` for an alert.
+    wrapper_open: String,
+    /// Wrapper closer: `</blockquote>` or `</div>`.
+    wrapper_close: String,
+    /// Whether a `\n` is pushed before the body iff it is non-empty — true for a
+    /// blockquote (`if !sub.is_empty() { '\n' }`), false for an alert (the title
+    /// line's trailing `\n` already separates it from the body).
+    body_leading_nl: bool,
+    /// The recursive parser rendering the `>`-stripped inner markdown. Fed only
+    /// the per-append delta; its `all_blocks()` are the inner sub-blocks.
+    inner: Box<StreamParser>,
+    /// Absolute outer-buffer offset already turned into fed inner content.
+    fed_outer: usize,
+    /// True when mid inner-line: the current line's `>` prefix was already
+    /// consumed and partial content fed; continuation bytes feed raw (no prefix).
+    mid_line: bool,
+    /// Last byte fed to `inner` (for catching a `[^` / `]:` marker split across
+    /// two feeds). `None` until the first non-empty feed.
+    last_fed: Option<u8>,
+    /// Whether the outer parser has footnotes on (then a `[^` inner marker BAILS,
+    /// since the nested parser runs with footnotes off).
+    footnotes: bool,
 }
 
 /// Incremental render state for a single open *flat* list at the tail — the
@@ -643,6 +729,9 @@ impl StreamParser {
             para_cache: None,
             table_cache: None,
             container_cache: None,
+            container_block_cache: None,
+            force_open_tail: false,
+            container_depth: 0,
             list_cache: None,
             indented_cache: None,
             html_cache: None,
@@ -846,6 +935,9 @@ impl StreamParser {
             if let Some(patch) = self.try_incremental_container() {
                 return patch;
             }
+            if let Some(patch) = self.try_incremental_container_block() {
+                return patch;
+            }
             if let Some(patch) = self.try_incremental_list() {
                 return patch;
             }
@@ -958,10 +1050,17 @@ impl StreamParser {
             let mut html = String::with_capacity(64);
             // Per-block open_tail: the final block that abuts buffer EOF and is
             // not blank-line-closed. Clone opts with the flag set only for it.
-            let block_open_tail = !finalizing
-                && bi == last_idx
-                && tail_start + raw.range.end == self.buffer.len()
-                && !buffer_ends_blank;
+            // `force_open_tail` (a nested container-block parser only) forces it on
+            // for EVERY block so committed inner sub-blocks render exactly like
+            // `render_blockquote`, which propagates the open container's open_tail
+            // to all of them (so a closed inner block ending in an incomplete
+            // `[x](` / `` `code `` / `$math` speculates identically — never finalized,
+            // so this is only ever the open-stream view).
+            let block_open_tail = self.force_open_tail
+                || (!finalizing
+                    && bi == last_idx
+                    && tail_start + raw.range.end == self.buffer.len()
+                    && !buffer_ends_blank);
             let block_opts;
             let block_opts_ref: &RenderOpts = if block_open_tail {
                 block_opts = RenderOpts { open_tail: true, ..opts.clone() };
@@ -1291,6 +1390,7 @@ impl StreamParser {
         self.para_cache = None;
         self.table_cache = None;
         self.container_cache = None;
+        self.container_block_cache = None;
         self.list_cache = None;
         self.indented_cache = None;
         self.html_cache = None;
@@ -1352,6 +1452,19 @@ impl StreamParser {
                             &opts,
                             &self.committed_footnote_occurrences,
                         );
+                        // The paragraph-only cache bails (returns None) on
+                        // STRUCTURED inner content (a list/quote/heading/table/…).
+                        // For that case, arm the recursive nested-parser cache so
+                        // it still streams in O(new bytes) instead of re-parsing
+                        // the whole growing tail each append.
+                        if self.container_cache.is_none()
+                            && self.container_depth < MAX_CONTAINER_DEPTH
+                        {
+                            let id = new_active[0].id;
+                            let kind = new_active[0].kind.clone();
+                            self.container_block_cache =
+                                self.build_container_block_cache(start, id, &kind, &opts);
+                        }
                     }
                     RawBlockKind::List { ordered, start: list_start_num } => {
                         self.list_cache = build_list_cache(
@@ -1428,9 +1541,10 @@ impl StreamParser {
                     if bytes[pos..content_end].contains(&b'\r') || is_close {
                         return None;
                     }
-                    if !cache.escaped_lines.is_empty() {
+                    if cache.has_body_line {
                         cache.escaped_lines.push('\n');
                     }
+                    cache.has_body_line = true;
                     escape_html(
                         std::str::from_utf8(&bytes[pos..content_end]).unwrap_or(""),
                         &mut cache.escaped_lines,
@@ -1460,20 +1574,32 @@ impl StreamParser {
         html.push_str(&cache.opener_html);
         let body_start = html.len();
         html.push_str(&cache.escaped_lines);
-        let lines_nonempty = !cache.escaped_lines.is_empty();
+        // `escaped_lines` is the complete body lines joined by `\n` with NO trailing
+        // `\n`; restore the last complete line's `\n` (via `has_body_line`, NOT
+        // `!escaped_lines.is_empty()`, so a leading/only blank body line keeps its
+        // `\n`) so `html[body_start..]` becomes exactly `escape(raw_body)`.
+        if cache.has_body_line {
+            html.push('\n');
+        }
         if !partial.is_empty() {
-            if lines_nonempty {
-                html.push('\n');
-            }
             escape_html(std::str::from_utf8(partial).unwrap_or(""), &mut html);
         }
         if cache.trim_body {
-            // Whitespace bytes survive escape_html unchanged, so trimming the
-            // escaped output equals trimming the source body.
+            // Math: trim the body's surrounding whitespace. Whitespace bytes survive
+            // escape_html unchanged, so trimming the escaped output equals trimming
+            // the source. (Leading whitespace was already dropped at arm time.)
             let trimmed = html.trim_end_matches([' ', '\t', '\n', '\r']).len();
             html.truncate(trimmed.max(body_start));
-        } else if lines_nonempty || !partial.is_empty() {
-            html.push('\n');
+        } else {
+            // Code: mirror `render_code_fence` exactly — strip ALL trailing
+            // `\n`/`\r` from the body, then append a single `\n` iff the body is
+            // non-empty (so a trailing blank body line collapses, e.g. ` ```\n\n `
+            // → `<pre><code></code></pre>`, while a leading blank is preserved).
+            let trimmed = html[body_start..].trim_end_matches(['\n', '\r']).len();
+            html.truncate(body_start + trimmed);
+            if html.len() > body_start {
+                html.push('\n');
+            }
         }
         // Opt-in structured channel: recover the decoded source from the just-
         // assembled, already-trimmed HTML body (`html[body_start..]`, before the
@@ -2129,13 +2255,17 @@ impl StreamParser {
 
         // Render boundary on the full active region (committed-tail + partial)
         // for the CURRENT paragraph only. Closed paragraphs are fully settled
-        // in `committed_paras_html` and never re-rendered.
+        // in `committed_paras_html` and never re-rendered. The active slice has its
+        // TRAILING newline(s) trimmed, exactly like `render_paragraph` does before
+        // `render_inline` — otherwise a trailing `\n` (present whenever the last
+        // inner line is complete) would terminate a speculative open-tail
+        // `[x](`/`` `code ``/`$math` at the paragraph's end and flash it literal
+        // instead of speculating, diverging from the one-shot render. The trim only
+        // touches the very end (never the settled prefix), so the commit boundary
+        // and footnote occurrence advance are unchanged.
+        let active_slice = trim_trailing_newlines(&cache.inner_buffer[cache.inner_cut..]);
         let mut active_html = String::new();
-        let boundary_rel = render_inline_boundary(
-            &cache.inner_buffer[cache.inner_cut..],
-            &opts,
-            &mut active_html,
-        );
+        let boundary_rel = render_inline_boundary(active_slice, &opts, &mut active_html);
         let new_cut = (cache.inner_cut + boundary_rel).min(committed_inner_end);
         if new_cut > cache.inner_cut {
             let mut seg = String::new();
@@ -2145,7 +2275,11 @@ impl StreamParser {
             resolve_footnote_ids(&seg, &mut cache.inner_fn_occ, &mut cache.committed_inner_html);
             cache.inner_cut = new_cut;
             active_html.clear();
-            render_inline(&cache.inner_buffer[cache.inner_cut..], &opts, &mut active_html);
+            render_inline(
+                trim_trailing_newlines(&cache.inner_buffer[cache.inner_cut..]),
+                &opts,
+                &mut active_html,
+            );
         }
         // Resolve the speculative active tail from a CLONE of the open paragraph's
         // occurrence sub-map (does NOT advance it). Byte-copy when footnotes off.
@@ -2203,6 +2337,16 @@ impl StreamParser {
             // the full renderer, which emits no body sub-block for an empty
             // inner — true whether or not closed paragraphs precede it).
             html.truncate(body_p_start);
+            // …and if there are NO closed paragraphs either, the body is totally
+            // empty: a blockquote's wrapper_open carries the conditional
+            // body-leading `\n` (`render_blockquote`'s `if !sub.is_empty()`), which
+            // must then vanish → `<blockquote></blockquote>` not
+            // `<blockquote>\n</blockquote>`. (An alert's `\n` is its title
+            // separator and always stays.)
+            if cache.body_leading_nl && cache.committed_paras_html.is_empty() {
+                debug_assert!(html.ends_with('\n'));
+                html.pop();
+            }
         } else {
             html.push_str(&cache.body_p_close);
         }
@@ -2240,6 +2384,179 @@ impl StreamParser {
         self.active_blocks = vec![block.clone()];
         self.container_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of an open structured blockquote / alert at the
+    /// tail (see [`ContainerBlockCache`]). Strips the `>` markers off the newly
+    /// arrived bytes, feeds that delta to the recursive nested parser, and
+    /// reassembles `wrapper + inner-blocks + wrapper`. Returns `None` (dropping
+    /// the cache → full reparse) on any BAIL condition.
+    fn try_incremental_container_block(&mut self) -> Option<Patch> {
+        let mut cache = self.container_block_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Tail-only check (same as the other caches): nothing but whitespace may
+        // sit between the committed boundary and the container's opener.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+
+        // Strip `>` markers off the delta since the last feed → inner markdown.
+        let mut mid_line = cache.mid_line;
+        let mut last_fed = cache.last_fed;
+        let (delta, new_fed) = strip_container_delta(
+            bytes,
+            cache.fed_outer,
+            end,
+            &mut mid_line,
+            &mut last_fed,
+            cache.footnotes,
+        )?;
+        // Feed the delta to the recursive parser (it owns the partial-trailing-line
+        // speculation, giving mid-stream parity). Empty delta still re-renders the
+        // open inner tail.
+        cache.inner.append(&delta);
+        cache.fed_outer = new_fed;
+        cache.mid_line = mid_line;
+        cache.last_fed = last_fed;
+
+        let html = assemble_container_block(&cache);
+        let kind = match cache.kind {
+            ContainerCacheKind::Blockquote => BlockKind::Blockquote(None),
+            ContainerCacheKind::Alert(ak) => BlockKind::Alert { kind: ak, nested: None },
+        };
+        let block = Block {
+            id: cache.id,
+            kind,
+            start: cache.start,
+            end,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.container_block_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// Arm the structured-container cache for an open blockquote / alert at
+    /// `start`. Returns `None` (no cache → full reparse) when the nested parser
+    /// could not reproduce the inner byte-for-byte: an incomplete first line (the
+    /// Blockquote/Alert distinction isn't settled), a wrong block kind,
+    /// `block_data` (v1 doesn't fill the nested data channel), or any of the feed
+    /// BAILs (CRLF / lazy continuation / footnote / ref-def). The first feed
+    /// processes every line already present; later appends fold only new bytes.
+    fn build_container_block_cache(
+        &self,
+        start: usize,
+        id: u64,
+        block_kind: &BlockKind,
+        opts: &RenderOpts,
+    ) -> Option<ContainerBlockCache> {
+        // The nested `ContainerData` channel isn't populated yet — let the full
+        // reparse own block_data containers (correct, just O(n²)).
+        if opts.block_data {
+            return None;
+        }
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Require a complete first line so Blockquote vs. Alert is settled.
+        let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
+        let first_line_end = start + first_nl;
+        if bytes[start..first_line_end].contains(&b'\r') {
+            return None;
+        }
+        let (kind, wrapper_open, wrapper_close, body_leading_nl, content_start) = match block_kind {
+            BlockKind::Blockquote(_) => {
+                let mut w = String::with_capacity(16);
+                w.push_str("<blockquote");
+                w.push_str(opts.dir());
+                w.push('>');
+                (
+                    ContainerCacheKind::Blockquote,
+                    w,
+                    String::from("</blockquote>"),
+                    true,
+                    start,
+                )
+            }
+            BlockKind::Alert { kind: ak, .. } => {
+                let mut w = String::with_capacity(96);
+                w.push_str("<div class=\"markdown-alert markdown-alert-");
+                w.push_str(ak.class());
+                w.push_str("\" data-alert=\"");
+                w.push_str(ak.class());
+                w.push_str("\" role=\"note\"");
+                w.push_str(opts.dir());
+                w.push_str(">\n<p class=\"markdown-alert-title\"");
+                w.push_str(opts.dir());
+                w.push('>');
+                w.push_str(ak.title());
+                w.push_str("</p>\n");
+                // Alert body starts on line 2 (the `[!KIND]` marker is the title).
+                (
+                    ContainerCacheKind::Alert(*ak),
+                    w,
+                    String::from("</div>"),
+                    false,
+                    first_line_end + 1,
+                )
+            }
+            _ => return None,
+        };
+
+        // Recursive nested parser: SAME feature flags as the outer EXCEPT
+        // gfm_footnotes (document-global numbering — kept off; a `[^` inner marker
+        // bails). committed link-ref table is DEEP-cloned (not Rc-shared) so the
+        // nested parser's own `Rc::make_mut` commit-fold keeps strong_count == 1;
+        // it's frozen anyway while the open container stalls `committed_offset`.
+        let mut inner = Box::new(StreamParser::new());
+        inner.unsafe_html = self.unsafe_html;
+        inner.gfm_autolinks = self.gfm_autolinks;
+        inner.gfm_alerts = self.gfm_alerts;
+        inner.gfm_footnotes = false;
+        inner.gfm_math = self.gfm_math;
+        inner.dir_auto = self.dir_auto;
+        inner.a11y = self.a11y;
+        inner.block_data = false;
+        inner.component_tags = self.component_tags.clone();
+        inner.inline_component_tags = self.inline_component_tags.clone();
+        inner.html_sanitize = self.html_sanitize;
+        inner.html_allowlist = self.html_allowlist.clone();
+        inner.html_drop = self.html_drop.clone();
+        inner.committed_refs = Rc::new((*self.committed_refs).clone());
+        inner.force_open_tail = true;
+        inner.container_depth = self.container_depth + 1;
+
+        let mut mid_line = false;
+        let mut last_fed = None;
+        let (delta, fed_outer) = strip_container_delta(
+            bytes,
+            content_start,
+            end,
+            &mut mid_line,
+            &mut last_fed,
+            self.gfm_footnotes,
+        )?;
+        inner.append(&delta);
+
+        Some(ContainerBlockCache {
+            start,
+            id,
+            kind,
+            wrapper_open,
+            wrapper_close,
+            body_leading_nl,
+            inner,
+            fed_outer,
+            mid_line,
+            last_fed,
+            footnotes: self.gfm_footnotes,
+        })
     }
 
     /// O(new bytes) extension of a long open flat list at the tail. Each
@@ -2602,6 +2919,145 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
     Some(())
 }
 
+/// Extract the inner-markdown DELTA to feed a [`ContainerBlockCache`]'s nested
+/// parser from `bytes[from..end]`, stripping the per-line `>` prefix
+/// (≤3 spaces, `>`, one optional space) exactly like `render::blockquote_inner`.
+///
+/// Linear and rollback-free: it advances over whole inner lines, and for the
+/// trailing PARTIAL line feeds the post-prefix content RAW (no `\n`) so the
+/// nested parser speculates it — which is why `mid_line` (we're continuing a
+/// partial inner line whose prefix was already consumed) feeds raw with no new
+/// prefix. It WAITS (stops, advancing `*pos` no further) when a trailing partial
+/// line hasn't revealed enough of its prefix yet (only spaces so far, or a bare
+/// `>` whose optional space is undecided) — those few bytes carry no visible
+/// output, so rendering with what's committed stays byte-faithful.
+///
+/// Returns `None` (the caller BAILS to the full reparse) on a `\r` (CRLF), a
+/// non-`>` line (a lazy continuation the nested parser can't see verbatim), or a
+/// scoping marker: a footnote `[^` (when `footnotes`) or a link-ref `]:` — both
+/// document-global, so the independent nested parser would mis-handle them.
+/// `last_fed` (the previous feed's last byte) catches a marker split across two
+/// feeds. On success returns the delta plus the new consumed offset.
+fn strip_container_delta(
+    bytes: &[u8],
+    from: usize,
+    end: usize,
+    mid_line: &mut bool,
+    last_fed: &mut Option<u8>,
+    footnotes: bool,
+) -> Option<(String, usize)> {
+    let nl_at = |start: usize| bytes[start..end].iter().position(|&b| b == b'\n').map(|r| start + r);
+    let mut delta = String::new();
+    let mut pos = from;
+    loop {
+        if pos >= end {
+            break;
+        }
+        if *mid_line {
+            // Continuation of an inner line whose `>` prefix was already consumed.
+            match nl_at(pos) {
+                Some(ce) => {
+                    if bytes[pos..ce].contains(&b'\r') {
+                        return None;
+                    }
+                    delta.push_str(std::str::from_utf8(&bytes[pos..ce]).ok()?);
+                    delta.push('\n');
+                    pos = ce + 1;
+                    *mid_line = false;
+                }
+                None => {
+                    if bytes[pos..end].contains(&b'\r') {
+                        return None;
+                    }
+                    delta.push_str(std::str::from_utf8(&bytes[pos..end]).ok()?);
+                    pos = end;
+                    break; // mid_line stays true
+                }
+            }
+        } else {
+            // Strip the line prefix: ≤3 spaces, `>`, one optional space.
+            let mut i = pos;
+            let mut sp = 0;
+            while i < end && bytes[i] == b' ' && sp < 3 {
+                i += 1;
+                sp += 1;
+            }
+            if i >= end {
+                break; // only spaces so far — wait for the rest of the prefix
+            }
+            if bytes[i] != b'>' {
+                return None; // non-`>` line: lazy continuation / end of quote
+            }
+            i += 1;
+            if i >= end {
+                break; // bare `>` at EOF — wait to resolve the optional space
+            }
+            if bytes[i] == b' ' {
+                i += 1;
+            }
+            let cs = i;
+            match nl_at(cs) {
+                Some(ce) => {
+                    if bytes[cs..ce].contains(&b'\r') {
+                        return None;
+                    }
+                    delta.push_str(std::str::from_utf8(&bytes[cs..ce]).ok()?);
+                    delta.push('\n');
+                    pos = ce + 1;
+                }
+                None => {
+                    if bytes[cs..end].contains(&b'\r') {
+                        return None;
+                    }
+                    delta.push_str(std::str::from_utf8(&bytes[cs..end]).ok()?);
+                    pos = end;
+                    *mid_line = true;
+                    break;
+                }
+            }
+        }
+    }
+    // Scoping bail (over-conservative substring match; a 1-byte overlap with the
+    // previous feed catches a `[^` / `]:` marker split across the feed boundary).
+    let db = delta.as_bytes();
+    if (footnotes && *last_fed == Some(b'[') && db.first() == Some(&b'^'))
+        || (*last_fed == Some(b']') && db.first() == Some(&b':'))
+    {
+        return None;
+    }
+    if (footnotes && delta.contains("[^")) || delta.contains("]:") {
+        return None;
+    }
+    if let Some(&b) = db.last() {
+        *last_fed = Some(b);
+    }
+    Some((delta, pos))
+}
+
+/// Assemble a [`ContainerBlockCache`]'s active-block HTML: wrapper opener, the
+/// `\n`-joined inner sub-block fragments (each nested block's `.html` is exactly
+/// `render_block`'s output, with no trailing `\n`), and the wrapper closer —
+/// byte-identical to `render_blockquote` / `render_alert`.
+fn assemble_container_block(cache: &ContainerBlockCache) -> String {
+    let blocks: Vec<&Block> = cache.inner.all_blocks().collect();
+    let body_len: usize = blocks.iter().map(|b| b.html.len() + 1).sum();
+    let mut html = String::with_capacity(
+        cache.wrapper_open.len() + 1 + body_len + cache.wrapper_close.len(),
+    );
+    html.push_str(&cache.wrapper_open);
+    // Blockquote pushes a leading `\n` iff the body is non-empty (`!sub.is_empty()`);
+    // an alert's title line already supplied that separator.
+    if cache.body_leading_nl && !blocks.is_empty() {
+        html.push('\n');
+    }
+    for b in &blocks {
+        html.push_str(&b.html);
+        html.push('\n');
+    }
+    html.push_str(&cache.wrapper_close);
+    html
+}
+
 /// Strip the CommonMark blockquote marker (`>` with optional one space, after
 /// up to 3 leading spaces) from a line's bytes. Returns the content portion,
 /// or `None` if the line doesn't carry a `>` marker (lazy continuation or
@@ -2640,6 +3096,7 @@ fn build_code_fence_cache(
     let nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
     let body_start = start + nl + 1;
     let mut escaped_lines = String::new();
+    let mut has_body_line = false;
     let mut lines_upto = body_start;
     let mut pos = body_start;
     while pos < end {
@@ -2651,9 +3108,10 @@ fn build_code_fence_cache(
                 if bytes[pos..content_end].contains(&b'\r') || is_fence_close_line(&bytes[pos..next]) {
                     return None;
                 }
-                if !escaped_lines.is_empty() {
+                if has_body_line {
                     escaped_lines.push('\n');
                 }
+                has_body_line = true;
                 escape_html(
                     std::str::from_utf8(&bytes[pos..content_end]).unwrap_or(""),
                     &mut escaped_lines,
@@ -2677,6 +3135,7 @@ fn build_code_fence_cache(
         close: FenceClose::CodeFence,
         trim_body: false,
         escaped_lines,
+        has_body_line,
         lines_upto,
     })
 }
@@ -2716,6 +3175,7 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
         return None;
     }
     let mut escaped_lines = String::new();
+    let mut has_body_line = false;
     let mut lines_upto = body_start;
     let mut pos = body_start;
     while pos < end {
@@ -2727,9 +3187,10 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
                 if bytes[pos..content_end].contains(&b'\r') || line_contains(&bytes[pos..content_end], closer) {
                     return None;
                 }
-                if !escaped_lines.is_empty() {
+                if has_body_line {
                     escaped_lines.push('\n');
                 }
+                has_body_line = true;
                 escape_html(
                     std::str::from_utf8(&bytes[pos..content_end]).unwrap_or(""),
                     &mut escaped_lines,
@@ -2751,6 +3212,7 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
         close: FenceClose::MathCloser(closer),
         trim_body: true,
         escaped_lines,
+        has_body_line,
         lines_upto,
     })
 }
@@ -2919,13 +3381,13 @@ fn build_container_cache(
     body_p_open.push_str(opts.dir());
     body_p_open.push('>');
     let body_p_close = String::from("</p>\n");
-    let (kind, wrapper_open, wrapper_close, lines_upto) = match block_kind {
+    let (kind, wrapper_open, wrapper_close, body_leading_nl, lines_upto) = match block_kind {
         BlockKind::Blockquote(_) => {
             let mut w = String::with_capacity(32);
             w.push_str("<blockquote");
             w.push_str(opts.dir());
             w.push_str(">\n");
-            (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), start)
+            (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), true, start)
         }
         BlockKind::Alert { kind: ak, .. } => {
             let mut w = String::with_capacity(96);
@@ -2941,7 +3403,7 @@ fn build_container_cache(
             w.push_str(ak.title());
             w.push_str("</p>\n");
             // Alert: skip past the `[!KIND]` marker line — body starts on line 2.
-            (ContainerCacheKind::Alert(*ak), w, String::from("</div>"), first_line_end + 1)
+            (ContainerCacheKind::Alert(*ak), w, String::from("</div>"), false, first_line_end + 1)
         }
         _ => return None,
     };
@@ -2971,6 +3433,7 @@ fn build_container_cache(
         id,
         kind,
         wrapper_open,
+        body_leading_nl,
         body_p_open,
         body_p_close,
         wrapper_close,

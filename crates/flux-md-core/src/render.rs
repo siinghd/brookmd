@@ -1822,7 +1822,7 @@ pub(crate) fn parse_alignments(line: &str) -> Vec<Option<&'static str>> {
         .collect()
 }
 
-fn trim_trailing_newlines(s: &str) -> &str {
+pub(crate) fn trim_trailing_newlines(s: &str) -> &str {
     s.trim_end_matches(|c: char| c == '\n' || c == '\r')
 }
 

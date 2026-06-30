@@ -4,6 +4,29 @@ Notable changes to flux-md. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.18.5 — 2026-06-30
+
+### Performance
+
+- **Blockquotes and GFM alerts with structured bodies now stream in O(n) instead
+  of O(n²).** When a `>` blockquote or `> [!NOTE]` alert contains a list, table,
+  nested quote, heading, or code block, the incremental container cache used to
+  bail to a full reparse on every appended chunk — re-scanning and re-rendering
+  the whole growing block, so a long quoted list or alert-with-list went
+  quadratic (a 256 KB body streamed in small chunks did ~250× the parse work of a
+  16 KB one). It now renders the `>`-stripped inner through a recursive nested
+  parser, committing settled inner blocks and re-rendering only the open tail, so
+  the work is linear in document size. Streamed and one-shot output stay
+  byte-identical. (WASM +3.8 KB.)
+
+### Internal
+
+- A deterministic complexity-scaling gate (`cargo test --features perf_counters
+  --test scaling`), a proptest chunk-independence parity suite, and a cargo-fuzz
+  parity target now run in CI to catch O(n²) streaming regressions and chunk-
+  boundary divergences before they ship. The container regression above was
+  surfaced by the new gate on its first run.
+
 ## 0.18.4 — 2026-06-29
 
 ### Fixed
