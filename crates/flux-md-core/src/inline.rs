@@ -50,6 +50,57 @@ fn is_boundary(bytes: &[u8], pos: usize) -> bool {
     }
 }
 
+/// Byte distance between synthetic boundary candidates in space-free text.
+/// Also the safety margin past any inert-run reset: the only run-resetting
+/// construct that can later complete *without* a fresh trigger byte is a
+/// failed `&`-entity decode, and `decode_entity` bounds an entity at 34 bytes
+/// (`&` + 32-char name + `;`), far less than this gap.
+const SYNTH_GAP: usize = 2048;
+
+/// Synthetic boundary candidates for space-free text (`track` mode only).
+///
+/// [`is_boundary`] only proposes word starts after a single space or a
+/// newline, so a huge run with no spaces (one giant word, entity soup) yields
+/// zero candidates, the streaming commit cut pins at 0, and every append
+/// re-renders the whole growing paragraph — O(n²). Inside a long run of
+/// *inert* bytes (bytes the catch-all text arm consumed, plus completed
+/// entities) we can propose extra cut points. Cutting there is prefix-stable
+/// by construction — escaping and entity decoding are context-free — and every
+/// construct that could span or restructure the cut is excluded:
+///
+/// * every construct opener (`` \&`<![$*_~ `` …) takes a non-catch-all arm and
+///   so resets the run; the candidate sits >= [`SYNTH_GAP`] bytes past the
+///   reset, beyond the bounded forward reach of a completable entity, and
+///   open-ended constructs (emphasis, links, code, math, autolinks-at-EOF) are
+///   already excluded via `unstable`/`earliest_open`/`pairs` in
+///   [`compute_cut`] or consume the tail outright (no candidates inside);
+/// * with GFM autolinks on, an email/`www.` autolink could otherwise reach
+///   *back* across a mid-word cut (a future `@` binds the alnum run to its
+///   left, and the suffix slice would probe position 0 as a link start that
+///   the full render never probes) — so the candidate byte itself must not be
+///   one an extended autolink can contain or start (alnum or `.+_-@`);
+/// * whitespace never extends a run (space-bearing text already gets natural
+///   candidates, and staying out of space runs keeps hard-break handling
+///   whole).
+fn synth_boundary(
+    pos: usize,
+    b: u8,
+    gfm_autolinks: bool,
+    inert_run_start: &mut usize,
+    inert_run_end: usize,
+    candidates: &mut Vec<usize>,
+) {
+    if pos != inert_run_end {
+        *inert_run_start = pos; // a reset (or slice start) — new run begins here
+    } else if pos - *inert_run_start >= SYNTH_GAP
+        && (!gfm_autolinks
+            || !(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'_' | b'-' | b'@')))
+    {
+        candidates.push(pos);
+        *inert_run_start = pos; // rate-limit: next candidate a full gap later
+    }
+}
+
 /// Largest boundary candidate that is stable: at/before any unstable construct
 /// (`unstable`), at/before any unpaired can-open emphasis opener (could pair
 /// forward), and not strictly inside any resolved emphasis pair `(a, b]`.
@@ -61,9 +112,22 @@ fn compute_cut(candidates: &[usize], unstable: usize, stack: &[Delim], pairs: &[
         }
     }
     let limit = unstable.min(earliest_open);
+    // Candidates arrive in ascending scan order, so instead of testing every
+    // candidate against every pair (O(candidates × pairs) — quadratic on
+    // emphasis-dense text), sort the pairs by opener once and sweep: `c` is
+    // strictly inside some pair `(a, b]` iff the max closer `b` over all pairs
+    // with `a < c` is >= `c`.
+    debug_assert!(candidates.windows(2).all(|w| w[0] <= w[1]));
+    let order = crate::sort::stable_order(pairs, |x, y| x.0 <= y.0);
     let mut best = 0;
+    let mut pi = 0;
+    let mut max_b = 0usize;
     for &c in candidates {
-        if c > best && c <= limit && !pairs.iter().any(|&(a, b)| a < c && c <= b) {
+        while pi < order.len() && pairs[order[pi]].0 < c {
+            max_b = max_b.max(pairs[order[pi]].1);
+            pi += 1;
+        }
+        if c > best && c <= limit && max_b < c {
             best = c;
         }
     }
@@ -120,6 +184,13 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
     // Streaming boundary tracking (only populated when `track`).
     let mut candidates: Vec<usize> = Vec::new();
     let mut unstable = usize::MAX;
+    // Inert-run tracking for synthetic boundary candidates (see
+    // [`synth_boundary`]; only maintained when `track`).
+    let mut inert_run_start = 0usize;
+    let mut inert_run_end = 0usize;
+    // Lazily-built index over the slice's `$` runs, shared by every
+    // `try_dollar_math` probe in this render (see [`DollarIndex`]).
+    let mut dollar_idx: Option<DollarIndex> = None;
 
     while pos < bytes.len() {
         if track && is_boundary(bytes, pos) {
@@ -200,11 +271,24 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
             }
             b'&' => {
                 if let Some((decoded, consumed)) = decode_entity(&bytes[pos..]) {
+                    // A completed entity is inert for streaming purposes: it's
+                    // consumed atomically and later input can't reopen it, so it
+                    // extends the inert run (and, like the catch-all arm, may
+                    // carry a synthetic boundary candidate at its `&`).
+                    if track {
+                        synth_boundary(pos, b'&', opts.gfm_autolinks, &mut inert_run_start, inert_run_end, &mut candidates);
+                    }
                     for c in decoded.chars() {
                         push_escaped_char(c, out);
                     }
                     pos += consumed;
+                    if track {
+                        inert_run_end = pos;
+                    }
                 } else {
+                    // Failed decode: a later `;` could still complete the
+                    // entity, so the run does NOT extend across this `&` (any
+                    // synthetic candidate must sit >= SYNTH_GAP past it).
                     out.push_str("&amp;");
                     pos += 1;
                 }
@@ -329,7 +413,7 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                 }
             }
             b'$' if opts.gfm_math => {
-                match try_dollar_math(bytes, pos, opts.open_tail, out) {
+                match try_dollar_math(bytes, pos, opts.open_tail, &mut dollar_idx, out) {
                     Some(end) => {
                         // Settled `$x$` / `$$…$$` OR (open_tail only) a speculative
                         // open dollar-math span whose closer hasn't streamed yet:
@@ -390,6 +474,14 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                 pos += 1;
             }
             _ => {
+                // Plain text. Non-whitespace bytes extend the inert run and may
+                // carry a synthetic boundary candidate (see `synth_boundary`);
+                // spaces/tabs never extend a run — space-bearing text gets its
+                // natural `is_boundary` candidates instead.
+                let ws = matches!(b, b' ' | b'\t');
+                if track && !ws {
+                    synth_boundary(pos, b, opts.gfm_autolinks, &mut inert_run_start, inert_run_end, &mut candidates);
+                }
                 if b < 0x80 {
                     push_escaped(b, out);
                     pos += 1;
@@ -398,6 +490,9 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                     pos += c.len_utf8();
                 } else {
                     pos += 1;
+                }
+                if track && !ws {
+                    inert_run_end = pos;
                 }
             }
         }
@@ -771,12 +866,80 @@ fn try_math_delim(
     None
 }
 
+/// Lazily-built per-slice index over `$` runs for [`try_dollar_math`]. Without
+/// it, every unmatched `$` opener re-scans to EOF looking for a valid closer —
+/// O(n²) inside a single render on `$`-dense text. Closer validity is
+/// position-local (it depends only on the bytes around the closer's run), so
+/// one O(n) pass records every run plus, per run class, the next valid closer
+/// at/after each run; every opener probe is then O(log runs).
+struct DollarIndex {
+    /// `(start, len)` of every maximal `$` run, ascending.
+    runs: Vec<(usize, usize)>,
+    /// `runs[next1[k]]` is the first run at index >= `k` that can close a
+    /// single-`$` span (non-space immediately left, no ASCII digit after the
+    /// consumed `$`). `usize::MAX` when none.
+    next1: Vec<usize>,
+    /// Same for `$$` closers (any run of len >= 2, no validity checks).
+    next2: Vec<usize>,
+    /// Ascending positions `b` with `bytes[b] == '\n' && bytes[b+1] == '\n'`
+    /// (the never-cross-a-blank-line barrier).
+    blanks: Vec<usize>,
+}
+
+fn build_dollar_index(bytes: &[u8]) -> DollarIndex {
+    let mut runs = Vec::new();
+    let mut blanks = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i;
+            while i < bytes.len() && bytes[i] == b'$' {
+                i += 1;
+            }
+            runs.push((start, i - start));
+        } else {
+            if bytes[i] == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
+                blanks.push(i);
+            }
+            i += 1;
+        }
+    }
+    let mut next1 = vec![usize::MAX; runs.len()];
+    let mut next2 = vec![usize::MAX; runs.len()];
+    let (mut n1, mut n2) = (usize::MAX, usize::MAX);
+    for k in (0..runs.len()).rev() {
+        let (pos, len) = runs[k];
+        // pandoc single-`$` closer rule: a non-space immediately to the left,
+        // and the byte after the consumed `$` (the run's own 2nd `$` when
+        // len >= 2) not an ASCII digit.
+        if pos > 0
+            && !matches!(bytes[pos - 1], b' ' | b'\t' | b'\n' | b'\r')
+            && !bytes.get(pos + 1).is_some_and(|b| b.is_ascii_digit())
+        {
+            n1 = k;
+        }
+        if len >= 2 {
+            n2 = k;
+        }
+        next1[k] = n1;
+        next2[k] = n2;
+    }
+    DollarIndex { runs, next1, next2, blanks }
+}
+
 /// Dollar-delimited inline math: `$…$` (inline) or `$$…$$` (display). Uses the
 /// pandoc disambiguation rule for single `$` so currency text stays literal:
 /// the opener must be followed by a non-space, and a closer is only valid when
 /// preceded by a non-space and not followed by an ASCII digit. Returns the
 /// offset past the closing run, or None to fall back to a literal `$`.
-fn try_dollar_math(bytes: &[u8], start: usize, open_tail: bool, out: &mut String) -> Option<usize> {
+/// `idx` caches the slice's `$`-run index across probes (see [`DollarIndex`]).
+fn try_dollar_math(
+    bytes: &[u8],
+    start: usize,
+    open_tail: bool,
+    idx: &mut Option<DollarIndex>,
+    out: &mut String,
+) -> Option<usize> {
     let mut run = 0;
     while start + run < bytes.len() && bytes[start + run] == b'$' {
         run += 1;
@@ -792,38 +955,42 @@ fn try_dollar_math(bytes: &[u8], start: usize, open_tail: bool, out: &mut String
             _ => {}
         }
     }
-    let mut i = content_start;
-    while i < bytes.len() {
-        if bytes[i] == b'$' {
-            let mut clen = 0;
-            while i + clen < bytes.len() && bytes[i + clen] == b'$' {
-                clen += 1;
-            }
-            if clen >= n {
-                let content_end = i;
-                if content_end == content_start {
-                    return None; // empty `$$` / `$ $`-style — leave literal
-                }
-                if !display {
-                    // pandoc: closer needs a non-space to its left and must not
-                    // be immediately followed by a digit.
-                    let prev = bytes[content_end - 1];
-                    let bad_left = matches!(prev, b' ' | b'\t' | b'\n' | b'\r');
-                    let bad_right = bytes.get(content_end + n).is_some_and(|b| b.is_ascii_digit());
-                    if bad_left || bad_right {
-                        i += clen;
-                        continue;
-                    }
-                }
-                emit_inline_math(&bytes[content_start..content_end], display, out);
-                return Some(content_end + n);
-            }
-            i += clen;
-        } else if bytes[i] == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
-            return None; // don't cross a blank line
-        } else {
-            i += 1;
+    // When the opener's own run has leftover `$`s (content_start is mid-run),
+    // the byte scan this replaces either bailed on empty content (leftover
+    // >= n) or stepped past the leftover — replicate that, so every closer
+    // candidate below is a true run start covered by the index.
+    let mut scan_from = content_start;
+    if bytes.get(content_start) == Some(&b'$') {
+        let mut clen = 0;
+        while content_start + clen < bytes.len() && bytes[content_start + clen] == b'$' {
+            clen += 1;
         }
+        if clen >= n {
+            return None; // empty `$$` / `$ $`-style — leave literal
+        }
+        scan_from = content_start + clen;
+    }
+    let idx = idx.get_or_insert_with(|| build_dollar_index(bytes));
+    let k = idx.runs.partition_point(|&(p, _)| p < scan_from);
+    let j = if display {
+        idx.next2.get(k).copied().unwrap_or(usize::MAX)
+    } else {
+        idx.next1.get(k).copied().unwrap_or(usize::MAX)
+    };
+    let bi = idx.blanks.partition_point(|&b| b < scan_from);
+    let barrier = idx.blanks.get(bi).copied().unwrap_or(usize::MAX);
+    if j != usize::MAX {
+        let content_end = idx.runs[j].0;
+        if barrier < content_end {
+            return None; // don't cross a blank line
+        }
+        // content_end > content_start always holds here (a run at
+        // content_start was handled above), so the body is non-empty.
+        emit_inline_math(&bytes[content_start..content_end], display, out);
+        return Some(content_end + n);
+    }
+    if barrier != usize::MAX {
+        return None; // don't cross a blank line
     }
     // EOF reached with no closing `$`/`$$` run and no intervening blank line. On
     // the still-open abuts-EOF active tail, speculate: render the partial body as
@@ -2177,26 +2344,57 @@ fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>, mut pairs: Optio
     let mut edits: Vec<Edit> = Vec::new();
 
     let n = stack.len();
+    // Backward-scan accelerators, per the delimiter-stack strategy in the
+    // CommonMark spec appendix. Without them a closer that can never pair
+    // (e.g. the mod-3 rule permanently blocking the only opener) re-walks the
+    // entire stack, making one resolution pass O(stack²).
+    //
+    // * `prev_link[j]` — the next index below `j` worth examining as an
+    //   opener. Entries that are dead (len == 0) or can never open
+    //   (!can_open) are skipped and the link compressed past them; both
+    //   conditions are permanent, so compression never hides an entry that
+    //   could become usable later.
+    // * `bottoms[class][bucket]` — "openers_bottom": per (delimiter class,
+    //   closer len % 3, closer can_open) the lowest index still worth
+    //   scanning. When a closer finds no opener, everything below it is
+    //   unusable for its bucket: the class/can_open/len==0 skips are
+    //   permanent, and the mod-3 skip depends only on the opener's len % 3 +
+    //   can_close and the bucket key. The one mutable input is an opener's
+    //   len % 3 — when a pairing leaves an opener with a nonzero remainder
+    //   its mod-3 class changed, so that class's bottoms drop back down to it
+    //   (below), keeping the bounded scan exactly equivalent to the
+    //   unbounded one.
+    let mut prev_link: Vec<usize> = (0..n).map(|j| j.wrapping_sub(1)).collect();
+    let mut bottoms = [[0usize; 6]; 3];
+    fn class_ix(c: u8) -> usize {
+        match c {
+            b'*' => 0,
+            b'_' => 1,
+            _ => 2,
+        }
+    }
     let mut i = 0;
     while i < n {
         if !stack[i].can_close {
             i += 1;
             continue;
         }
+        let ci = class_ix(stack[i].class);
+        let bucket = stack[i].len % 3 + if stack[i].can_open { 3 } else { 0 };
+        let bottom = bottoms[ci][bucket];
         let mut j = i;
         let found = loop {
-            if j == 0 {
+            let mut p = prev_link[j];
+            while p != usize::MAX && (stack[p].len == 0 || !stack[p].can_open) {
+                p = prev_link[p];
+            }
+            prev_link[j] = p;
+            if p == usize::MAX || p < bottom {
                 break None;
             }
-            j -= 1;
+            j = p;
             let s = &stack[j];
-            if s.len == 0 {
-                continue;
-            }
             if s.class != stack[i].class {
-                continue;
-            }
-            if !s.can_open {
                 continue;
             }
             let sum_mod = (s.len + stack[i].len) % 3;
@@ -2228,8 +2426,8 @@ fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>, mut pairs: Optio
 
             let op_at = stack[opener_idx].at + stack[opener_idx].len - take;
             let cl_at = stack[i].at;
-            edits.push(Edit { at: op_at, delete: take, insert: open_tag.to_string() });
-            edits.push(Edit { at: cl_at, delete: take, insert: close_tag.to_string() });
+            edits.push(Edit { at: op_at, delete: take, insert: open_tag });
+            edits.push(Edit { at: cl_at, delete: take, insert: close_tag });
             if let Some(p) = pairs.as_deref_mut() {
                 p.push((stack[opener_idx].in_at, stack[i].in_at));
             }
@@ -2240,6 +2438,14 @@ fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>, mut pairs: Optio
             // consumed; the opener's remaining chars are to the LEFT of what
             // we consumed (its .at stays put).
             stack[i].at += take;
+            if stack[opener_idx].len > 0 {
+                // The partial consume changed the opener's len % 3, so a
+                // bucket that proved "nothing usable below X" may now have a
+                // usable opener here — drop this class's bottoms back to it.
+                for b in bottoms[ci].iter_mut() {
+                    *b = (*b).min(opener_idx);
+                }
+            }
             if stack[i].len == 0 {
                 i += 1;
             }
@@ -2247,22 +2453,36 @@ fn resolve_delimiters(out: &mut String, stack: &mut Vec<Delim>, mut pairs: Optio
                 stack[k].len = 0;
             }
         } else {
+            bottoms[ci][bucket] = i;
             i += 1;
         }
     }
 
-    // Apply edits from the end backwards (descending `at`) so an earlier
-    // replacement can't shift a later one's offsets; stable so same-position
-    // edits keep insertion order. (Replaces std's stable sort to slim the WASM.)
-    let order = crate::sort::stable_order(&edits, |a, b| a.at >= b.at);
-    for &oi in &order {
-        let e = &edits[oi];
-        out.replace_range(e.at..e.at + e.delete, &e.insert);
+    // Apply the edits by rebuilding `out` in ONE forward pass: sorted
+    // ascending by `at` (stable — the merge sort keeps insertion order on
+    // ties, though the edits carve disjoint ranges out of distinct delimiter
+    // runs so ties can't occur), copy the untouched gap, push the tag, skip
+    // the deleted delimiter chars. The previous in-place `replace_range` walk
+    // memmoved the whole remaining suffix once per edit — O(pairs × len) on
+    // emphasis-dense text.
+    if !edits.is_empty() {
+        let order = crate::sort::stable_order(&edits, |a, b| a.at <= b.at);
+        let grow: usize = edits.iter().map(|e| e.insert.len().saturating_sub(e.delete)).sum();
+        let mut rebuilt = String::with_capacity(out.len() + grow);
+        let mut cursor = 0;
+        for &oi in &order {
+            let e = &edits[oi];
+            rebuilt.push_str(&out[cursor..e.at]);
+            rebuilt.push_str(e.insert);
+            cursor = e.at + e.delete;
+        }
+        rebuilt.push_str(&out[cursor..]);
+        *out = rebuilt;
     }
 }
 
 struct Edit {
     at: usize,
     delete: usize,
-    insert: String,
+    insert: &'static str,
 }

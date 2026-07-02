@@ -59,6 +59,10 @@ struct Opts {
     block_data: bool,
     component_tags: &'static [&'static str],
     unsafe_html: bool,
+    /// Giant-word shapes are linear exactly when extended autolinks are off (a
+    /// future `@` legitimately binds an alnum run right-to-left, so with
+    /// autolinks on the commit cut is semantically pinned).
+    no_autolinks: bool,
 }
 
 struct Shape {
@@ -86,7 +90,7 @@ fn measure(md: &str, chunk: usize, o: Opts) -> Work {
     perf::reset();
     let bytes = md.as_bytes();
     let mut p = StreamParser::new()
-        .with_gfm_autolinks(true)
+        .with_gfm_autolinks(!o.no_autolinks)
         .with_gfm_alerts(true)
         .with_gfm_math(true)
         .with_gfm_footnotes(o.footnotes)
@@ -350,9 +354,10 @@ fn growing_last_cell(target: usize) -> String {
     s
 }
 
-/// resolve-delimiters-replace-range: emphasis-pair-dense paragraph — each
-/// resolved pair splices via `replace_range`, O(pairs × slice) inside one
-/// inline render.
+/// resolve-delimiters-replace-range (FIXED): emphasis-pair-dense paragraph —
+/// each resolved pair used to splice via `replace_range`, O(pairs × slice)
+/// inside one inline render; edits now apply in a single forward-pass rebuild.
+/// Counter-linear guard: the render-side win itself is wall-only.
 fn strikethrough_one_para(target: usize) -> String {
     let mut s = String::new();
     let mut i = 0usize;
@@ -366,10 +371,12 @@ fn strikethrough_one_para(target: usize) -> String {
     s
 }
 
-/// delimiter-stack-mod3-rescan: a lone `**` opener permanently blocked by the
-/// mod-3 rule makes every later `*` closer re-walk the whole delimiter stack
-/// (O(stack²) per render), and pins the paragraph cut → streaming goes ~cubic
-/// in wall. Sizes kept tiny: this is the most expensive shape per byte.
+/// delimiter-stack-mod3-rescan (per-render FIXED via openers_bottom; streaming
+/// pin remains): a lone `**` opener permanently blocked by the mod-3 rule used
+/// to make every later `*` closer re-walk the whole delimiter stack (O(stack²)
+/// per render, so streaming went ~cubic in wall). The bounded scan makes one
+/// render linear; the paragraph cut stays semantically pinned (a future `**`
+/// closer could pair back), so streaming is counter-bounded quadratic.
 fn mod3_soup(target: usize) -> String {
     let mut s = String::from("a**b");
     while s.len() < target {
@@ -378,9 +385,12 @@ fn mod3_soup(target: usize) -> String {
     s
 }
 
-/// dollar-math-eof-rescan: every `$` is a valid opener whose candidate closers
-/// are all space-preceded, so each opener scans to EOF (O(n²) per render) and
-/// pins the paragraph cut. Sizes kept tiny (see mod3_soup).
+/// dollar-math-eof-rescan (per-render FIXED via precomputed closer tables;
+/// streaming pin remains): every `$` is a valid opener whose candidate closers
+/// are all invalid, so each opener used to scan to EOF (O(n²) inside one
+/// render). Memoized next-valid-closer lookup makes one render linear; the
+/// paragraph cut stays semantically pinned (a future closer could pair back),
+/// so streaming is counter-bounded quadratic.
 fn dollar_soup(target: usize) -> String {
     let mut s = String::with_capacity(target + 8);
     while s.len() < target {
@@ -389,11 +399,27 @@ fn dollar_soup(target: usize) -> String {
     s
 }
 
-/// compute-cut-pair-overlap-scan: thousands of resolved emphasis pairs make
-/// `compute_cut`'s per-candidate pair-overlap scan O(candidates × pairs)
-/// inside one boundary-tracked render (wall-only; both counters linear).
+/// compute-cut-pair-overlap-scan (FIXED): thousands of resolved emphasis pairs
+/// made `compute_cut`'s per-candidate pair-overlap scan O(candidates × pairs);
+/// now a single ascending sweep with a running max. Counter-linear guard.
 fn em_pairs_one_para(target: usize) -> String {
     repeat_to("*em* ", target)
+}
+
+/// commit-cut-pinned-no-boundary (PARTIALLY FIXED): a single space-free
+/// paragraph of completed entities had zero boundary candidates, pinning the
+/// commit cut at 0 (counter-visible ~250x). Synthetic boundary candidates
+/// inside inert runs let the cut advance every ~2 KB.
+fn entity_soup(target: usize) -> String {
+    repeat_to("&amp;", target)
+}
+
+/// One giant space-free "word" with periodic non-autolinkable bytes (`;`).
+/// Synthetic candidates may only sit on bytes an extended autolink can neither
+/// contain nor start (a future `@` binds alnum runs backwards), so this is the
+/// autolinks-on-safe flavor of the giant-word shape.
+fn punctuated_giant_word(target: usize) -> String {
+    repeat_to("abcdefghij;", target)
 }
 
 /// crlf-cache-bail (FIXED): CRLF line endings used to bail every incremental
@@ -568,10 +594,32 @@ fn shapes() -> Vec<Shape> {
         lin("crlf_nested_loose_list", crlf_nested_loose_list, Linear),
         lin("crlf_blockquote_with_list", crlf_blockquote_with_list, Linear),
         lin("crlf_alert_with_list", crlf_alert_with_list, Linear),
+        // Inline-engine wave (FIXED): emphasis-edit forward rebuild,
+        // openers_bottom, compute_cut sweep, synthetic inert-run boundaries.
+        lin("strikethrough_para", strikethrough_one_para, Linear),
+        lin("em_pairs_para", em_pairs_one_para, Linear),
+        lin("entity_soup", entity_soup, Linear),
+        lin("punctuated_giant_word", punctuated_giant_word, Linear),
+        // Giant word with autolinks OFF is linear post-fix; with autolinks ON
+        // the pin is semantic — see the known-quadratic entry below.
+        Shape {
+            name: "giant_word_no_autolinks",
+            gen: one_giant_word,
+            opts: Opts { no_autolinks: true, ..base },
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
-        quad("commit-cut-pinned-no-boundary", one_giant_word, base, KnownQuadratic, KnownQuadratic),
+        // commit-cut-pinned-no-boundary, residual semantic pin: with extended
+        // autolinks ON a future `@` legitimately reaches back through the alnum
+        // run, so the cut cannot advance. Inert-run flavors (entity_soup,
+        // punctuated_giant_word, autolinks-off) are FIXED and linear above.
+        quad("giant-word-autolinks-pin", one_giant_word, base, KnownQuadratic, KnownQuadratic),
         quad("uncached-open-block-kinds", component_block_open, chart_tag, KnownQuadratic, KnownQuadratic),
         // html-empty-partial-blank-close: FIXED — promoted to the linear
         // html_type6/7_aligned shapes above.
@@ -580,8 +628,9 @@ fn shapes() -> Vec<Shape> {
         quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
         quad("open-list-item-body-rerender", quoted_list_table, base, Linear, KnownQuadratic),
         quad("table-partial-row-rerender", growing_last_cell, base, Linear, KnownQuadratic),
-        quad("resolve-delimiters-replace-range", strikethrough_one_para, base, Linear, Linear), // wall-only (replace_range memmove)
-        quad("compute-cut-pair-overlap-scan", em_pairs_one_para, base, Linear, Linear), // wall-only (pair-overlap scan)
+        // resolve-delimiters-replace-range: FIXED — strikethrough_para promoted
+        // to a linear shape above (the render-side win is wall-only).
+        // compute-cut-pair-overlap-scan: FIXED — em_pairs_para promoted above.
         // crlf-cache-bail: FIXED — promoted to the seven crlf_* linear twins above.
         quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
         quad("list-interior-blank-loose-bail", indented_code_blanks, base, KnownQuadratic, Linear),
