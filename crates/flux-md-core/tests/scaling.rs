@@ -1,34 +1,101 @@
-//! Deterministic complexity gate — asserts the streaming parser stays
-//! sub-quadratic on the document shapes that *should* commit/cache linearly.
+//! Deterministic complexity gate — bounds the streaming parser's *work* (not
+//! wall-clock time) across a size span, per document shape, per metric.
 //!
-//! Every O(n²) streaming cliff we have shipped and then fixed by hand
-//! (0.18.2 ref-def runs, 0.18.3 nested lists, 0.18.4 blockquote contents) was a
-//! tail that stopped committing, so `reparse_tail` re-scanned a growing suffix
-//! on every append. This test measures that exact quantity — the bytes the
-//! slow path scans, summed over the whole stream (see `flux_md_core::perf`) —
-//! and fails if it grows quadratically with document size.
+//! Three counters (see `flux_md_core::perf`), because streaming cost goes
+//! quadratic in three distinct ways:
 //!
-//! It is **deterministic**: it counts work, not wall-clock time, so it can gate
-//! in CI without flaking on noisy shared runners. Run with:
+//! - `scanned`  — slow-path tail re-scan bytes. Every cliff we shipped and then
+//!   fixed by hand (0.18.2 ref-def runs, 0.18.3 nested lists, 0.18.4 blockquote
+//!   contents) was a tail that stopped committing, so `reparse_tail` re-scanned
+//!   a growing suffix each append.
+//! - `rendered` — bytes entering the inline renderer. Catches cache-INTERNAL
+//!   quadratics the scan counter is blind to: a cache that stays armed but
+//!   re-inline-renders a growing region every append (open list item bodies,
+//!   table partial rows, pinned container paragraph cuts).
+//! - `emitted`  — HTML bytes crossing the `append`/`finalize` patch boundary.
+//!   Informational only (printed, never asserted): re-emitting the full open
+//!   block per append is the current wire contract, so this is inherently
+//!   O(n²/chunk) for any giant single open block.
 //!
-//!   cargo test --release --features perf_counters --test scaling
+//! Each shape declares an expectation per gated metric:
+//!
+//! - `Linear`         — must stay ~O(n); ratio across the span ≤ 4x linear.
+//! - `KnownQuadratic` — documented O(n²), the open fix-campaign target list
+//!   (named by hunt group key). Guarded against regressing PAST quadratic
+//!   (an accidental O(n³)). When a group is fixed, flip it to `Linear`.
+//! - `Untracked`      — the metric cannot see this shape's work (wall-only
+//!   cost, e.g. memcpy/allocator churn); printed, not asserted.
+//!
+//! Deterministic: counts work, so it gates in CI without flaking on noisy
+//! shared runners. Run with:
+//!
+//!   cargo test --release --features perf_counters --test scaling -- --nocapture
 //!
 //! Without the feature the whole file compiles to nothing.
 
 #![cfg(feature = "perf_counters")]
 
 use flux_md_core::{perf, StreamParser};
+use std::time::Instant;
 
-/// Stream `md` in `chunk`-byte pieces (UTF-8 safe), finalize, and return the
-/// total slow-path tail bytes scanned. Small chunks = many appends = the most
+// ---- harness ---------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Expect {
+    Linear,
+    KnownQuadratic,
+    /// Declared vocabulary for future entries whose cliff no counter can see
+    /// (wall-only): printed, never asserted. Currently every registered shape
+    /// classifies as Linear or KnownQuadratic on both gated metrics.
+    #[allow(dead_code)]
+    Untracked,
+}
+
+/// Builder options a shape needs beyond the always-on base set
+/// (autolinks + alerts + math, the richest common streaming configuration).
+#[derive(Clone, Copy, Default)]
+struct Opts {
+    footnotes: bool,
+    block_data: bool,
+    component_tags: &'static [&'static str],
+    unsafe_html: bool,
+}
+
+struct Shape {
+    name: &'static str,
+    gen: fn(usize) -> String,
+    opts: Opts,
+    chunk: usize,
+    small: usize,
+    large: usize,
+    scanned: Expect,
+    rendered: Expect,
+}
+
+struct Work {
+    scanned: u64,
+    rendered: u64,
+    emitted: u64,
+    wall_ms: f64,
+}
+
+/// Stream `md` in `chunk`-byte pieces (UTF-8 safe), finalize, and return all
+/// work counters plus wall time. Small chunks = many appends = the most
 /// demanding case for an incremental parser.
-fn scan_work(md: &str, chunk: usize) -> u64 {
+fn measure(md: &str, chunk: usize, o: Opts) -> Work {
     perf::reset();
     let bytes = md.as_bytes();
     let mut p = StreamParser::new()
         .with_gfm_autolinks(true)
         .with_gfm_alerts(true)
-        .with_gfm_math(true);
+        .with_gfm_math(true)
+        .with_gfm_footnotes(o.footnotes)
+        .with_block_data(o.block_data)
+        .with_unsafe_html(o.unsafe_html);
+    if !o.component_tags.is_empty() {
+        p = p.with_component_tags(o.component_tags.iter().map(|s| s.to_string()).collect());
+    }
+    let start = Instant::now();
     let mut i = 0;
     while i < bytes.len() {
         let mut e = (i + chunk).min(bytes.len());
@@ -39,7 +106,13 @@ fn scan_work(md: &str, chunk: usize) -> u64 {
         i = e;
     }
     p.finalize();
-    perf::scanned_bytes()
+    let wall_ms = start.elapsed().as_secs_f64() * 1e3;
+    Work {
+        scanned: perf::scanned_bytes().max(1),
+        rendered: perf::rendered_bytes().max(1),
+        emitted: perf::emitted_bytes().max(1),
+        wall_ms,
+    }
 }
 
 // ---- document-shape generators (size-parametric) --------------------------
@@ -168,106 +241,417 @@ fn big_math(target: usize) -> String {
     s
 }
 
-// ---- the gate -------------------------------------------------------------
+// ---- fix-campaign generators (one per verified O(n²) hunt group) -----------
 
-/// Shapes that MUST stay sub-quadratic: they either commit blocks regularly or
-/// are handled by an incremental cache. `(name, generator-by-byte-target)`.
-fn linear_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
-    vec![
-        ("mixed", mixed),
-        ("many_paragraphs", many_paragraphs),
-        ("big_list", big_list),         // flat list -> ListCache (incremental)
-        ("big_blockquote", big_blockquote), // prose quote -> ContainerCache (incremental)
-        // Structured-inner containers -> ContainerBlockCache (recursive nested
-        // parser, incremental). Was O(n²) (the 0.18.4 flicker fix bailed to a
-        // full reparse every append); now streams linearly.
-        ("alert_with_list", big_alert),
-        ("blockquote_with_list", blockquote_with_list),
-        // Nested loose list (loose outer bullets with 2-space nested subs) ->
-        // ListCache (multi-line item bodies, incremental). Was O(n²) (the 0.18.3
-        // flicker fix bailed the list cache to a full reparse on every nested
-        // sub-bullet); the cache now renders each item's full body — nested
-        // sub-lists included — via the shared `render_item_body`, so it streams
-        // linearly.
-        ("nested_loose_list", nested_loose_list),
-        ("big_table", big_table),
-        ("big_code", big_code),
-        ("big_math", big_math),
-    ]
+/// open-block-html-reemit: a giant never-closing fence. Cache-hit appends
+/// re-materialize the whole open block's HTML (memcpy + Block clone) — a
+/// wall-only cliff both work counters are blind to; `emitted` shows it.
+fn unclosed_fence(target: usize) -> String {
+    let mut s = String::from("```rust\n");
+    while s.len() < target {
+        s.push_str("let result = compute(alpha, beta, gamma); // never closes\n");
+    }
+    s
 }
 
-/// KNOWN O(n²) shapes — the next perf target. An open block that holds
-/// *structured* inner content that is one atomic, never-committing block whose
-/// incremental cache currently *bails to a full reparse* every append. Both the
-/// blockquote/alert-with-structured-body shapes (recursive container-block cache)
-/// and `nested_loose_list` (multi-line-body list cache) have been fixed and moved
-/// into `linear_shapes`, so this list is now empty. The guard below still runs
-/// (vacuously) and is kept so the next discovered cliff has a home.
-fn known_quadratic_shapes() -> Vec<(&'static str, fn(usize) -> String)> {
-    vec![]
+/// commit-cut-pinned-no-boundary: a single enormous word — zero inter-word
+/// boundary candidates, so the paragraph cache never arms and every append
+/// full-rescans + re-renders the whole tail.
+fn one_giant_word(target: usize) -> String {
+    "a".repeat(target)
 }
 
-/// Sizes spanning 16x. A linear parser's work grows ~16x across this span; a
-/// quadratic one grows ~256x. We assert the 16x-span ratio is well below the
-/// quadratic regime, with generous headroom for per-shape constants. The linear
-/// shapes are cheap even at 256 KB; chunk 128 keeps appends frequent enough to
+/// uncached-open-block-kinds: an open ComponentBlock has no incremental cache
+/// arm in `reparse_tail`, so its growing body full-rescans every append.
+fn component_block_open(target: usize) -> String {
+    let mut s = String::from("<Chart>\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("data point {i} with **bold** and `code` in the body line\n"));
+        i += 1;
+    }
+    s // close tag never arrives
+}
+
+/// html-empty-partial-blank-close: type-6 HTML block with 64-byte lines so
+/// chunked appends always end newline-aligned — the empty trailing partial is
+/// misclassified as the closing blank line and the HTML cache drops every
+/// append.
+fn html_div_aligned(target: usize) -> String {
+    let mut s = String::with_capacity(target + 64);
+    let mut open = String::from("<div class=\"wrap\">");
+    while open.len() < 63 {
+        open.push(' ');
+    }
+    open.push('\n');
+    s.push_str(&open);
+    let line = "abcdefghij klmnopqrst uvwxyz0123 456789ABCD EFGHIJKLMN OPQRSTUV\n"; // 64 bytes
+    while s.len() < target {
+        s.push_str(line);
+    }
+    s
+}
+
+/// footnote-global-state: paragraph + a no-blank run of single-line footnote
+/// defs scans as one never-committing non-renderable block.
+fn fn_def_run_noblank(target: usize) -> String {
+    let mut s = String::from("Intro paragraph citing a note.[^f0]\n\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("[^f{i}]: footnote text number {i} with some words\n"));
+        i += 1;
+    }
+    s
+}
+
+/// global-defs-inside-container: link-ref defs inside a blockquote defeat the
+/// recursive container-block cache (document-global scoping bail).
+fn quote_ref_defs(target: usize) -> String {
+    let mut s = String::with_capacity(target + 64);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("> [r{i}]: https://example.com/page/{i} \"Title {i}\"\n"));
+        i += 1;
+    }
+    s
+}
+
+/// open-list-item-body-rerender: a quoted list item whose body is a growing
+/// table — the open item never folds, so `fold_item_body` re-renders it whole
+/// every append (scan-counter-blind; `rendered` sees it).
+fn quoted_list_table(target: usize) -> String {
+    let mut s = String::from("> - intro\n>   | a | b |\n>   | --- | --- |\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!(">   | cell {i} | value {i} |\n"));
+        i += 1;
+    }
+    s
+}
+
+/// table-partial-row-rerender: the trailing table row never gets its newline,
+/// so the speculative partial-row render re-splits + re-renders the whole
+/// growing partial every append (scan-counter-blind; `rendered` sees it).
+fn growing_last_cell(target: usize) -> String {
+    let mut s = String::from("| a | b |\n| --- | --- |\n| x | y |\n| last | ");
+    while s.len() < target {
+        s.push_str("word word word ");
+    }
+    s.push_str("|\n");
+    s
+}
+
+/// resolve-delimiters-replace-range: emphasis-pair-dense paragraph — each
+/// resolved pair splices via `replace_range`, O(pairs × slice) inside one
+/// inline render.
+fn strikethrough_one_para(target: usize) -> String {
+    let mut s = String::new();
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("w{i} ~~struck {i}~~ mid "));
+        if i % 8 == 7 {
+            s.push('\n');
+        }
+        i += 1;
+    }
+    s
+}
+
+/// delimiter-stack-mod3-rescan: a lone `**` opener permanently blocked by the
+/// mod-3 rule makes every later `*` closer re-walk the whole delimiter stack
+/// (O(stack²) per render), and pins the paragraph cut → streaming goes ~cubic
+/// in wall. Sizes kept tiny: this is the most expensive shape per byte.
+fn mod3_soup(target: usize) -> String {
+    let mut s = String::from("a**b");
+    while s.len() < target {
+        s.push_str("c* ");
+    }
+    s
+}
+
+/// dollar-math-eof-rescan: every `$` is a valid opener whose candidate closers
+/// are all space-preceded, so each opener scans to EOF (O(n²) per render) and
+/// pins the paragraph cut. Sizes kept tiny (see mod3_soup).
+fn dollar_soup(target: usize) -> String {
+    let mut s = String::with_capacity(target + 8);
+    while s.len() < target {
+        s.push_str("$x ");
+    }
+    s
+}
+
+/// compute-cut-pair-overlap-scan: thousands of resolved emphasis pairs make
+/// `compute_cut`'s per-candidate pair-overlap scan O(candidates × pairs)
+/// inside one boundary-tracked render (wall-only; both counters linear).
+fn em_pairs_one_para(target: usize) -> String {
+    repeat_to("*em* ", target)
+}
+
+/// crlf-cache-bail: CRLF line endings bail every incremental cache, so an
+/// ordinary list full-rescans each append.
+fn crlf_big_list(target: usize) -> String {
+    big_list(target).replace('\n', "\r\n")
+}
+
+/// blockdata-disables-container-cache: same shape as `big_alert`, but
+/// `block_data` ON disables the recursive container cache.
+fn blockdata_alert(target: usize) -> String {
+    big_alert(target)
+}
+
+/// blockdata-per-append-rebuild: `block_data` ON rebuilds the structured data
+/// channel for the open block from scratch every append (wall-only cliff).
+fn blockdata_math(target: usize) -> String {
+    big_math(target)
+}
+
+/// list-interior-blank-loose-bail: indented code with periodic interior blank
+/// lines — the blank flips looseness speculation and bails the cache.
+fn indented_code_blanks(target: usize) -> String {
+    let mut s = String::with_capacity(target + 64);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str("    let value = compute(alpha, beta); // indented code line\n");
+        i += 1;
+        if i % 20 == 0 {
+            s.push('\n');
+        }
+    }
+    s
+}
+
+/// container-stack-churn-lazy: blockquote depth grows line by line, churning
+/// the container stack (O(n²·depth) — worse than plain quadratic in wall, so
+/// sizes stay tiny).
+fn quote_depth_growing(target: usize) -> String {
+    let mut s = String::with_capacity(target + 4096);
+    let mut k = 1usize;
+    while s.len() < target {
+        for _ in 0..k {
+            s.push_str("> ");
+        }
+        s.push_str(&format!("level {k} prose with **bold**\n"));
+        k += 1;
+    }
+    s
+}
+
+// ---- the per-shape table ----------------------------------------------------
+
+/// Default span for shapes cheap enough to run big: 16x. Linear work grows
+/// ~16x across it; quadratic ~256x. Chunk 128 keeps appends frequent enough to
 /// expose any O(n²/chunk) curve while finishing fast in CI.
 const SMALL: usize = 16 * 1024;
 const LARGE: usize = 256 * 1024;
-const SPAN: f64 = (LARGE / SMALL) as f64; // 16.0
 const CHUNK: usize = 128;
 
-/// Allowed work-growth ratio across the 16x span. Linear ≈ 16, quadratic ≈ 256.
-/// 64 = 4x linear headroom (absorbs cache re-arm constants and small-N noise)
-/// while still 4x below the quadratic floor — any real O(n²) cliff blows past it
-/// (the shipped cliffs were 100x–2900x).
-const MAX_RATIO: f64 = 64.0;
+/// Span for the known-quadratic shapes: 8x (8 KB → 64 KB unless noted), the
+/// small-span pattern that keeps documented-O(n²) shapes affordable in CI.
+const Q_SMALL: usize = 8 * 1024;
+const Q_LARGE: usize = 64 * 1024;
 
-#[test]
-fn streaming_stays_subquadratic() {
-    let mut failures = Vec::new();
-    for (name, gen) in linear_shapes() {
-        let w_small = scan_work(&gen(SMALL), CHUNK).max(1);
-        let w_large = scan_work(&gen(LARGE), CHUNK).max(1);
-        let ratio = w_large as f64 / w_small as f64;
-        let per_byte_growth = ratio / SPAN; // 1.0 = perfectly linear
-        println!(
-            "{name:18} small={w_small:>12} large={w_large:>12}  ratio={ratio:>7.1} (x{SPAN})  growth={per_byte_growth:>5.2}x"
-        );
-        if ratio > MAX_RATIO {
-            failures.push(format!(
-                "{name}: work grew {ratio:.1}x across a {SPAN}x size span (limit {MAX_RATIO}x) — superlinear regression"
-            ));
-        }
-    }
-    assert!(failures.is_empty(), "complexity regression(s):\n  {}", failures.join("\n  "));
+/// Per-metric gate limits, span-relative:
+/// - Linear: ratio ≤ span × 4 — 4x headroom absorbs cache re-arm constants and
+///   small-N noise while staying 4x below the quadratic floor (span²). The
+///   shipped cliffs were 100x–2900x, far past it. (span 16 → limit 64,
+///   identical to the historical gate.)
+/// - KnownQuadratic: ratio < span² × 2.5 — trips only on worse-than-quadratic
+///   (e.g. an accidental cubic); the quadratic itself is the documented limit,
+///   not a failure. (span 8 → limit 160, identical to the historical guard.)
+fn linear_limit(span: f64) -> f64 {
+    span * 4.0
+}
+fn quad_limit(span: f64) -> f64 {
+    span * span * 2.5
 }
 
-/// Guards any remaining known-O(n²) shape against regressing *past* quadratic
-/// (e.g. an accidental O(n³)). `known_quadratic_shapes()` is currently empty —
-/// every shape that lived here has been made linear and promoted to
-/// `linear_shapes()` — so this runs vacuously; it stays as the home for the next
-/// discovered cliff.
-#[test]
-fn known_quadratic_open_containers_not_worse() {
-    // Uses a smaller 8x span (8 KB -> 64 KB) to keep the test fast. Quadratic ≈
-    // 64x work across an 8x span; allow up to 160x (well over quadratic) so this
-    // trips only on a worse-than-quadratic (e.g. cubic) regression — the
-    // quadratic itself is the documented limit, not a failure.
-    const SMALL_Q: usize = 8 * 1024;
-    const LARGE_Q: usize = 64 * 1024;
-    const SPAN_Q: f64 = (LARGE_Q / SMALL_Q) as f64; // 8.0
-    const WORSE_THAN_QUADRATIC: f64 = 160.0;
-    for (name, gen) in known_quadratic_shapes() {
-        let w_small = scan_work(&gen(SMALL_Q), CHUNK).max(1);
-        let w_large = scan_work(&gen(LARGE_Q), CHUNK).max(1);
-        let ratio = w_large as f64 / w_small as f64;
-        println!("[KNOWN O(n²) — fix target] {name:18} ratio={ratio:>7.1} (x{SPAN_Q})  small={w_small} large={w_large}");
-        assert!(
-            ratio < WORSE_THAN_QUADRATIC,
-            "{name}: work grew {ratio:.1}x across {SPAN_Q}x — WORSE than the documented quadratic limit"
-        );
+fn shapes() -> Vec<Shape> {
+    let base = Opts::default();
+    let lin = |name: &'static str, gen: fn(usize) -> String, rendered: Expect| Shape {
+        name,
+        gen,
+        opts: base,
+        chunk: CHUNK,
+        small: SMALL,
+        large: LARGE,
+        scanned: Expect::Linear,
+        rendered,
+    };
+    // A known-quadratic fix-campaign entry, named by hunt group key. `scanned`/
+    // `rendered` reflect which metric actually sees the cliff (measured, not
+    // assumed): a metric that stays linear on a wall-only cliff is declared
+    // Linear so the gate at least pins the visible half.
+    let quad = |name: &'static str,
+                gen: fn(usize) -> String,
+                opts: Opts,
+                scanned: Expect,
+                rendered: Expect| Shape {
+        name,
+        gen,
+        opts,
+        chunk: CHUNK,
+        small: Q_SMALL,
+        large: Q_LARGE,
+        scanned,
+        rendered,
+    };
+    use Expect::{KnownQuadratic, Linear};
+    let footnotes = Opts { footnotes: true, ..base };
+    let block_data = Opts { block_data: true, ..base };
+    let chart_tag = Opts { component_tags: &["Chart"], ..base };
+    let mut v = vec![
+        // -- shapes that MUST stay linear (commit regularly or have a cache) --
+        lin("mixed", mixed, Linear),
+        lin("many_paragraphs", many_paragraphs, Linear),
+        lin("big_list", big_list, Linear), // flat list -> ListCache (incremental)
+        lin("big_blockquote", big_blockquote, Linear), // prose quote -> ContainerCache
+        // Structured-inner containers -> ContainerBlockCache (recursive nested
+        // parser, incremental). Was O(n²) (the 0.18.4 flicker fix bailed to a
+        // full reparse every append); now streams linearly.
+        lin("alert_with_list", big_alert, Linear),
+        lin("blockquote_with_list", blockquote_with_list, Linear),
+        // Nested loose list -> ListCache (multi-line item bodies, incremental).
+        // Was O(n²) (the 0.18.3 flicker fix bailed the list cache to a full
+        // reparse on every nested sub-bullet); now streams linearly.
+        lin("nested_loose_list", nested_loose_list, Linear),
+        lin("big_table", big_table, Linear),
+        lin("big_code", big_code, Linear),
+        lin("big_math", big_math, Linear),
+        // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
+        //    as each lands) ---------------------------------------------------
+        quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
+        quad("commit-cut-pinned-no-boundary", one_giant_word, base, KnownQuadratic, KnownQuadratic),
+        quad("uncached-open-block-kinds", component_block_open, chart_tag, KnownQuadratic, KnownQuadratic),
+        quad("html-empty-partial-blank-close", html_div_aligned, base, KnownQuadratic, Linear),
+        quad("footnote-global-state", fn_def_run_noblank, footnotes, KnownQuadratic, KnownQuadratic),
+        // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
+        quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
+        quad("open-list-item-body-rerender", quoted_list_table, base, Linear, KnownQuadratic),
+        quad("table-partial-row-rerender", growing_last_cell, base, Linear, KnownQuadratic),
+        quad("resolve-delimiters-replace-range", strikethrough_one_para, base, Linear, Linear), // wall-only (replace_range memmove)
+        quad("compute-cut-pair-overlap-scan", em_pairs_one_para, base, Linear, Linear), // wall-only (pair-overlap scan)
+        quad("crlf-cache-bail", crlf_big_list, base, KnownQuadratic, KnownQuadratic),
+        quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
+        quad("list-interior-blank-loose-bail", indented_code_blanks, base, KnownQuadratic, Linear),
+    ];
+    // Shapes too expensive per byte for the 8 KB → 64 KB span (super-quadratic
+    // wall); same 8x span at smaller sizes.
+    v.push(Shape {
+        name: "delimiter-stack-mod3-rescan",
+        gen: mod3_soup,
+        opts: base,
+        chunk: CHUNK,
+        small: 1024,
+        large: 8 * 1024,
+        scanned: KnownQuadratic,
+        rendered: KnownQuadratic,
+    });
+    v.push(Shape {
+        name: "dollar-math-eof-rescan",
+        gen: dollar_soup,
+        opts: base,
+        chunk: CHUNK,
+        small: 1024,
+        large: 8 * 1024,
+        scanned: KnownQuadratic,
+        rendered: KnownQuadratic,
+    });
+    v.push(Shape {
+        name: "blockdata-disables-container-cache",
+        gen: blockdata_alert,
+        opts: block_data,
+        chunk: CHUNK,
+        small: 4 * 1024,
+        large: 32 * 1024,
+        scanned: KnownQuadratic,
+        rendered: KnownQuadratic,
+    });
+    v.push(Shape {
+        name: "container-stack-churn-lazy",
+        gen: quote_depth_growing,
+        opts: base,
+        chunk: CHUNK,
+        small: 2 * 1024,
+        large: 16 * 1024,
+        scanned: KnownQuadratic,
+        rendered: KnownQuadratic,
+    });
+    v
+}
+
+// ---- the gate ---------------------------------------------------------------
+
+fn check(
+    shape: &str,
+    metric: &str,
+    ratio: f64,
+    span: f64,
+    expect: Expect,
+    failures: &mut Vec<String>,
+) {
+    match expect {
+        Expect::Linear => {
+            if ratio > linear_limit(span) {
+                failures.push(format!(
+                    "{shape}: {metric} work grew {ratio:.1}x across a {span}x size span \
+(limit {:.0}x) — superlinear regression",
+                    linear_limit(span)
+                ));
+            }
+        }
+        Expect::KnownQuadratic => {
+            if ratio > quad_limit(span) {
+                failures.push(format!(
+                    "{shape}: {metric} work grew {ratio:.1}x across a {span}x size span — \
+WORSE than the documented quadratic limit ({:.0}x)",
+                    quad_limit(span)
+                ));
+            }
+        }
+        Expect::Untracked => {}
     }
+}
+
+fn tag(e: Expect) -> &'static str {
+    match e {
+        Expect::Linear => "lin",
+        Expect::KnownQuadratic => "n²",
+        Expect::Untracked => "-",
+    }
+}
+
+#[test]
+fn streaming_complexity_gate() {
+    let mut failures = Vec::new();
+    println!(
+        "{:36} {:>5}  {:>12} {:>12} {:>12}  {:>9} {:>9}",
+        "shape (span)", "", "scanned", "rendered", "emitted", "wall-S ms", "wall-L ms"
+    );
+    for s in shapes() {
+        let span = (s.large / s.small) as f64;
+        let w_small = measure(&(s.gen)(s.small), s.chunk, s.opts);
+        let w_large = measure(&(s.gen)(s.large), s.chunk, s.opts);
+        let r_scan = w_large.scanned as f64 / w_small.scanned as f64;
+        let r_rend = w_large.rendered as f64 / w_small.rendered as f64;
+        let r_emit = w_large.emitted as f64 / w_small.emitted as f64;
+        println!(
+            "{:36} (x{:>2})  {:>7.1} [{}] {:>7.1} [{}] {:>9.1} [i]  {:>9.1} {:>9.1}",
+            s.name,
+            span,
+            r_scan,
+            tag(s.scanned),
+            r_rend,
+            tag(s.rendered),
+            r_emit,
+            w_small.wall_ms,
+            w_large.wall_ms,
+        );
+        check(s.name, "scanned", r_scan, span, s.scanned, &mut failures);
+        check(s.name, "rendered", r_rend, span, s.rendered, &mut failures);
+        // `emitted` is informational only — full-active-block re-emission per
+        // append is the current wire contract (see perf module docs).
+    }
+    assert!(failures.is_empty(), "complexity regression(s):\n  {}", failures.join("\n  "));
 }
 
 /// Pins the exact 0.18.2 regression: a paragraph immediately followed by a long
@@ -276,12 +660,16 @@ fn known_quadratic_open_containers_not_worse() {
 /// The fix made it linear; this guards it deterministically.
 #[test]
 fn ref_def_run_is_linear() {
-    let small = scan_work(&ref_heavy(250), CHUNK).max(1);
-    let large = scan_work(&ref_heavy(4000), CHUNK).max(1); // 16x more defs
-    let ratio = large as f64 / small as f64;
-    println!("ref_heavy  small={small} large={large} ratio={ratio:.1} (x16 defs)");
+    let small = measure(&ref_heavy(250), CHUNK, Opts::default());
+    let large = measure(&ref_heavy(4000), CHUNK, Opts::default()); // 16x more defs
+    let ratio = large.scanned as f64 / small.scanned as f64;
+    println!(
+        "ref_heavy  small={} large={} ratio={ratio:.1} (x16 defs)",
+        small.scanned, large.scanned
+    );
     assert!(
-        ratio < MAX_RATIO,
-        "ref-def run regressed to superlinear: {ratio:.1}x work for 16x defs (limit {MAX_RATIO}x)"
+        ratio < linear_limit(16.0),
+        "ref-def run regressed to superlinear: {ratio:.1}x work for 16x defs (limit {:.0}x)",
+        linear_limit(16.0)
     );
 }

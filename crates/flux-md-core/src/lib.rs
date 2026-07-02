@@ -23,25 +23,41 @@ pub use parser::{Patch, StreamParser};
 /// Deterministic perf instrumentation — feature `perf_counters`, off by default
 /// and never compiled into the WASM build (no `[features]` flag is set there).
 ///
-/// Counts the tail bytes the *slow path* re-scans across a stream. The
-/// incremental caches (fence/paragraph/table/container/list/indented/html)
-/// extend an open block in O(new bytes) and never reach this counter; only a
-/// cache miss falls through to `scan(tail)`, whose cost is `tail.len()`. Summed
-/// over a whole stream this is exactly the quantity that goes quadratic when a
-/// block fails to commit — so a complexity-scaling test can assert the parser
-/// stays sub-quadratic *deterministically*, with no dependence on wall-clock
-/// timing (which is too noisy to gate on in CI). See `tests/scaling.rs`.
+/// Three per-thread work counters, each capturing a different way streaming
+/// cost can go quadratic (see `tests/scaling.rs` for the gate that bounds them):
+///
+/// - `scanned_bytes` — tail bytes the *slow path* re-scans. The incremental
+///   caches (fence/paragraph/table/container/list/indented/html) extend an open
+///   block in O(new bytes) and never reach this counter; only a cache miss
+///   falls through to `scan(tail)`, whose cost is `tail.len()`.
+/// - `rendered_bytes` — input bytes fed through the inline renderer. Catches
+///   cache-*internal* quadratics the scan counter is blind to: a cache that
+///   stays armed but re-inline-renders a growing region on every append (open
+///   list item bodies, table partial rows, pinned paragraph cuts inside
+///   containers) shows up here even though it never re-scans.
+/// - `emitted_bytes` — HTML bytes crossing the public `append`/`finalize`
+///   boundary (`patch.newly_committed` + `patch.active`). Informational: full
+///   re-emission of the open block's HTML each append is the current wire
+///   contract, so this is inherently O(n²/chunk) for a giant single open block
+///   and is printed, not gated.
+///
+/// All counters count work, not wall-clock time, so a scaling test can gate
+/// deterministically in CI without flaking on noisy shared runners.
 #[cfg(feature = "perf_counters")]
 pub mod perf {
     use std::cell::Cell;
 
     thread_local! {
         static SCAN_BYTES: Cell<u64> = Cell::new(0);
+        static RENDER_BYTES: Cell<u64> = Cell::new(0);
+        static EMIT_BYTES: Cell<u64> = Cell::new(0);
     }
 
-    /// Reset the per-thread counter before a measurement.
+    /// Reset all per-thread counters before a measurement.
     pub fn reset() {
         SCAN_BYTES.with(|c| c.set(0));
+        RENDER_BYTES.with(|c| c.set(0));
+        EMIT_BYTES.with(|c| c.set(0));
     }
 
     /// Total tail bytes the slow path has scanned since the last [`reset`].
@@ -49,9 +65,32 @@ pub mod perf {
         SCAN_BYTES.with(|c| c.get())
     }
 
+    /// Total input bytes fed through the inline renderer since the last
+    /// [`reset`] (nested constructs — link text, inline components — count
+    /// their sub-slices again; a constant factor, irrelevant to scaling ratios).
+    pub fn rendered_bytes() -> u64 {
+        RENDER_BYTES.with(|c| c.get())
+    }
+
+    /// Total HTML bytes emitted across the `append`/`finalize` boundary
+    /// (committed + active) since the last [`reset`].
+    pub fn emitted_bytes() -> u64 {
+        EMIT_BYTES.with(|c| c.get())
+    }
+
     #[inline]
     pub(crate) fn add_scan(n: usize) {
         SCAN_BYTES.with(|c| c.set(c.get().wrapping_add(n as u64)));
+    }
+
+    #[inline]
+    pub(crate) fn add_render(n: usize) {
+        RENDER_BYTES.with(|c| c.set(c.get().wrapping_add(n as u64)));
+    }
+
+    #[inline]
+    pub(crate) fn add_emit(n: usize) {
+        EMIT_BYTES.with(|c| c.set(c.get().wrapping_add(n as u64)));
     }
 }
 

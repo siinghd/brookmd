@@ -906,7 +906,10 @@ impl StreamParser {
             return Patch::default();
         }
         self.buffer.push_str(chunk);
-        self.reparse_tail(false)
+        let patch = self.reparse_tail(false);
+        #[cfg(feature = "perf_counters")]
+        Self::count_emitted(&patch);
+        patch
     }
 
     pub fn finalize(&mut self) -> Patch {
@@ -914,7 +917,21 @@ impl StreamParser {
             return Patch::default();
         }
         self.finalized = true;
-        self.reparse_tail(true)
+        let patch = self.reparse_tail(true);
+        #[cfg(feature = "perf_counters")]
+        Self::count_emitted(&patch);
+        patch
+    }
+
+    /// Deterministic complexity probe (feature `perf_counters` only): HTML bytes
+    /// crossing the public patch boundary. Re-emitting the whole open block per
+    /// append is the wire contract, so this is informational — printed by
+    /// `tests/scaling.rs`, never gated.
+    #[cfg(feature = "perf_counters")]
+    fn count_emitted(patch: &Patch) {
+        let n: usize =
+            patch.newly_committed.iter().chain(patch.active.iter()).map(|b| b.html.len()).sum();
+        crate::perf::add_emit(n);
     }
 
     pub fn buffer(&self) -> &str {

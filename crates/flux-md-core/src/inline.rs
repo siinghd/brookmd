@@ -96,6 +96,13 @@ impl Drop for InlineDepthGuard {
 }
 
 fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: bool) -> usize {
+    // Deterministic complexity probe (feature `perf_counters` only; compiled out
+    // of every real build). Every byte entering the inline renderer is counted —
+    // an incremental cache that stays armed but re-renders a growing region on
+    // each append goes quadratic HERE while the slow-path scan counter stays
+    // linear. See `flux_md_core::perf` and `tests/scaling.rs`.
+    #[cfg(feature = "perf_counters")]
+    crate::perf::add_render(input.len());
     // Depth guard: nested inline-component tags recurse here (via
     // write_inline_component). Past the cap, emit the remaining inner as escaped
     // text instead of descending another shadow-stack frame. No legitimate inline
