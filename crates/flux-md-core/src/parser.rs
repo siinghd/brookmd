@@ -9,8 +9,8 @@ use crate::render::{
     collect_footnote_refs_overlay, extend_footnote_refs, is_fence_close_line,
     is_footnote_def_block, item_body, item_directly_loose, last_footnote_def_opener,
     normalize_label, parse_alignments, push_code_fence_open, push_table_cell,
-    push_table_cell_open, render_block, render_footnote_section, render_item_body,
-    resolve_footnote_ids, resolve_footnote_ids_overlay, split_table_cells,
+    push_table_cell_open, push_tagfiltered, render_block, render_footnote_section,
+    render_item_body, resolve_footnote_ids, resolve_footnote_ids_overlay, split_table_cells,
     trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
@@ -251,6 +251,11 @@ pub struct StreamParser {
     unsafe_html: bool,
     gfm_autolinks: bool,
     gfm_alerts: bool,
+    /// GFM "Disallowed Raw HTML" (tagfilter): in `unsafe_html` pass-through,
+    /// the nine disallowed tags render with their `<` escaped. Off by default
+    /// and NOT implied by `unsafe_html` (strict CommonMark wants `<script>`
+    /// verbatim there).
+    gfm_tagfilter: bool,
     gfm_footnotes: bool,
     gfm_math: bool,
     dir_auto: bool,
@@ -1104,6 +1109,10 @@ struct HtmlBlockCache {
     /// sanitizer is off); when `false`, the slice is escaped into `<pre><code>`.
     /// Locked at arm time from the parser's options.
     pass_through: bool,
+    /// When `true` (pass-through + `gfm_tagfilter`), each folded line and the
+    /// re-processed partial run through the GFM tagfilter — per NEW line only,
+    /// so filtering stays O(new bytes) and byte-identical to the full path.
+    tagfilter: bool,
     /// Pre-rendered prefix of the completed lines: for pass-through, the raw
     /// source bytes verbatim (including their `\n`); for the escaped path, their
     /// `escape_html` output (newlines survive escaping unchanged). No closer.
@@ -1267,6 +1276,7 @@ impl StreamParser {
             unsafe_html: false,
             gfm_autolinks: false,
             gfm_alerts: false,
+            gfm_tagfilter: false,
             gfm_footnotes: false,
             gfm_math: false,
             dir_auto: false,
@@ -1323,6 +1333,21 @@ impl StreamParser {
 
     pub fn set_gfm_alerts(&mut self, on: bool) {
         self.gfm_alerts = on;
+    }
+
+    /// Enable the GFM "Disallowed Raw HTML" extension (tagfilter): when raw
+    /// HTML passes through verbatim (`unsafe_html`), the nine disallowed tags
+    /// (`<title>`, `<textarea>`, `<style>`, `<xmp>`, `<iframe>`, `<noembed>`,
+    /// `<noframes>`, `<script>`, `<plaintext>`) get their leading `<` escaped
+    /// so they display as text. Off by default (strict CommonMark passes them
+    /// through); no effect while raw HTML is escaped or sanitized.
+    pub fn with_gfm_tagfilter(mut self, on: bool) -> Self {
+        self.gfm_tagfilter = on;
+        self
+    }
+
+    pub fn set_gfm_tagfilter(&mut self, on: bool) {
+        self.gfm_tagfilter = on;
     }
 
     /// Enable GFM footnotes (`[^1]` + `[^1]:` → footnote section). Off by
@@ -1655,6 +1680,7 @@ impl StreamParser {
             open_tail: false,
             gfm_autolinks: self.gfm_autolinks,
             gfm_alerts: self.gfm_alerts,
+            gfm_tagfilter: self.gfm_tagfilter,
             gfm_math: self.gfm_math,
             dir_auto: self.dir_auto,
             a11y: self.a11y,
@@ -2547,7 +2573,9 @@ impl StreamParser {
         let mut cache = self.html_cache.take()?;
         // The pass-through decision must still hold (options don't change mid-
         // stream, but stay defensive: a changed setting voids the cache).
-        if cache.pass_through != (self.unsafe_html && !self.html_sanitize) {
+        if cache.pass_through != (self.unsafe_html && !self.html_sanitize)
+            || cache.tagfilter != (cache.pass_through && self.gfm_tagfilter)
+        {
             return None;
         }
         // The block must still be the tail (only whitespace before the opener).
@@ -2575,7 +2603,12 @@ impl StreamParser {
                     if html_block_closes_here(line, html_type, &bytes[pos..content_end]) {
                         return None;
                     }
-                    fold_html_line(&bytes[pos..next], cache.pass_through, &mut cache.cached_prefix);
+                    fold_html_line(
+                        &bytes[pos..next],
+                        cache.pass_through,
+                        cache.tagfilter,
+                        &mut cache.cached_prefix,
+                    );
                     cache.lines_upto = next;
                     pos = next;
                 }
@@ -2593,9 +2626,16 @@ impl StreamParser {
         let mut html = String::with_capacity(cache.cached_prefix.len() + partial.len() + 32);
         if cache.pass_through {
             // Pass-through: prefix + partial verbatim, trailing newlines trimmed,
-            // then a single `\n` (matches render_html_block's pass-through).
+            // then a single `\n` (matches render_html_block's pass-through). With
+            // the tagfilter on, the partial is filtered per append (end-of-chunk
+            // is a tag boundary, exactly like the full path at buffer EOF).
             html.push_str(&cache.cached_prefix);
-            html.push_str(std::str::from_utf8(partial).unwrap_or(""));
+            let partial_str = std::str::from_utf8(partial).unwrap_or("");
+            if cache.tagfilter {
+                push_tagfiltered(partial_str, &mut html);
+            } else {
+                html.push_str(partial_str);
+            }
             let trimmed = html.trim_end_matches(['\n', '\r']).len();
             html.truncate(trimmed);
             html.push('\n');
@@ -2643,6 +2683,7 @@ impl StreamParser {
             open_tail: true,
             gfm_autolinks: self.gfm_autolinks,
             gfm_alerts: self.gfm_alerts,
+            gfm_tagfilter: self.gfm_tagfilter,
             gfm_math: self.gfm_math,
             dir_auto: self.dir_auto,
             a11y: self.a11y,
@@ -3575,6 +3616,7 @@ impl StreamParser {
         inner.unsafe_html = self.unsafe_html;
         inner.gfm_autolinks = self.gfm_autolinks;
         inner.gfm_alerts = self.gfm_alerts;
+        inner.gfm_tagfilter = self.gfm_tagfilter;
         inner.gfm_footnotes = false;
         inner.gfm_math = self.gfm_math;
         inner.dir_auto = self.dir_auto;
@@ -3787,6 +3829,7 @@ impl StreamParser {
         inner.unsafe_html = self.unsafe_html;
         inner.gfm_autolinks = self.gfm_autolinks;
         inner.gfm_alerts = self.gfm_alerts;
+        inner.gfm_tagfilter = self.gfm_tagfilter;
         inner.gfm_footnotes = false;
         inner.gfm_math = self.gfm_math;
         inner.dir_auto = self.dir_auto;
@@ -5803,11 +5846,16 @@ fn html_block_closes_here(line: &[u8], html_type: u8, content: &[u8]) -> bool {
 }
 
 /// Fold one complete HTML-block source line (terminator included) into the
-/// cached prefix: verbatim for pass-through, `escape_html`d otherwise. Newlines
-/// pass through `escape_html` unchanged, so the escaped prefix keeps line breaks.
-fn fold_html_line(line: &[u8], pass_through: bool, out: &mut String) {
+/// cached prefix: verbatim for pass-through (tagfiltered when the GFM
+/// tagfilter is on — every tag boundary a disallowed `<name` needs lies within
+/// the line + its `\n`, so the per-line decision is final and matches the full
+/// path), `escape_html`d otherwise. Newlines pass through `escape_html`
+/// unchanged, so the escaped prefix keeps line breaks.
+fn fold_html_line(line: &[u8], pass_through: bool, tagfilter: bool, out: &mut String) {
     let s = std::str::from_utf8(line).unwrap_or("");
-    if pass_through {
+    if pass_through && tagfilter {
+        push_tagfiltered(s, out);
+    } else if pass_through {
         out.push_str(s);
     } else {
         escape_html(s, out);
@@ -5880,6 +5928,7 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
     let end = bytes.len();
     let (_, html_type) = detect_html_block_open(bytes, start)?;
     let pass_through = opts.unsafe_html && !opts.html_sanitize;
+    let tagfilter = pass_through && opts.gfm_tagfilter;
     let mut cached_prefix = String::new();
     let mut lines_upto = start;
     let mut pos = start;
@@ -5893,7 +5942,7 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
                 if html_block_closes_here(line, html_type, &bytes[pos..content_end]) {
                     return None;
                 }
-                fold_html_line(line, pass_through, &mut cached_prefix);
+                fold_html_line(line, pass_through, tagfilter, &mut cached_prefix);
                 lines_upto = next;
                 pos = next;
             }
@@ -5905,7 +5954,7 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
     if !partial.is_empty() && html_block_closes_here(partial, html_type, partial) {
         return None;
     }
-    Some(HtmlBlockCache { start, id, html_type, pass_through, cached_prefix, lines_upto })
+    Some(HtmlBlockCache { start, id, html_type, pass_through, tagfilter, cached_prefix, lines_upto })
 }
 
 /// True if the open paragraph beginning before `cut` actually ends somewhere in

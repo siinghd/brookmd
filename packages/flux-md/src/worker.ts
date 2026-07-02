@@ -24,6 +24,7 @@ const core = new WorkerCore({
     const p = new FluxParser();
     p.setGfmAutolinks(c?.gfmAutolinks ?? true);
     p.setGfmAlerts(c?.gfmAlerts ?? true);
+    p.setGfmTagfilter(c?.gfmTagfilter ?? false);
     p.setGfmFootnotes(c?.gfmFootnotes ?? false);
     p.setGfmMath(c?.gfmMath ?? false);
     p.setDirAuto(c?.dirAuto ?? false);

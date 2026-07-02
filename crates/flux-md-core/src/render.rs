@@ -63,6 +63,13 @@ pub struct RenderOpts {
     /// (`<div class="markdown-alert …">`). Off by default so strict CommonMark
     /// output (a plain `<blockquote>`) is unchanged.
     pub gfm_alerts: bool,
+    /// GFM "Disallowed Raw HTML" (tagfilter, GFM spec §6.11): when raw HTML is
+    /// emitted verbatim (`unsafe_html` pass-through), escape the leading `<` of
+    /// the nine disallowed tags (`<title>`, `<script>`, …) so they render as
+    /// text instead of taking effect. Off by default — strict CommonMark
+    /// expects `<script>` verbatim under `unsafe_html`, so this is NOT implied
+    /// by it. Irrelevant when raw HTML is escaped/sanitized (already inert).
+    pub gfm_tagfilter: bool,
     /// Math: recognize `$…$` / `\(…\)` inline and `$$…$$` / `\[…\]` display
     /// math. Off by default (so `$` in prose stays literal). The block-level
     /// half is also gated in the scanner via [`ScanCtx::math`].
@@ -1867,6 +1874,55 @@ pub(crate) fn strip_inline_html(html: &str) -> String {
     out
 }
 
+/// The nine tag names the GFM "Disallowed Raw HTML" extension (tagfilter, GFM
+/// spec §6.11) neutralizes when raw HTML is emitted verbatim.
+const TAGFILTER_TAGS: &[&str] = &[
+    "title", "textarea", "style", "xmp", "iframe", "noembed", "noframes", "script", "plaintext",
+];
+
+/// True when the bytes at a `<` open a disallowed tag per the tagfilter: `<` +
+/// optional `/` + a disallowed name (ASCII case-insensitive) followed by
+/// whitespace, `>`, or `/>`. End-of-chunk also counts as a boundary — a block's
+/// content always ends in a line terminator at finalize, so a `<script` cut off
+/// by buffer EOF must filter now for streamed/one-shot parity (and so a
+/// mid-stream frame never shows the tag live).
+fn tagfilter_match(t: &[u8]) -> bool {
+    debug_assert_eq!(t.first(), Some(&b'<'));
+    let name_start = if t.get(1) == Some(&b'/') { 2 } else { 1 };
+    let mut i = name_start;
+    while i < t.len() && t[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    let name = &t[name_start..i];
+    if !TAGFILTER_TAGS.iter().any(|d| d.as_bytes().eq_ignore_ascii_case(name)) {
+        return false;
+    }
+    match t.get(i) {
+        None => true,
+        Some(&b'>') => true,
+        Some(&b) if matches!(b, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r') => true,
+        Some(&b'/') => t.get(i + 1) == Some(&b'>'),
+        _ => false,
+    }
+}
+
+/// Copy a raw-HTML chunk to `out`, replacing the leading `<` of every
+/// disallowed tag with `&lt;` (everything else verbatim, including the rest of
+/// the tag). Scans every `<` in the chunk — also inside comments/CDATA, per the
+/// extension. O(chunk).
+pub(crate) fn push_tagfiltered(s: &str, out: &mut String) {
+    let bytes = s.as_bytes();
+    let mut emitted = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'<' && tagfilter_match(&bytes[i..]) {
+            out.push_str(&s[emitted..i]);
+            out.push_str("&lt;");
+            emitted = i + 1;
+        }
+    }
+    out.push_str(&s[emitted..]);
+}
+
 fn render_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
     // A comment-ONLY HTML block has no visible representation: drop it (renders
     // to nothing), so `<!--marker-->` on its own line never surfaces as an
@@ -1886,7 +1942,14 @@ fn render_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
     // even if `unsafe_html` is also on.
     if opts.unsafe_html && !opts.html_sanitize {
         let trimmed = slice.trim_end_matches(|c: char| c == '\n' || c == '\r');
-        out.push_str(trimmed);
+        if opts.gfm_tagfilter {
+            // Filtering the TRIMMED slice is equivalent to filtering the raw
+            // one: trailing newlines and end-of-chunk are both tag boundaries,
+            // and the filter never touches newlines.
+            push_tagfiltered(trimmed, out);
+        } else {
+            out.push_str(trimmed);
+        }
         // CommonMark output keeps a trailing newline after HTML blocks so
         // adjacent inline content doesn't smash against it.
         out.push('\n');

@@ -233,6 +233,7 @@ export function defineFluxMarkdown(tag = "flux-markdown"): void {
       };
       set("gfm-autolinks", "gfmAutolinks");
       set("gfm-alerts", "gfmAlerts");
+      set("gfm-tagfilter", "gfmTagfilter");
       set("gfm-footnotes", "gfmFootnotes");
       set("gfm-math", "gfmMath");
       set("dir-auto", "dirAuto");

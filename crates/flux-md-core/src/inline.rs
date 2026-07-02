@@ -16,7 +16,7 @@
 //! is escaped (or passed through if unsafe mode is enabled).
 
 use crate::entities::decode_entity;
-use crate::render::RenderOpts;
+use crate::render::{push_tagfiltered, RenderOpts};
 use crate::url::{escape_attr, escape_html, sanitize_attrs, sanitize_image_url, sanitize_url};
 
 const ESCAPABLE: &[u8] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
@@ -1157,6 +1157,17 @@ const DANGEROUS_HTML_TAGS: &[&[u8]] = &[
     b"xmp", b"plaintext", b"noembed", b"noframes", b"listing",
 ];
 
+/// Emit an inline raw-HTML token verbatim (`unsafe_html` pass-through),
+/// routing through the GFM tagfilter when it's on — so a disallowed inline
+/// `<title>` / `<script …>` renders as text (GFM spec §6.11).
+fn push_raw_inline_html(token: &str, opts: &RenderOpts, out: &mut String) {
+    if opts.gfm_tagfilter {
+        push_tagfiltered(token, out);
+    } else {
+        out.push_str(token);
+    }
+}
+
 fn try_inline_html(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut String) -> Option<usize> {
     let consumed = match_inline_html(bytes, start)?;
     let token = &bytes[start..start + consumed];
@@ -1166,7 +1177,7 @@ fn try_inline_html(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut Stri
     // verbatim for CommonMark fidelity — a browser ignores them either way.
     if token.starts_with(b"<!--") {
         if opts.unsafe_html && !opts.html_sanitize {
-            out.push_str(std::str::from_utf8(token).ok()?);
+            push_raw_inline_html(std::str::from_utf8(token).ok()?, opts, out);
         }
         return Some(start + consumed);
     }
@@ -1177,7 +1188,7 @@ fn try_inline_html(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut Stri
     }
 
     if opts.unsafe_html {
-        out.push_str(std::str::from_utf8(token).ok()?);
+        push_raw_inline_html(std::str::from_utf8(token).ok()?, opts, out);
     } else {
         // Escape it.
         for &b in token {

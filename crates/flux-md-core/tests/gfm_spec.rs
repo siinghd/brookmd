@@ -20,7 +20,10 @@ struct SpecCase {
 const SPEC_JSON: &str = include_str!("gfm-spec.json");
 
 fn render_md(src: &str) -> String {
-    let mut p = StreamParser::new().with_unsafe_html(true).with_gfm_autolinks(true);
+    let mut p = StreamParser::new()
+        .with_unsafe_html(true)
+        .with_gfm_autolinks(true)
+        .with_gfm_tagfilter(true);
     p.append(src);
     p.finalize();
     let mut out = String::new();

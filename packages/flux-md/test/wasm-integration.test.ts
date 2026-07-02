@@ -100,6 +100,20 @@ test.skipIf(!haveWasm)("real WASM: setGfmMath toggles math output end-to-end (fl
   expect(on.blocks.some((b) => b.html.includes("math-inline"))).toBe(true);
 });
 
+test.skipIf(!haveWasm)("real WASM: setGfmTagfilter escapes disallowed raw HTML end-to-end", () => {
+  const md = "<title>x</title>\n";
+  // unsafeHtml alone passes the disallowed tag through (tagfilter defaults off)…
+  const off = parseAll(md, (p) => p.setUnsafeHtml(true));
+  expect(off.blocks.some((b) => b.html.includes("<title>x</title>"))).toBe(true);
+  // …and the tagfilter flag crosses the boundary and escapes its `<`.
+  const on = parseAll(md, (p) => {
+    p.setUnsafeHtml(true);
+    p.setGfmTagfilter(true);
+  });
+  expect(on.blocks.some((b) => b.html.includes("&lt;title>x&lt;/title>"))).toBe(true);
+  expect(on.blocks.some((b) => b.html.includes("<title"))).toBe(false);
+});
+
 test.skipIf(!haveWasm)("real WASM: setA11y wraps a task-list checkbox in a <label>", () => {
   const off = parseAll("- [ ] todo\n");
   const on = parseAll("- [ ] todo\n", (p) => p.setA11y(true));

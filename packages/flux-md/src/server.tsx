@@ -86,6 +86,7 @@ function makeParser(config?: ParserConfig): FluxParser {
   const p = new FluxParser();
   p.setGfmAutolinks(config?.gfmAutolinks ?? true);
   p.setGfmAlerts(config?.gfmAlerts ?? true);
+  p.setGfmTagfilter(config?.gfmTagfilter ?? false);
   p.setGfmFootnotes(config?.gfmFootnotes ?? false);
   p.setGfmMath(config?.gfmMath ?? false);
   p.setDirAuto(config?.dirAuto ?? false);

@@ -587,6 +587,7 @@ const client = new FluxClient({
   config: {
     gfmAutolinks: true,   // bare www./http(s):// URLs + emails → links (default true)
     gfmAlerts: true,      // > [!NOTE] → callouts (default true)
+    gfmTagfilter: false,  // GFM disallowed raw HTML: escape <script>/<title>/… under unsafeHtml (default false)
     gfmFootnotes: true,   // [^1] + [^1]: → footnote section (default false)
     gfmMath: true,        // $…$ / \(…\) inline + $$…$$ / \[…\] display math (default false)
     dirAuto: true,        // per-block dir="auto" for RTL/bidi text (default false)
@@ -623,6 +624,13 @@ When to enable each flag:
 - `unsafeHtml: true` — only when rendering trusted HTML. For untrusted /
   LLM-produced HTML, pair this with `<FluxMarkdown sanitize={…} />` (DOMPurify or
   similar — see [Security](#security)).
+- `gfmTagfilter: true` — the GFM "Disallowed Raw HTML" extension, for use with
+  `unsafeHtml`: the nine disallowed tags (`<title>`, `<textarea>`, `<style>`,
+  `<xmp>`, `<iframe>`, `<noembed>`, `<noframes>`, `<script>`, `<plaintext>`) get
+  their leading `<` escaped so they display as text instead of taking effect —
+  opening and closing forms, any case, in blocks and inline. Off by default
+  (strict CommonMark passes them through under `unsafeHtml`); it's a tag
+  denylist, **not** a sanitizer — untrusted input still wants `sanitize`.
 - `componentTags: ["Thinking", …]` — when your LLM emits **block** custom tags
   like `<Thinking>…</Thinking>` (on their own line) and you want their inner
   content parsed as markdown and dispatched to a React component. Safe without

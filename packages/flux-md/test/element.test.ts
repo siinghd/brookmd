@@ -211,6 +211,7 @@ test("self-owned client created with config from tri-state attributes", () => {
   const el = document.createElement("flux-markdown");
   el.setAttribute("gfm-alerts", "false"); // turn OFF a default-on flag
   el.setAttribute("gfm-math", "true");
+  el.setAttribute("gfm-tagfilter", "true");
   el.setAttribute("component-tags", "Thinking, Callout");
   el.textContent = "x";
   document.body.appendChild(el);
@@ -223,6 +224,7 @@ test("self-owned client created with config from tri-state attributes", () => {
   expect(first).toBeDefined();
   expect(first!.config.gfmAlerts).toBe(false);
   expect(first!.config.gfmMath).toBe(true);
+  expect(first!.config.gfmTagfilter).toBe(true);
   expect(first!.config.componentTags).toEqual(["Thinking", "Callout"]);
 
   el.remove();

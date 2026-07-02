@@ -328,6 +328,15 @@ export interface ParserConfig {
   gfmAutolinks?: boolean;
   /** GitHub alerts (`> [!NOTE]` → callouts). Default true. */
   gfmAlerts?: boolean;
+  /**
+   * GFM "Disallowed Raw HTML" (tagfilter): with `unsafeHtml` on, the nine
+   * disallowed tags (`<title>`, `<textarea>`, `<style>`, `<xmp>`, `<iframe>`,
+   * `<noembed>`, `<noframes>`, `<script>`, `<plaintext>`) get their leading
+   * `<` escaped so they display as text instead of taking effect. Default
+   * false (strict CommonMark passes them through under `unsafeHtml`); no
+   * effect while raw HTML is escaped (default) or sanitized — already inert.
+   */
+  gfmTagfilter?: boolean;
   /** GFM footnotes (`[^1]` + `[^1]:` → footnote section). Default false. */
   gfmFootnotes?: boolean;
   /**

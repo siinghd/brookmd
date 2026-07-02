@@ -187,6 +187,16 @@ impl FluxParser {
         self.inner.set_gfm_alerts(on);
     }
 
+    /// Enable the GFM "Disallowed Raw HTML" extension (tagfilter): with raw
+    /// HTML passing through (`setUnsafeHtml(true)`), the nine disallowed tags
+    /// (`<title>`, `<script>`, `<iframe>`, …) get their leading `<` escaped so
+    /// they display as text instead of taking effect. Off by default; no
+    /// effect while raw HTML is escaped or sanitized (already inert).
+    #[wasm_bindgen(js_name = setGfmTagfilter)]
+    pub fn set_gfm_tagfilter(&mut self, on: bool) {
+        self.inner.set_gfm_tagfilter(on);
+    }
+
     /// Enable GFM footnotes (`[^1]` references + `[^1]:` definitions → a
     /// footnote section emitted at finalize). Off by default.
     #[wasm_bindgen(js_name = setGfmFootnotes)]
