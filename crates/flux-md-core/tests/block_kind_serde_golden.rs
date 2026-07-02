@@ -28,16 +28,18 @@ fn j(k: &BlockKind) -> String {
 
 #[test]
 fn every_variant_matches_pre_refactor_golden() {
+    // The `Rc` wrappers are invisible on the wire (serde `rc` serializes through
+    // them) — the golden strings below prove it.
     let td = TableData {
-        headers: vec![TableCell {
+        headers: Rc::new(vec![TableCell {
             text: "H".into(),
             html: "<strong>H</strong>".into(),
-        }],
+        }]),
         rows: vec![Rc::new(vec![TableCell {
             text: "x".into(),
             html: "x".into(),
         }])],
-        aligns: vec![Some("center"), None],
+        aligns: Rc::new(vec![Some("center"), None]),
     };
 
     // Unit kinds — no `data` key.
@@ -53,7 +55,7 @@ fn every_variant_matches_pre_refactor_golden() {
     assert_eq!(j(&BlockKind::MathBlock(None)), r#"{"type":"MathBlock"}"#);
     assert_eq!(
         j(&BlockKind::MathBlock(Some(MathBlockData {
-            latex: "E = mc^2".into()
+            latex: Rc::new("E = mc^2".into())
         }))),
         r#"{"type":"MathBlock","data":{"latex":"E = mc^2"}}"#
     );
@@ -95,14 +97,14 @@ fn every_variant_matches_pre_refactor_golden() {
     assert_eq!(
         j(&BlockKind::CodeBlock {
             lang: Some("rust".into()),
-            code: Some("fn main() {}\n".into()),
+            code: Some(Rc::new("fn main() {}\n".into())),
         }),
         r#"{"type":"CodeBlock","data":{"lang":"rust","code":"fn main() {}\n"}}"#
     );
     assert_eq!(
         j(&BlockKind::CodeBlock {
             lang: None,
-            code: Some("plain\n".into()),
+            code: Some(Rc::new("plain\n".into())),
         }),
         r#"{"type":"CodeBlock","data":{"lang":null,"code":"plain\n"}}"#
     );
@@ -131,8 +133,8 @@ fn every_variant_matches_pre_refactor_golden() {
             ordered: true,
             start: Some(1),
             items: vec![
-                ListItemData { html: "first".into() },
-                ListItemData { html: "<strong>second</strong>".into() },
+                Rc::new(ListItemData { html: "first".into() }),
+                Rc::new(ListItemData { html: "<strong>second</strong>".into() }),
             ],
         }),
         r#"{"type":"List","data":{"ordered":true,"start":1,"items":[{"html":"first"},{"html":"<strong>second</strong>"}]}}"#
@@ -165,8 +167,8 @@ fn every_variant_matches_pre_refactor_golden() {
     assert_eq!(
         j(&BlockKind::Blockquote(Some(ContainerData {
             nested: vec![
-                NestedBlock { html: "<p>a</p>".into() },
-                NestedBlock { html: "<p>b</p>".into() },
+                Rc::new(NestedBlock { html: "<p>a</p>".into() }),
+                Rc::new(NestedBlock { html: "<p>b</p>".into() }),
             ],
         }))),
         r#"{"type":"Blockquote","data":{"nested":[{"html":"<p>a</p>"},{"html":"<p>b</p>"}]}}"#
@@ -178,7 +180,7 @@ fn every_variant_matches_pre_refactor_golden() {
         j(&BlockKind::Alert {
             kind: AlertKind::Tip,
             nested: Some(ContainerData {
-                nested: vec![NestedBlock { html: "<p>x</p>".into() }],
+                nested: vec![Rc::new(NestedBlock { html: "<p>x</p>".into() })],
             }),
         }),
         r#"{"type":"Alert","data":{"kind":"tip","nested":[{"html":"<p>x</p>"}]}}"#

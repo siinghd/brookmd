@@ -41,7 +41,7 @@ fn table_emits_structured_data_when_on() {
     assert_eq!(td.headers[1].html, "B");
 
     // Alignments come straight off the delimiter row.
-    assert_eq!(td.aligns, vec![None, Some("center")]);
+    assert_eq!(*td.aligns, vec![None, Some("center")]);
 
     // Body row: a link renders to html, strips to its link text.
     assert_eq!(td.rows.len(), 1);
@@ -214,7 +214,7 @@ fn data_mirrors_own_html_at_every_append() {
                 BlockKind::Table(Some(td)) => {
                     assert!(is_table_html, "populated Table but html is not a table: {}", b.html);
                     // Header cell html appears inside the rendered thead.
-                    for cell in &td.headers {
+                    for cell in td.headers.iter() {
                         assert!(
                             cell.html.is_empty() || b.html.contains(&cell.html),
                             "header cell html {:?} not found in block html {:?}",

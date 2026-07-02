@@ -65,8 +65,11 @@ pub enum BlockKind {
     /// consumer can build a copy-to-clipboard string / re-highlight from DATA
     /// without re-parsing (and entity-decoding) the rendered HTML. The opt-in
     /// `code` rides behind `#[serde(skip_serializing_if)]` so the off wire stays
-    /// byte-identical.
-    CodeBlock { lang: Option<String>, code: Option<String> },
+    /// byte-identical. `Rc`-shared so the streaming fence/indented caches can
+    /// re-emit the (large, growing) source every patch with `Block::clone` as a
+    /// refcount bump, not an O(body) `String` copy; serde's `rc` feature
+    /// serializes through the `Rc` transparently (wire unchanged).
+    CodeBlock { lang: Option<String>, code: Option<Rc<String>> },
     /// A display-math block (`$$…$$` / `\[…\]` / a fenced `math` block). The
     /// `Option<MathBlockData>` is the opt-in structured channel (`setBlockData`):
     /// `None` (default-off) ⇒ serializes as `{"type":"MathBlock"}` with no `data`
@@ -87,8 +90,11 @@ pub enum BlockKind {
     /// `<li>` so a keyed renderer can stamp one node per item and skip the
     /// re-render of unchanged items while the list streams. Both opt-in fields ride
     /// behind `#[serde(skip_serializing_if)]` (`items` skipped when empty) so the
-    /// off wire stays byte-identical.
-    List { ordered: bool, start: Option<u32>, items: Vec<ListItemData> },
+    /// off wire stays byte-identical. Each item is `Rc`-shared (like
+    /// `TableData::rows`) so the streaming `ListCache` re-emits all committed
+    /// items per patch as O(items) refcount bumps, not O(item bytes) `String`
+    /// clones; the wire shape is unchanged (serde `rc`).
+    List { ordered: bool, start: Option<u32>, items: Vec<Rc<ListItemData>> },
     /// A blockquote. `nested` is the opt-in structured channel (`setBlockData`):
     /// `None` (default-off) ⇒ serializes as `{"type":"Blockquote"}` with no `data`
     /// key, byte-identical to before; `Some(cd)` (on) ⇒
@@ -143,7 +149,7 @@ struct CodeBlockData<'a> {
     /// wire stays byte-identical (`{"lang":…}`), present when on (`{"lang":…,
     /// "code":"…"}`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    code: &'a Option<String>,
+    code: &'a Option<Rc<String>>,
 }
 #[derive(Serialize)]
 struct ListData<'a> {
@@ -155,8 +161,8 @@ struct ListData<'a> {
     start: Option<u32>,
     /// Opt-in per-item inner HTML (`setBlockData`); omitted when empty (off) so the
     /// off wire stays byte-identical, present when on (`{…,"items":[{"html":…},…]}`).
-    #[serde(skip_serializing_if = "<[ListItemData]>::is_empty")]
-    items: &'a [ListItemData],
+    #[serde(skip_serializing_if = "<[Rc<ListItemData>]>::is_empty")]
+    items: &'a [Rc<ListItemData>],
 }
 #[derive(Serialize)]
 struct AlertData<'a> {
@@ -165,7 +171,7 @@ struct AlertData<'a> {
     /// `ContainerData` carrier and omitted entirely when off so the wire stays
     /// byte-identical (`{"kind":…}`), present when on (`{"kind":…,"nested":[…]}`).
     #[serde(skip_serializing_if = "Option::is_none")]
-    nested: Option<&'a Vec<NestedBlock>>,
+    nested: Option<&'a Vec<Rc<NestedBlock>>>,
 }
 #[derive(Serialize)]
 struct ComponentData<'a> {
@@ -277,10 +283,12 @@ pub struct HeadingData {
 /// `<div class="math math-display">…</div>` (or `<pre><code>…</code></pre>` for a
 /// fenced `math`/`latex`/`tex` block) body and entity-decoding it, done once in
 /// Rust here so a `components.MathBlock` override can re-render with KaTeX from
-/// DATA — no HTML re-parse.
+/// DATA — no HTML re-parse. `Rc`-shared for the same reason as
+/// `BlockKind::CodeBlock::code` (per-patch re-emit of a large growing source);
+/// serializes through the `Rc` transparently.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MathBlockData {
-    pub latex: String,
+    pub latex: Rc<String>,
 }
 
 /// Structured table payload for the opt-in `kind.data` channel (the
@@ -294,14 +302,16 @@ pub struct MathBlockData {
 /// re-emit the full table on every patch (the active block always carries all
 /// rows so far, mirroring `Block::html`) with an O(rows) refcount bump per
 /// patch instead of an O(cells) deep `String` clone — the perf-critical
-/// difference for large streamed tables. The `rc` serde feature makes
-/// `Rc<Vec<TableCell>>` serialize transparently, so the wire shape is unchanged:
+/// difference for large streamed tables. `headers` and `aligns` are frozen at
+/// the delimiter row, so they ride behind an `Rc` too (one bump per patch).
+/// The `rc` serde feature makes every `Rc` serialize transparently, so the wire
+/// shape is unchanged:
 /// `{ headers: TableCell[], rows: TableCell[][], aligns: (string|null)[] }`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TableData {
-    pub headers: Vec<TableCell>,
+    pub headers: Rc<Vec<TableCell>>,
     pub rows: Vec<Rc<Vec<TableCell>>>,
-    pub aligns: Vec<Option<&'static str>>,
+    pub aligns: Rc<Vec<Option<&'static str>>>,
 }
 
 /// One table cell in the structured channel. `text` is the plaintext (inline
@@ -336,10 +346,13 @@ pub struct ListItemData {
 /// override can render these KEYED (one node per entry) so that while the
 /// container streams, only its last (open) inner block re-renders each tick —
 /// the committed inner blocks have stable HTML and memoize. The wrapper
-/// (`<blockquote>` / the alert `<div>` + title) is NOT in `nested`.
+/// (`<blockquote>` / the alert `<div>` + title) is NOT in `nested`. Entries are
+/// `Rc`-shared (like `TableData::rows`) so the streaming container caches
+/// re-emit the committed entries per patch as refcount bumps; the wire shape is
+/// unchanged (serde `rc`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ContainerData {
-    pub nested: Vec<NestedBlock>,
+    pub nested: Vec<Rc<NestedBlock>>,
 }
 
 /// One inner sub-block of a blockquote / alert in the structured channel. `html`

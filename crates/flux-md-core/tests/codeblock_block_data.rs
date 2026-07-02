@@ -24,7 +24,9 @@ fn finalize(md: &str, block_data: bool) -> StreamParser {
 fn first_code(p: &StreamParser) -> Option<(Option<String>, Option<String>)> {
     for b in p.all_blocks() {
         if let BlockKind::CodeBlock { lang, code } = &b.kind {
-            return Some((lang.clone(), code.clone()));
+            // `code` rides behind an `Rc` (streaming re-emit is a refcount bump);
+            // deep-copy it here so assertions compare plain `String`s.
+            return Some((lang.clone(), code.as_ref().map(|c| (**c).clone())));
         }
     }
     None
@@ -92,7 +94,7 @@ fn code_equals_decoded_html_body() {
             if let BlockKind::CodeBlock { code: Some(code), .. } = &b.kind {
                 let decoded = decode_code_html(&b.html);
                 assert_eq!(
-                    *code, decoded,
+                    **code, decoded,
                     "code must equal decoded <pre><code> body for {md:?}"
                 );
             }
@@ -180,4 +182,53 @@ fn decode_code_html(html: &str) -> String {
         }
     }
     out
+}
+
+/// Dedicated guard for `block_data` + INDENTED code + INTERIOR BLANK lines: the
+/// IndentedCodeCache folds interior blanks into `escaped_lines` when content
+/// resumes, and the raw `decoded_lines` twin must mirror that exact accounting
+/// (same fold points, same trailing trim) or `kind.data.code` diverges from the
+/// decoded HTML body. Streamed at every chunk size must match the one-shot
+/// parse of the same prefix — kind (code included) and html — at every append.
+#[test]
+fn indented_interior_blanks_match_one_shot_at_every_prefix() {
+    let cases = [
+        // single interior blank
+        "    line one\n    line two\n\n    line three\n",
+        // double interior blank + whitespace-only "blank" (spaces beyond col 4)
+        "    a & b < c\n\n\n    d > e\n      \n    tail line\n",
+        // blank with extra indent (strips to 2 spaces of content) + tab line
+        "    first\n        \n\tsecond after tab\n\n    third\n",
+        // trailing blanks (trimmed by the assembly, not part of the block)
+        "    only line\n\n\n",
+    ];
+    for md in cases {
+        for chunk in [1usize, 3, 64, 128] {
+            let mut p = StreamParser::new().with_block_data(true);
+            let b = md.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                let e = (i + chunk).min(b.len());
+                p.append(&md[i..e]);
+                let mut q = StreamParser::new().with_block_data(true);
+                q.append(&md[..e]);
+                let ps: Vec<(String, String)> = p
+                    .all_blocks()
+                    .map(|b| (serde_json::to_string(&b.kind).unwrap(), b.html.clone()))
+                    .collect();
+                let qs: Vec<(String, String)> = q
+                    .all_blocks()
+                    .map(|b| (serde_json::to_string(&b.kind).unwrap(), b.html.clone()))
+                    .collect();
+                assert_eq!(
+                    ps, qs,
+                    "streamed kind/html diverged from one-shot at prefix {e} (chunk {chunk}) for {md:?}"
+                );
+                i = e;
+            }
+            p.finalize();
+            let one = first_code(&finalize(md, true));
+            assert_eq!(first_code(&p), one, "finalize != one-shot for {md:?} (chunk {chunk})");
+        }
+    }
 }

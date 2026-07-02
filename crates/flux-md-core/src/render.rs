@@ -281,7 +281,7 @@ pub enum Enrichment {
     /// Ordered/unordered list — folds the start number and the per-item inner
     /// HTML onto `BlockKind::List { start: Some(_), items, .. }` (the classified
     /// `ordered` is preserved).
-    List(u32, Vec<ListItemData>),
+    List(u32, Vec<Rc<ListItemData>>),
     /// Blockquote — folds onto `BlockKind::Blockquote(Some(_))`.
     Blockquote(ContainerData),
     /// GFM alert — folds onto `BlockKind::Alert { nested: Some(_), .. }` (the
@@ -352,7 +352,7 @@ pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut S
                 let lang = info.split_whitespace().next().unwrap_or("");
                 match lang {
                     "math" | "latex" | "tex" => {
-                        return Some(Enrichment::MathBlock(MathBlockData { latex: code }))
+                        return Some(Enrichment::MathBlock(MathBlockData { latex: Rc::new(code) }))
                     }
                     // A ```mermaid fence classifies to the unit `Mermaid` kind,
                     // which is intentionally NOT enriched (see report) — drop the
@@ -367,7 +367,7 @@ pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut S
         }
         RawBlockKind::MathFence { terminated } => {
             return render_math_block(slice, *terminated, opts, out)
-                .map(|latex| Enrichment::MathBlock(MathBlockData { latex }))
+                .map(|latex| Enrichment::MathBlock(MathBlockData { latex: Rc::new(latex) }))
         }
         RawBlockKind::Blockquote => return render_blockquote(slice, opts, out),
         RawBlockKind::List { ordered, start } => {
@@ -587,45 +587,6 @@ fn render_code_fence(
     } else {
         None
     }
-}
-
-/// Inverse of [`escape_html`]: decode the four entities it can emit (`&lt; &gt;
-/// &amp; &quot;`) back to their literals. Used by the streaming fence cache to
-/// recover the decoded code/LaTeX source from an already-assembled, already-
-/// trimmed HTML body — guaranteeing `kind.data.code`/`.latex` is byte-identical to
-/// the full path (and to the client's `decodeCodeText`/`decodeMathText`). `&amp;`
-/// is decoded LAST so `&amp;lt;` → `&lt;` (not `<`), mirroring the client's
-/// `decodeEntities` ordering. The body never contains `&#39;` (`escape_html` does
-/// not emit it), so it is not handled.
-pub(crate) fn unescape_html_body(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let bytes = body.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'&' {
-            if body[i..].starts_with("&lt;") {
-                out.push('<');
-                i += 4;
-                continue;
-            } else if body[i..].starts_with("&gt;") {
-                out.push('>');
-                i += 4;
-                continue;
-            } else if body[i..].starts_with("&quot;") {
-                out.push('"');
-                i += 6;
-                continue;
-            } else if body[i..].starts_with("&amp;") {
-                out.push('&');
-                i += 5;
-                continue;
-            }
-        }
-        let ch = body[i..].chars().next().unwrap();
-        out.push(ch);
-        i += ch.len_utf8();
-    }
-    out
 }
 
 /// The decoded source the `<pre><code>` body holds for a `content` string: empty
@@ -881,12 +842,12 @@ fn render_blockquote(slice: &str, opts: &RenderOpts, out: &mut String) -> Option
     // Opt-in: capture each inner sub-block's own HTML fragment (byte-identical to
     // what lands in `out`) into the structured `nested` channel so a keyed
     // override can render children one node at a time. Off ⇒ no Vec, no Enrichment.
-    let mut nested: Vec<NestedBlock> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
+    let mut nested: Vec<Rc<NestedBlock>> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
     for b in &sub {
         let frag_start = out.len();
         render_block(&inner, b, opts, out);
         if opts.block_data {
-            nested.push(NestedBlock { html: out[frag_start..].to_string() });
+            nested.push(Rc::new(NestedBlock { html: out[frag_start..].to_string() }));
         }
         out.push('\n');
     }
@@ -928,12 +889,12 @@ fn render_alert(inner: &str, kind: AlertKind, opts: &RenderOpts, out: &mut Strin
     // Opt-in: capture each body sub-block's HTML fragment into `nested` (the
     // title line is the wrapper, not a body block, so it is excluded). Mirrors
     // `render_blockquote`'s nested capture.
-    let mut nested: Vec<NestedBlock> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
+    let mut nested: Vec<Rc<NestedBlock>> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
     for b in &sub {
         let frag_start = out.len();
         render_block(body, b, opts, out);
         if opts.block_data {
-            nested.push(NestedBlock { html: out[frag_start..].to_string() });
+            nested.push(Rc::new(NestedBlock { html: out[frag_start..].to_string() }));
         }
         out.push('\n');
     }
@@ -1449,9 +1410,9 @@ fn strip_cols(line: &[u8], cols: usize) -> String {
 /// `ListItemData` per item carrying that item's inner `<li>` HTML (byte-identical
 /// to the content between the matching `<li…>`/`</li>` in `out`); returns an empty
 /// `Vec` when off (zero extra work / allocation).
-fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &mut String) -> Vec<ListItemData> {
+fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &mut String) -> Vec<Rc<ListItemData>> {
     let bytes = slice.as_bytes();
-    let mut items: Vec<ListItemData> = Vec::new();
+    let mut items: Vec<Rc<ListItemData>> = Vec::new();
     // Split into sibling items by tracking each item's own content_indent
     // (CMark §5.2). A line opens a new sibling item iff it carries a marker of
     // this list's family, is indented at most `edge + 3` columns, and is
@@ -1545,7 +1506,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
         // renderer gets the exact bytes between this `<li…>` and its `</li>` —
         // no second render, no HTML re-parse.
         if let Some((lo, hi)) = inner {
-            items.push(ListItemData { html: out[lo..hi].to_string() });
+            items.push(Rc::new(ListItemData { html: out[lo..hi].to_string() }));
         }
         out.push('\n');
     }
@@ -1746,7 +1707,7 @@ fn render_table(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<Tabl
     }
     out.push_str("</table>");
     if opts.block_data {
-        Some(TableData { headers: td_headers, rows: td_rows, aligns })
+        Some(TableData { headers: Rc::new(td_headers), rows: td_rows, aligns: Rc::new(aligns) })
     } else {
         None
     }
@@ -2084,7 +2045,7 @@ mod strip_pass_bench {
         let mut cells = Vec::new();
         for b in p.all_blocks() {
             if let BlockKind::Table(Some(td)) = &b.kind {
-                for h in &td.headers {
+                for h in td.headers.iter() {
                     cells.push(h.html.clone());
                 }
                 for r in &td.rows {

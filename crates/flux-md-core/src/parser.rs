@@ -146,9 +146,12 @@ fn resolve_block_footnotes(
         resolve_footnote_ids_overlay(s, base, &mut seed, &mut o);
         o
     };
+    // The `Rc`-shared payload entries are freshly produced here (strong count 1
+    // on the full-reparse path), so `Rc::make_mut` / re-wrapping never clones a
+    // cache-frozen entry.
     match &mut block.kind {
         BlockKind::Table(Some(td)) => {
-            for cell in &mut td.headers {
+            for cell in Rc::make_mut(&mut td.headers) {
                 cell.html = resolve_one(&cell.html);
             }
             for row in &mut td.rows {
@@ -161,17 +164,17 @@ fn resolve_block_footnotes(
         }
         BlockKind::List { items, .. } => {
             for it in items {
-                it.html = resolve_one(&it.html);
+                *it = Rc::new(ListItemData { html: resolve_one(&it.html) });
             }
         }
         BlockKind::Blockquote(Some(cd)) => {
             for nb in &mut cd.nested {
-                nb.html = resolve_one(&nb.html);
+                *nb = Rc::new(NestedBlock { html: resolve_one(&nb.html) });
             }
         }
         BlockKind::Alert { nested: Some(cd), .. } => {
             for nb in &mut cd.nested {
-                nb.html = resolve_one(&nb.html);
+                *nb = Rc::new(NestedBlock { html: resolve_one(&nb.html) });
             }
         }
         _ => {}
@@ -375,6 +378,12 @@ struct FenceCache {
     close: FenceClose,
     /// Math fences trim surrounding whitespace of the body; code fences don't.
     trim_body: bool,
+    /// Absolute byte offset where the fence BODY begins in `buffer` (past the
+    /// opener line for code; past the delimiter + leading whitespace for math).
+    /// The assembled HTML body is exactly `escape_html(buffer[body_start..end])`
+    /// plus the trailing trim, so the opt-in `kind.data` source derives from this
+    /// RAW slice directly — no per-append whole-body entity decode.
+    body_start: usize,
     /// Escaped HTML of the complete body lines, joined by `\n`, no trailing `\n`.
     escaped_lines: String,
     /// Whether ≥1 complete body line has been folded in. Drives the `\n` line
@@ -512,16 +521,18 @@ struct TableCache {
     lines_upto: usize,
     /// Header column count (locked at the delimiter row).
     ncol: usize,
-    /// Per-column alignment (parsed once from the delimiter row).
-    aligns: Vec<Option<&'static str>>,
+    /// Per-column alignment (parsed once from the delimiter row). `Rc`-shared so
+    /// the per-patch `TableData` emit is a refcount bump, not a `Vec` clone.
+    aligns: Rc<Vec<Option<&'static str>>>,
     /// `true` once we've emitted `<tbody>` into `cached_prefix` (after the first
     /// committed body row). The trailing partial-row path emits its own `<tbody>`
     /// when speculatively rendering the very first row of the body.
     tbody_opened: bool,
     /// Structured `kind.data` channel (only populated when `block_data` is on):
     /// the header cells (locked once, parallel to the `<thead>` in
-    /// `cached_prefix`). Empty + unused when off.
-    header_cells: Vec<TableCell>,
+    /// `cached_prefix`), `Rc`-shared so the per-patch emit is a refcount bump.
+    /// Empty + unused when off.
+    header_cells: Rc<Vec<TableCell>>,
     /// Structured channel: the committed body-row cells, pushed at the exact
     /// step a row's `<tr>` is folded into `cached_prefix` so DATA never diverges
     /// from HTML. The speculative trailing partial row is NOT stored here (it is
@@ -707,8 +718,10 @@ struct ContainerCache {
     /// trailing `\n`), pushed in lock-step with `committed_paras_html` so a
     /// keyed override gets one stable, memoizable entry per committed paragraph.
     /// The still-open current paragraph is appended fresh each patch (mirroring
-    /// `partial_html` in the table cache). Empty + unused when off.
-    committed_paras: Vec<NestedBlock>,
+    /// `partial_html` in the table cache). `Rc`-shared so the per-patch re-emit
+    /// is O(paras) refcount bumps, not O(para bytes) `String` clones. Empty +
+    /// unused when off.
+    committed_paras: Vec<Rc<NestedBlock>>,
     /// Stripped inner content of the CURRENT (still-open) paragraph, one
     /// `\n`-terminated line per processed source line. Cleared on close.
     inner_buffer: String,
@@ -766,9 +779,14 @@ enum ContainerCacheKind {
 /// is preserved because the container only ever commits through a full outer
 /// reparse, which re-collects refs from source. The cache BAILS to the full
 /// reparse (correct, just O(n²)) on anything the nested parser can't reproduce
-/// identically: a `\r` (CRLF), a non-`>` lazy continuation line, a footnote
-/// ref/def (`[^` with footnotes on — numbering is document-global), or
-/// `block_data` (the nested `ContainerData` channel is not populated in v1).
+/// identically: a `\r` (CRLF), a non-`>` lazy continuation line, or a footnote
+/// ref/def (`[^` with footnotes on — numbering is document-global).
+///
+/// `block_data` is owned here too: the nested `ContainerData` channel emits one
+/// `NestedBlock { html }` per inner block, which matches `render_blockquote` /
+/// `render_alert` byte-for-byte because those build their `nested` fragments at
+/// exactly the per-sub-block boundaries this cache joins with `\n` (the same
+/// invariant the wrapper HTML parity rests on).
 struct ContainerBlockCache {
     /// Absolute byte offset of the container's first line in `buffer`.
     start: usize,
@@ -799,6 +817,13 @@ struct ContainerBlockCache {
     /// Whether the outer parser has footnotes on (then a `[^` inner marker BAILS,
     /// since the nested parser runs with footnotes off).
     footnotes: bool,
+    /// Structured `kind.data` channel (only populated when the OUTER parser's
+    /// `block_data` is on — the nested parser itself runs with it off): one
+    /// `Rc`-shared `NestedBlock` per COMMITTED inner sub-block, folded exactly
+    /// once when the nested parser commits it (committed blocks never change).
+    /// The still-open inner blocks are appended fresh per emit, mirroring the
+    /// table cache's committed-rows-then-partial pattern. Empty + unused when off.
+    committed_nested: Vec<Rc<NestedBlock>>,
 }
 
 /// Incremental render state for a single open *flat* list at the tail — the
@@ -903,8 +928,10 @@ struct ListCache {
     /// Per-item inner `<li>` HTML for the opt-in `kind.data` channel — one entry
     /// per `items` span, parallel to `cached_prefix`. Empty unless `block_data` is
     /// on; surfaced on the active block's `BlockKind::List { items }` so the keyed
-    /// renderer reuses unchanged item nodes while the list streams.
-    item_html: Vec<ListItemData>,
+    /// renderer reuses unchanged item nodes while the list streams. `Rc`-shared
+    /// (mirroring `TableData::rows`) so the per-patch re-emit of all committed
+    /// items is O(items) refcount bumps, not O(item bytes) `String` clones.
+    item_html: Vec<Rc<ListItemData>>,
     /// Footnote occurrence map for the FROZEN prefix (`cached_prefix` +
     /// `item_html`). Seeded from the committed occurrence counts at arm time and
     /// advanced when an item's placeholder tokens are resolved into the prefix.
@@ -1042,6 +1069,12 @@ struct IndentedCodeCache {
     /// trailing `\n`. Whitespace bytes survive `escape_html` unchanged, so
     /// trimming this matches trimming the decoded source.
     escaped_lines: String,
+    /// RAW (unescaped) twin of `escaped_lines`, extended in lock-step — only when
+    /// `block_data` is on (empty + unused otherwise). The opt-in `kind.data.code`
+    /// assembles from this directly, so the per-append emit is a memcpy instead of
+    /// an O(body) entity decode of the assembled HTML. Interior blank lines fold
+    /// into both twins at the same points, so the trailing trims stay identical.
+    decoded_lines: String,
     /// Absolute offset just past the last complete body line's `\n`.
     lines_upto: usize,
 }
@@ -1694,7 +1727,7 @@ impl StreamParser {
                 // CodeBlock keeps its classified `lang`; only `code` is folded on.
                 Some(Enrichment::CodeBlock(code)) => {
                     if let BlockKind::CodeBlock { lang, .. } = kind {
-                        kind = BlockKind::CodeBlock { lang, code: Some(code) };
+                        kind = BlockKind::CodeBlock { lang, code: Some(Rc::new(code)) };
                     }
                 }
                 Some(Enrichment::MathBlock(md)) => kind = BlockKind::MathBlock(Some(md)),
@@ -2169,8 +2202,12 @@ impl StreamParser {
                         );
                     }
                     RawBlockKind::IndentedCode => {
-                        self.indented_cache =
-                            build_indented_cache(&self.buffer, start, new_active[0].id);
+                        self.indented_cache = build_indented_cache(
+                            &self.buffer,
+                            start,
+                            new_active[0].id,
+                            self.block_data,
+                        );
                     }
                     RawBlockKind::HtmlBlock { closed: false } => {
                         self.html_cache =
@@ -2324,22 +2361,43 @@ impl StreamParser {
                 html.push('\n');
             }
         }
-        // Opt-in structured channel: recover the decoded source from the just-
-        // assembled, already-trimmed HTML body (`html[body_start..]`, before the
-        // closer) by inverting `escape_html`. This makes the streamed `kind.data`
-        // byte-identical to the full path / `decodeCodeText`/`decodeMathText`, with
-        // no parallel raw-source state in the cache. Off (or for a Mermaid fence,
-        // which carries no enrichment) ⇒ the frozen `cache.kind` is reused as-is.
-        let kind = if self.block_data {
-            let src = crate::render::unescape_html_body(&html[body_start..]);
+        // Opt-in structured channel: the decoded source. The HTML body just
+        // assembled is exactly `escape_html(buffer[cache.body_start..end])` plus
+        // the trailing trim, and whitespace passes `escape_html` unchanged, so the
+        // decoded source is the RAW buffer slice with the SAME trim — byte-identical
+        // to inverting the escape, without the O(body) per-append entity decode
+        // (which made a long streamed fence an O(n²) wall cliff under `block_data`).
+        // The trim is driven by `trim_body`, not the carrier kind: a ```math fence
+        // carries MathBlock data with the code-fence trim, exactly like the full
+        // path (`render_code_fence` → `MathBlockData`). Off (or for a Mermaid
+        // fence, which carries no enrichment) ⇒ the frozen `cache.kind` is cloned
+        // (a refcount bump for any `Rc` payload).
+        let kind = if self.block_data
+            && matches!(cache.kind, BlockKind::CodeBlock { .. } | BlockKind::MathBlock(_))
+        {
+            let raw_body = &self.buffer[cache.body_start..end];
+            let src = if cache.trim_body {
+                // Math: mirror the whitespace trim above (leading whitespace was
+                // already skipped at arm time via `body_start`).
+                raw_body.trim_end_matches([' ', '\t', '\n', '\r']).to_string()
+            } else {
+                // Code: mirror `render_code_fence` + `code_body_source` — strip all
+                // trailing `\n`/`\r`, then a single `\n` iff the body is non-empty.
+                let trimmed = raw_body.trim_end_matches(['\n', '\r']);
+                let mut s = String::with_capacity(trimmed.len() + 1);
+                s.push_str(trimmed);
+                if !s.is_empty() {
+                    s.push('\n');
+                }
+                s
+            };
             match &cache.kind {
                 BlockKind::CodeBlock { lang, .. } => {
-                    BlockKind::CodeBlock { lang: lang.clone(), code: Some(src) }
+                    BlockKind::CodeBlock { lang: lang.clone(), code: Some(Rc::new(src)) }
                 }
-                BlockKind::MathBlock(_) => {
-                    BlockKind::MathBlock(Some(crate::blocks::MathBlockData { latex: src }))
-                }
-                other => other.clone(),
+                _ => BlockKind::MathBlock(Some(crate::blocks::MathBlockData {
+                    latex: Rc::new(src),
+                })),
             }
         } else {
             cache.kind.clone()
@@ -2397,8 +2455,15 @@ impl StreamParser {
                     }
                     if !cache.escaped_lines.is_empty() {
                         cache.escaped_lines.push('\n');
+                        if self.block_data {
+                            cache.decoded_lines.push('\n');
+                        }
                     }
                     push_indented_content(line, &mut cache.escaped_lines);
+                    if self.block_data {
+                        let raw = indented_strip(line);
+                        cache.decoded_lines.push_str(std::str::from_utf8(raw).unwrap_or(""));
+                    }
                     cache.lines_upto = next;
                     pos = next;
                 }
@@ -2434,12 +2499,26 @@ impl StreamParser {
         }
         let trimmed = html.trim_end_matches([' ', '\t', '\n', '\r']).len();
         html.truncate(trimmed.max(body_start));
-        // Opt-in structured channel: the decoded source is the trimmed body + "\n",
-        // recovered by inverting escape_html — byte-identical to the full path.
+        // Opt-in structured channel: the decoded source is the trimmed body + "\n".
+        // The HTML body is `escape_html(decoded_lines [+ '\n' + stripped partial])`
+        // with the same trailing trim, and whitespace passes `escape_html`
+        // unchanged, so assembling from the RAW `decoded_lines` twin is
+        // byte-identical to inverting the escape — without the O(body) per-append
+        // entity decode (an O(n²) wall cliff under `block_data`).
         let kind = if self.block_data {
-            let mut code = crate::render::unescape_html_body(&html[body_start..]);
+            let mut code =
+                String::with_capacity(cache.decoded_lines.len() + partial.len() + 2);
+            code.push_str(&cache.decoded_lines);
+            if !partial_blank {
+                if !cache.decoded_lines.is_empty() {
+                    code.push('\n');
+                }
+                code.push_str(std::str::from_utf8(indented_strip(partial)).unwrap_or(""));
+            }
+            let t = code.trim_end_matches([' ', '\t', '\n', '\r']).len();
+            code.truncate(t);
             code.push('\n');
-            BlockKind::CodeBlock { lang: None, code: Some(code) }
+            BlockKind::CodeBlock { lang: None, code: Some(Rc::new(code)) }
         } else {
             BlockKind::CodeBlock { lang: None, code: None }
         };
@@ -2898,15 +2977,16 @@ impl StreamParser {
         // the speculative partial row (if any), exactly mirroring the HTML the
         // consumer renders. emit-on-every-patch so DATA never lags HTML.
         let kind = if opts.block_data {
-            // O(rows) Rc refcount bumps, not an O(cells) String deep clone.
+            // O(rows) Rc refcount bumps, not an O(cells) String deep clone — the
+            // headers/aligns clones are Rc bumps too.
             let mut rows = cache.body_cells.clone();
             if let Some(row) = partial_row {
                 rows.push(Rc::new(row));
             }
             BlockKind::Table(Some(TableData {
-                headers: cache.header_cells.clone(),
+                headers: Rc::clone(&cache.header_cells),
                 rows,
-                aligns: cache.aligns.clone(),
+                aligns: Rc::clone(&cache.aligns),
             }))
         } else {
             BlockKind::Table(None)
@@ -3372,12 +3452,12 @@ impl StreamParser {
         }
 
         // Assemble the opt-in `nested` channel: the stable committed paragraphs
-        // (O(paras) clone of cheap entries) plus the current open paragraph.
+        // (O(paras) Rc refcount bumps) plus the current open paragraph.
         // emit-on-every-patch so DATA never lags HTML, mirroring the table cache.
         let container_data = if opts.block_data {
             let mut nested = cache.committed_paras.clone();
             if let Some(p) = open_para_html {
-                nested.push(NestedBlock { html: p });
+                nested.push(Rc::new(NestedBlock { html: p }));
             }
             Some(ContainerData { nested })
         } else {
@@ -3440,9 +3520,32 @@ impl StreamParser {
         cache.last_fed = last_fed;
 
         let html = assemble_container_block(&cache);
+        // Opt-in structured channel: one `NestedBlock` per inner sub-block —
+        // byte-identical to `render_blockquote` / `render_alert`, whose `nested`
+        // fragments are captured at exactly these per-block boundaries. Committed
+        // inner blocks fold once (Rc bump per re-emit); the open inner tail is
+        // rebuilt fresh each append, mirroring the table cache.
+        let container_data = if self.block_data {
+            for b in &cache.inner.committed_blocks[cache.committed_nested.len()..] {
+                cache.committed_nested.push(Rc::new(NestedBlock { html: b.html.clone() }));
+            }
+            let mut nested = cache.committed_nested.clone();
+            nested.extend(
+                cache
+                    .inner
+                    .active_blocks
+                    .iter()
+                    .map(|b| Rc::new(NestedBlock { html: b.html.clone() })),
+            );
+            Some(ContainerData { nested })
+        } else {
+            None
+        };
         let kind = match cache.kind {
-            ContainerCacheKind::Blockquote => BlockKind::Blockquote(None),
-            ContainerCacheKind::Alert(ak) => BlockKind::Alert { kind: ak, nested: None },
+            ContainerCacheKind::Blockquote => BlockKind::Blockquote(container_data),
+            ContainerCacheKind::Alert(ak) => {
+                BlockKind::Alert { kind: ak, nested: container_data }
+            }
         };
         let block = Block {
             id: cache.id,
@@ -3491,11 +3594,10 @@ impl StreamParser {
     /// Arm the structured-container cache for an open blockquote / alert at
     /// `start`. Returns `None` (no cache → full reparse) when the nested parser
     /// could not reproduce the inner byte-for-byte: an incomplete first line (the
-    /// Blockquote/Alert distinction isn't settled), a wrong block kind,
-    /// `block_data` (v1 doesn't fill the nested data channel), or any of the feed
-    /// BAILs (CRLF / lazy continuation / footnote marker with footnotes on). The
-    /// first feed processes every line already present; later appends fold only
-    /// new bytes.
+    /// Blockquote/Alert distinction isn't settled), a wrong block kind, or any of
+    /// the feed BAILs (CRLF / lazy continuation / footnote marker with footnotes
+    /// on). The first feed processes every line already present; later appends
+    /// fold only new bytes.
     fn build_container_block_cache(
         &self,
         start: usize,
@@ -3503,11 +3605,6 @@ impl StreamParser {
         block_kind: &BlockKind,
         opts: &RenderOpts,
     ) -> Option<ContainerBlockCache> {
-        // The nested `ContainerData` channel isn't populated yet — let the full
-        // reparse own block_data containers (correct, just O(n²)).
-        if opts.block_data {
-            return None;
-        }
         let bytes = self.buffer.as_bytes();
         let end = bytes.len();
         // Require a complete first line so Blockquote vs. Alert is settled.
@@ -3581,6 +3678,7 @@ impl StreamParser {
             mid_line,
             last_fed,
             footnotes: self.gfm_footnotes,
+            committed_nested: Vec::new(),
         })
     }
 
@@ -4134,7 +4232,7 @@ impl StreamParser {
         }
 
         let mut partial_html = String::new();
-        let mut partial_item: Vec<ListItemData> = Vec::new();
+        let mut partial_item: Vec<Rc<ListItemData>> = Vec::new();
         if partial_is_sibling {
             // The open item [open_item_start..lines_upto] is complete; the partial
             // starts a new sibling. A preceding blank — or a §5.3 interior gap in
@@ -4246,9 +4344,10 @@ impl StreamParser {
 
         // Opt-in structured channel: surface the per-item inner HTML (committed
         // items + the speculative open/partial item(s)) on the active block so the
-        // keyed renderer reuses unchanged item nodes mid-stream. Off ⇒ empty
-        // (omitted on the wire, byte-identical).
-        let items: Vec<ListItemData> = if block_data {
+        // keyed renderer reuses unchanged item nodes mid-stream. The committed
+        // entries clone as Rc refcount bumps. Off ⇒ empty (omitted on the wire,
+        // byte-identical).
+        let items: Vec<Rc<ListItemData>> = if block_data {
             let mut v = Vec::with_capacity(cache.item_html.len() + partial_item.len());
             v.extend_from_slice(&cache.item_html);
             v.append(&mut partial_item);
@@ -4862,6 +4961,7 @@ fn build_code_fence_cache(
         closer_html: "</code></pre>",
         close: FenceClose::CodeFence,
         trim_body: false,
+        body_start,
         escaped_lines,
         has_body_line,
         lines_upto,
@@ -4939,6 +5039,7 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
         closer_html: "</div>",
         close: FenceClose::MathCloser(closer),
         trim_body: true,
+        body_start,
         escaped_lines,
         has_body_line,
         lines_upto,
@@ -5035,9 +5136,9 @@ fn build_table_cache(
         cached_prefix,
         lines_upto: body_start,
         ncol,
-        aligns,
+        aligns: Rc::new(aligns),
         tbody_opened: false,
-        header_cells: td_header_cells,
+        header_cells: Rc::new(td_header_cells),
         body_cells: Vec::new(),
         fn_occ,
         fn_nums: RegionFnNums::new(start, fn_next),
@@ -5073,7 +5174,7 @@ fn close_container_paragraph(cache: &mut ContainerCache, opts: &RenderOpts) {
         html.push_str(&cache.body_p_open);
         html.push_str(&final_text);
         html.push_str("</p>");
-        cache.committed_paras.push(NestedBlock { html });
+        cache.committed_paras.push(Rc::new(NestedBlock { html }));
     }
     cache.inner_buffer.clear();
     cache.inner_cut = 0;
@@ -5289,7 +5390,7 @@ fn fold_item_body(
     loose: bool,
     opts: &RenderOpts,
     out: &mut String,
-    html_sink: Option<&mut Vec<ListItemData>>,
+    html_sink: Option<&mut Vec<Rc<ListItemData>>>,
     base: &HashMap<String, usize>,
     over: &mut HashMap<String, usize>,
 ) -> Option<()> {
@@ -5301,7 +5402,7 @@ fn fold_item_body(
         let mut seed = over.clone();
         let mut inner = String::with_capacity(hi - lo);
         resolve_footnote_ids_overlay(&tmp[lo..hi], base, &mut seed, &mut inner);
-        sink.push(ListItemData { html: inner });
+        sink.push(Rc::new(ListItemData { html: inner }));
     }
     resolve_footnote_ids_overlay(&tmp, base, over, out);
     out.push('\n');
@@ -5660,9 +5761,9 @@ fn indented_code_line(line: &[u8]) -> bool {
 }
 
 /// Strip up to 4 columns of leading indent from `line` (content only) — one tab
-/// is consumed whole and stops the strip — then escape the remainder into `out`.
-/// Mirrors the per-line stripping in `render_indented_code`.
-fn push_indented_content(line: &[u8], out: &mut String) {
+/// is consumed whole and stops the strip. Mirrors the per-line stripping in
+/// `render_indented_code`.
+fn indented_strip(line: &[u8]) -> &[u8] {
     let mut i = 0usize;
     let mut consumed = 0usize;
     while i < line.len() && consumed < 4 {
@@ -5678,7 +5779,12 @@ fn push_indented_content(line: &[u8], out: &mut String) {
             _ => break,
         }
     }
-    escape_html(std::str::from_utf8(&line[i..]).unwrap_or(""), out);
+    &line[i..]
+}
+
+/// [`indented_strip`] + escape the remainder into `out`.
+fn push_indented_content(line: &[u8], out: &mut String) {
+    escape_html(std::str::from_utf8(indented_strip(line)).unwrap_or(""), out);
 }
 
 /// True iff this `line` ends the open HTML block of `html_type` — the
@@ -5713,10 +5819,16 @@ fn fold_html_line(line: &[u8], pass_through: bool, out: &mut String) {
 /// `try_incremental_indented`, so the cache can arm on a region that already
 /// contains blanks). Returns `None` (no caching) if a non-blank line dedents or
 /// any line contains a `\r` — those keep going through the full renderer.
-fn build_indented_cache(buffer: &str, start: usize, id: u64) -> Option<IndentedCodeCache> {
+fn build_indented_cache(
+    buffer: &str,
+    start: usize,
+    id: u64,
+    block_data: bool,
+) -> Option<IndentedCodeCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
     let mut escaped_lines = String::new();
+    let mut decoded_lines = String::new();
     let mut lines_upto = start;
     let mut pos = start;
     while pos < end {
@@ -5732,8 +5844,15 @@ fn build_indented_cache(buffer: &str, start: usize, id: u64) -> Option<IndentedC
                 }
                 if !escaped_lines.is_empty() {
                     escaped_lines.push('\n');
+                    if block_data {
+                        decoded_lines.push('\n');
+                    }
                 }
                 push_indented_content(line, &mut escaped_lines);
+                if block_data {
+                    let raw = indented_strip(line);
+                    decoded_lines.push_str(std::str::from_utf8(raw).unwrap_or(""));
+                }
                 lines_upto = next;
                 pos = next;
             }
@@ -5749,7 +5868,7 @@ fn build_indented_cache(buffer: &str, start: usize, id: u64) -> Option<IndentedC
     if !partial_blank && !indented_code_line(partial) {
         return None;
     }
-    Some(IndentedCodeCache { start, id, escaped_lines, lines_upto })
+    Some(IndentedCodeCache { start, id, escaped_lines, decoded_lines, lines_upto })
 }
 
 /// Arm the raw-HTML-block cache for the open block at `start`, walking its body

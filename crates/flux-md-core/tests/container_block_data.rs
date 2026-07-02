@@ -257,3 +257,51 @@ fn nested_fragments_are_in_block_html_at_every_append() {
         }
     }
 }
+
+/// STRUCTURED inner content (lists, headings, fences) streams through the
+/// recursive `ContainerBlockCache` — which now owns `block_data` too, emitting
+/// one `NestedBlock` per inner sub-block. At every prefix, the streamed
+/// container's `kind` (nested data included) and `html` must match a fresh
+/// one-shot parse of that same prefix — the cache-vs-full-path byte contract.
+/// (Before the fix the cache bailed outright under `block_data`, so this path
+/// was only ever exercised by the O(n²) full reparse.)
+#[test]
+fn structured_body_data_matches_one_shot_at_every_prefix() {
+    let cases = [
+        "> [!NOTE]\n> - point 0 with **bold**\n> - point 1 more\n> - point 2\n\nafter\n",
+        "> - point 0 with **bold** and `code`\n> - point 1\n> - point 2\n",
+        "> ## heading\n> - a\n> - b\n>\n> outro **para**\n",
+        "> [!WARNING]\n> ```\n> fenced\n> ```\n> - tail item\n",
+        "> [r0]: https://example.com/0\n> [r1]: https://example.com/1\n> see [text][r0]\n",
+    ];
+    for md in cases {
+        for chunk in [1usize, 3, 7] {
+            let mut p = StreamParser::new().with_block_data(true).with_gfm_alerts(true);
+            let b = md.as_bytes();
+            let mut i = 0;
+            while i < b.len() {
+                let mut e = (i + chunk).min(b.len());
+                while e < b.len() && (b[e] & 0xC0) == 0x80 {
+                    e += 1;
+                }
+                p.append(&md[i..e]);
+                let mut q = StreamParser::new().with_block_data(true).with_gfm_alerts(true);
+                q.append(&md[..e]);
+                let ps: Vec<(String, String)> = p
+                    .all_blocks()
+                    .map(|b| (serde_json::to_string(&b.kind).unwrap(), b.html.clone()))
+                    .collect();
+                let qs: Vec<(String, String)> = q
+                    .all_blocks()
+                    .map(|b| (serde_json::to_string(&b.kind).unwrap(), b.html.clone()))
+                    .collect();
+                assert_eq!(
+                    ps, qs,
+                    "streamed kind/html diverged from one-shot at prefix {e} (chunk {chunk}) for {md:?}"
+                );
+                i = e;
+            }
+            p.finalize();
+        }
+    }
+}

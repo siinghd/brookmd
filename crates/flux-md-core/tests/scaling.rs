@@ -189,6 +189,19 @@ fn big_blockquote(target: usize) -> String {
     )
 }
 
+fn quote_many_paras(target: usize) -> String {
+    // A prose blockquote whose body is MANY short inner paragraphs (each blank
+    // `>` line closes one) — the ContainerCache shape whose committed-paras data
+    // channel re-emits per append. Kept linear by the Rc-shared committed entries.
+    let mut s = String::with_capacity(target + 32);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("> para {i} with some **bold** prose here\n>\n"));
+        i += 1;
+    }
+    s
+}
+
 fn bq_lazy_continuation(target: usize) -> String {
     // One `>` line, then marker-less lazy paragraph-continuation lines forever
     // (CommonMark laziness). The container cache used to bail on every lazy
@@ -709,18 +722,6 @@ fn crlf_alert_with_list(target: usize) -> String {
     big_alert(target).replace('\n', "\r\n")
 }
 
-/// blockdata-disables-container-cache: same shape as `big_alert`, but
-/// `block_data` ON disables the recursive container cache.
-fn blockdata_alert(target: usize) -> String {
-    big_alert(target)
-}
-
-/// blockdata-per-append-rebuild: `block_data` ON rebuilds the structured data
-/// channel for the open block from scratch every append (wall-only cliff).
-fn blockdata_math(target: usize) -> String {
-    big_math(target)
-}
-
 /// list-interior-blank-loose-bail (FIXED): indented code with a legal interior
 /// blank every 20 lines used to permanently disarm the IndentedCodeCache
 /// (bail + re-arm walk died on the same blank), so the never-committing
@@ -802,12 +803,24 @@ fn shapes() -> Vec<Shape> {
     let footnotes = Opts { footnotes: true, ..base };
     let block_data = Opts { block_data: true, ..base };
     let chart_tag = Opts { component_tags: &["Chart"], ..base };
+    // A `block_data = true` twin of a cached linear shape (same span/chunk).
+    let bd = |name: &'static str, gen: fn(usize) -> String| Shape {
+        name,
+        gen,
+        opts: block_data,
+        chunk: CHUNK,
+        small: SMALL,
+        large: LARGE,
+        scanned: Expect::Linear,
+        rendered: Expect::Linear,
+    };
     let mut v = vec![
         // -- shapes that MUST stay linear (commit regularly or have a cache) --
         lin("mixed", mixed, Linear),
         lin("many_paragraphs", many_paragraphs, Linear),
         lin("big_list", big_list, Linear), // flat list -> ListCache (incremental)
         lin("big_blockquote", big_blockquote, Linear), // prose quote -> ContainerCache
+        lin("quote_many_paras", quote_many_paras, Linear), // multi-para quote -> ContainerCache
         // Structured-inner containers -> ContainerBlockCache (recursive nested
         // parser, incremental). Was O(n²) (the 0.18.4 flicker fix bailed to a
         // full reparse every append); now streams linearly.
@@ -880,6 +893,26 @@ fn shapes() -> Vec<Shape> {
         lin("quote_ref_defs", quote_ref_defs, Linear),
         lin("quote_footnote_defs", quote_footnote_defs, Linear),
         lin("bq_lazy_continuation", bq_lazy_continuation, Linear),
+        // `block_data` twins of the cached shapes (hunt groups
+        // blockdata-disables-container-cache + blockdata-per-append-rebuild,
+        // FIXED): the structured `kind.data` channel must never disarm an
+        // incremental cache or change its scan profile. The container-block
+        // cache used to bail outright under `block_data` (247x counter on an
+        // alert/quote with a structured body — it now owns the nested
+        // `ContainerData` channel); the armed caches used to rebuild their full
+        // data payload per append (fence/indented whole-body entity decode,
+        // deep-cloned list items / container paras / table headers) — counter-
+        // linear but a 3–87x wall multiplier, fixed by raw-slice derivation +
+        // `Rc`-shared committed entries. The wall half can't gate
+        // deterministically; these twins pin the arm/disarm + scan profile.
+        bd("blockdata_alert", big_alert),
+        bd("blockdata_blockquote", blockquote_with_list),
+        bd("blockdata_quote_paras", quote_many_paras),
+        bd("blockdata_big_list", big_list),
+        bd("blockdata_nested_list", nested_loose_list),
+        bd("blockdata_big_table", big_table),
+        bd("blockdata_big_code", big_code),
+        bd("blockdata_big_math", big_math),
         // Footnote shapes (hunt group footnote-global-state, FIXED): def-run
         // tails commit up to the last def opener, the per-cache footnote
         // numbering extends over only NEW bytes (`RegionFnNums`, self-counted
@@ -968,7 +1001,9 @@ fn shapes() -> Vec<Shape> {
         // to a linear shape above (the render-side win is wall-only).
         // compute-cut-pair-overlap-scan: FIXED — em_pairs_para promoted above.
         // crlf-cache-bail: FIXED — promoted to the seven crlf_* linear twins above.
-        quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
+        // blockdata-per-append-rebuild: FIXED — the armed caches derive the data
+        // channel from the raw source / Rc-shared committed entries; promoted to
+        // the blockdata_* linear twins above.
         // Residual first-line-incomplete container pins (both container caches
         // need a complete first line before Blockquote-vs-Alert settles).
         quad("container-first-line-pin", quote_giant_line, base, KnownQuadratic, KnownQuadratic),
@@ -998,16 +1033,9 @@ fn shapes() -> Vec<Shape> {
         scanned: KnownQuadratic,
         rendered: KnownQuadratic,
     });
-    v.push(Shape {
-        name: "blockdata-disables-container-cache",
-        gen: blockdata_alert,
-        opts: block_data,
-        chunk: CHUNK,
-        small: 4 * 1024,
-        large: 32 * 1024,
-        scanned: KnownQuadratic,
-        rendered: KnownQuadratic,
-    });
+    // blockdata-disables-container-cache: FIXED — the ContainerBlockCache owns
+    // `block_data` now (nested `ContainerData` per committed inner block);
+    // promoted to the blockdata_alert / blockdata_blockquote linear twins above.
     // The DEPTH half of container-stack-churn-lazy remains: per-line O(depth)
     // marker restripping past MAX_CONTAINER_DEPTH is slightly worse than pure
     // n² (~104x across this 8x span); the quad guard leaves headroom over the

@@ -23,7 +23,7 @@ fn finalize(md: &str, block_data: bool) -> StreamParser {
 fn first_latex(p: &StreamParser) -> Option<String> {
     for b in p.all_blocks() {
         if let BlockKind::MathBlock(Some(md)) = &b.kind {
-            return Some(md.latex.clone());
+            return Some((*md.latex).clone());
         }
     }
     None
@@ -85,7 +85,7 @@ fn latex_equals_decoded_html_body() {
         for b in p.all_blocks() {
             if let BlockKind::MathBlock(Some(data)) = &b.kind {
                 let decoded = decode_math_html(&b.html);
-                assert_eq!(data.latex, decoded, "latex must equal decoded body for {md:?}");
+                assert_eq!(*data.latex, decoded, "latex must equal decoded body for {md:?}");
             }
         }
     }

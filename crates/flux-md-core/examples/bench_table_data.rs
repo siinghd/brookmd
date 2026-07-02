@@ -118,7 +118,7 @@ fn touch_blocks<'a>(blocks: impl Iterator<Item = &'a Block>) -> usize {
     for b in blocks {
         total += b.html.len();
         if let BlockKind::Table(Some(td)) = &b.kind {
-            for h in &td.headers {
+            for h in td.headers.iter() {
                 total += h.text.len() + h.html.len();
             }
             for row in &td.rows {
