@@ -15,9 +15,10 @@ use crate::render::{
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
 use crate::scanner::{
-    count_table_columns, detect_html_block_open, html_block_line_closes, indent_cols, is_blank_line,
-    is_setext_underline, is_table_delimiter_row, line_end, line_slice, parse_link_ref_def, scan,
-    scan_marker, would_start_other_block, MarkerScan, RawBlock, RawBlockKind, ScanCtx,
+    component_inner_range, component_open_tag, count_table_columns, detect_html_block_open,
+    html_block_line_closes, indent_cols, is_blank_line, is_clean_close_tag, is_setext_underline,
+    is_table_delimiter_row, line_end, line_slice, parse_link_ref_def, scan, scan_marker,
+    strip_indent, would_start_other_block, MarkerScan, RawBlock, RawBlockKind, ScanCtx,
 };
 
 /// True when a *stripped* container (blockquote/alert) inner line is NOT plain
@@ -41,7 +42,7 @@ fn container_inner_breaks_paragraph(stripped: &[u8], ctx: ScanCtx<'_>) -> bool {
         || indent_cols(stripped) >= 4
 }
 use crate::inline::{render_inline, render_inline_boundary};
-use crate::url::escape_html;
+use crate::url::{escape_attr, escape_html, sanitize_attrs};
 
 /// Collect link reference definitions from `text` into `refs`, recursing into
 /// block quotes and list items (definitions are document-wide, §4.7). `ctx`
@@ -294,6 +295,22 @@ pub struct StreamParser {
     /// then so a `\r|\n` split across appends stays chunk-independent;
     /// `finalize` flushes a still-pending `\r` as `\n`. See [`Self::ingest`].
     pending_cr: bool,
+    /// Fast path for a long open component block (`<Tag>` whose close hasn't
+    /// arrived) at the tail (see [`ComponentBlockCache`]). Like the structured
+    /// container cache, the markdown body streams through a recursive nested
+    /// `StreamParser` in O(new bytes).
+    component_cache: Option<ComponentBlockCache>,
+    /// Fast path for a still-growing single-line ATX heading at the tail (see
+    /// [`HeadingCache`] — the paragraph cache's settled-prefix scheme in an
+    /// `<hN>` wrapper).
+    heading_cache: Option<HeadingCache>,
+    /// Fast path for a still-growing thematic-break line at the tail (see
+    /// [`RuleCache`] — the output is a constant `<hr>`).
+    rule_cache: Option<RuleCache>,
+    /// Fast path for a code fence whose OPENING line (the info string) is still
+    /// growing (see [`FenceInfoCache`] — output depends only on the settled
+    /// first info word, so it is frozen).
+    fence_info_cache: Option<FenceInfoCache>,
 }
 
 #[derive(Default)]
@@ -1039,6 +1056,144 @@ struct HtmlBlockCache {
     lines_upto: usize,
 }
 
+/// Incremental render state for a single open COMPONENT block (`<Tag>` whose
+/// matching close line hasn't arrived) at the tail. The component is one atomic,
+/// never-committing block whose body is markdown, so the full reparse re-scans +
+/// re-renders the whole growing body every append (O(n²) — the streaming
+/// `<Chart>` shape). This is [`ContainerBlockCache`] without the `>`-stripping:
+/// the body bytes past the open tag's `>` feed a recursive nested
+/// [`StreamParser`] RAW, and the active block reassembles as
+/// `<Tag attrs>` + inner sub-blocks + `</Tag>` — byte-identical to
+/// `render_component` (same wrapper builder, same `\n` joins, same
+/// `!sub.is_empty()` leading newline).
+///
+/// The close / fence / same-tag-nesting line classification mirrors
+/// `scan_component_block` exactly, so the cache BAILS to the full reparse at the
+/// precise line where the scanner would terminate the block. It also bails on
+/// the scoping markers the nested parser can't reproduce (`[^` when footnotes
+/// are on; `]:` link-ref defs — both document-global), on `\r`, and on a
+/// blank-line-terminated buffer (the full rescan then renders the whole
+/// component with `open_tail = false`, which the nested parser's frozen
+/// `force_open_tail` commits can't match).
+struct ComponentBlockCache {
+    /// Absolute byte offset of the component's open-tag line in `buffer`.
+    start: usize,
+    /// Stable id of the component block (preserved across appends and the close).
+    id: u64,
+    /// Component tag name (allowlisted; drives the close/nesting line tracking).
+    tag: String,
+    /// Frozen `BlockKind::Component { tag, attrs }` from arm time — the open tag
+    /// line is complete, so the sanitized attrs can never change.
+    kind: BlockKind,
+    /// Wrapper opener `<Tag attrs>`, built with the same `sanitize_attrs` +
+    /// `escape_attr` as `render_component`.
+    wrapper_open: String,
+    /// Wrapper closer `</Tag>`.
+    wrapper_close: String,
+    /// The recursive parser rendering the raw body markdown. Fed only the
+    /// per-append delta; its `all_blocks()` are the inner sub-blocks.
+    inner: Box<StreamParser>,
+    /// Absolute outer-buffer offset already fed to `inner` (everything past the
+    /// open tag's `>` feeds raw — the body IS the inner markdown).
+    fed_upto: usize,
+    /// Absolute offset of the first not-yet-classified line. The close/fence/
+    /// nesting scan is line-based; complete lines classify exactly once.
+    lines_upto: usize,
+    /// Same-tag nesting depth, mirroring `scan_component_block` (starts at 1;
+    /// the outer block terminates when a clean close line brings it to 0).
+    depth: usize,
+    /// Code-fence toggle state, mirroring `scan_component_block` (a `</Tag>`
+    /// line inside a ``` fence is content, not a close).
+    in_fence: bool,
+    /// Last byte fed to `inner` (for catching a `[^` / `]:` marker split across
+    /// two feeds). `None` until the first non-empty feed.
+    last_fed: Option<u8>,
+    /// Whether the outer parser has footnotes on (then a `[^` body marker BAILS,
+    /// since the nested parser runs with footnotes off).
+    footnotes: bool,
+}
+
+/// Incremental render state for a still-growing single-line ATX heading at the
+/// tail — the giant-`# …` streaming shape. A heading has no cache arm otherwise,
+/// so every append re-scans + re-`render_inline`s the whole growing line
+/// (O(n²); with early-open emphasis the re-render itself is superlinear, going
+/// ~cubic in wall time). This is the [`ParagraphCache`] settled-prefix scheme in
+/// an `<hN>` wrapper: `render_inline_boundary` commits the construct-free prefix
+/// once and only the short active tail re-renders per append.
+///
+/// The heading-specific part is the CONTENT WINDOW: `render_heading` strips the
+/// leading `#`s + whitespace (frozen once content exists — the line only grows
+/// at its end) and, per append, the trailing spaces plus an optional closing-`#`
+/// run (only when preceded by space/tab). The trim is recomputed each append
+/// (O(trailing run)); if it ever reaches back into the frozen prefix the cache
+/// bails. Any newline ends the single-line heading — bail, full path owns it.
+struct HeadingCache {
+    /// Absolute byte offset of the heading's first byte (its indent/`#`s).
+    start: usize,
+    /// Stable id of the heading block.
+    id: u64,
+    /// ATX level (1–6), locked once content exists.
+    level: u8,
+    /// Absolute offset of the first content byte (past `#`s + following ws).
+    content_start: usize,
+    /// Absolute offset; `buffer[content_start..cut]` is committed (settled) and
+    /// rendered into `committed_inner`. Always ≤ the current trim target.
+    cut: usize,
+    /// Rendered inline HTML of `buffer[content_start..cut]`.
+    committed_inner: String,
+    /// Buffer length after the last processed append — only bytes past this are
+    /// checked for the newline that ends the heading.
+    scanned_upto: usize,
+    /// Footnote occurrence map for the frozen prefix (see [`ParagraphCache`]).
+    fn_occ: HashMap<String, usize>,
+    /// Incremental footnote NUMBERING over the heading region (see
+    /// [`RegionFnNums`]). Inert when footnotes are off.
+    fn_nums: RegionFnNums,
+}
+
+/// Incremental state for a still-growing thematic-break line at the tail
+/// (`"-".repeat(n)` streamed). The output is a constant `<hr>`; the cache just
+/// validates that appended bytes keep the line a same-char break (`scan_hr`:
+/// only the rule char, spaces, tabs) and re-emits the block without re-scanning
+/// the whole line. Any other byte — including the newline that completes the
+/// line — bails to the full path.
+struct RuleCache {
+    /// Absolute byte offset of the rule line's first byte.
+    start: usize,
+    /// Stable id of the rule block.
+    id: u64,
+    /// The break character (`-`/`*`/`_`), locked at arm time.
+    ch: u8,
+    /// Buffer length after the last processed append (only new bytes validate).
+    scanned_upto: usize,
+}
+
+/// Incremental state for a code fence whose OPENING line is still growing — the
+/// giant-info-string shape ("```rust " + huge attr tail, no newline yet).
+/// [`FenceCache`] requires a complete opener line, so this tail otherwise
+/// full-rescans every append. The rendered block (`push_code_fence_open` +
+/// `</code></pre>`, empty body) and its classified kind depend ONLY on the first
+/// info word; once that word is settled (whitespace follows it) both are frozen,
+/// and each append just validates the new bytes. Bails on the newline that
+/// completes the opener (the normal fence cache arms on the next reparse) and on
+/// a backtick in a backtick fence's info (the scanner then rejects the fence).
+struct FenceInfoCache {
+    /// Absolute byte offset of the fence opener's first byte.
+    start: usize,
+    /// Stable id of the fence block.
+    id: u64,
+    /// True for a ``` fence (whose info may not contain backticks, §4.5).
+    backtick: bool,
+    /// Frozen block HTML: opener tag from the settled first info word + closer.
+    html: String,
+    /// Frozen classified kind (CodeBlock/MathBlock/Mermaid from the first word,
+    /// including any folded `block_data` enrichment — the body stays empty while
+    /// the opener line grows, so the enrichment can't change either).
+    kind: BlockKind,
+    /// Buffer length after the last processed append (only new bytes validate).
+    scanned_upto: usize,
+}
+
 impl StreamParser {
     pub fn new() -> Self {
         Self {
@@ -1077,6 +1232,10 @@ impl StreamParser {
             indented_cache: None,
             html_cache: None,
             pending_cr: false,
+            component_cache: None,
+            heading_cache: None,
+            rule_cache: None,
+            fence_info_cache: None,
         }
     }
 
@@ -1355,6 +1514,18 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_html() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_component() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_heading() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_rule() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_fence_info() {
                 return patch;
             }
         }
@@ -1869,6 +2040,10 @@ impl StreamParser {
         self.list_cache = None;
         self.indented_cache = None;
         self.html_cache = None;
+        self.component_cache = None;
+        self.heading_cache = None;
+        self.rule_cache = None;
+        self.fence_info_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -1877,7 +2052,7 @@ impl StreamParser {
                 .all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
             if gap_blank {
                 match &raw.kind {
-                    RawBlockKind::CodeFence { terminated: false, info, .. } => {
+                    RawBlockKind::CodeFence { terminated: false, info, fence_char, .. } => {
                         self.fence_cache = build_code_fence_cache(
                             &self.buffer,
                             start,
@@ -1885,6 +2060,20 @@ impl StreamParser {
                             new_active[0].id,
                             new_active[0].kind.clone(),
                         );
+                        // The builder above needs a complete opener line. While
+                        // the opener's info string is still growing, arm the
+                        // provisional frozen-output cache instead (the rendered
+                        // block depends only on the settled first info word).
+                        if self.fence_cache.is_none() {
+                            self.fence_info_cache = build_fence_info_cache(
+                                &self.buffer,
+                                start,
+                                info,
+                                *fence_char,
+                                new_active[0].id,
+                                new_active[0].kind.clone(),
+                            );
+                        }
                     }
                     RawBlockKind::MathFence { terminated: false } => {
                         self.fence_cache = build_math_fence_cache(
@@ -1963,6 +2152,32 @@ impl StreamParser {
                     RawBlockKind::HtmlBlock { closed: false } => {
                         self.html_cache =
                             build_html_cache(&self.buffer, start, new_active[0].id, &opts);
+                    }
+                    RawBlockKind::ComponentBlock { tag, terminated: false } => {
+                        // Recursive nested-parser cache, mirroring the
+                        // structured-container arm (incl. its depth bound).
+                        if self.container_depth < MAX_CONTAINER_DEPTH {
+                            self.component_cache = self.build_component_block_cache(
+                                start,
+                                tag,
+                                new_active[0].id,
+                                new_active[0].kind.clone(),
+                            );
+                        }
+                    }
+                    RawBlockKind::Heading { level } => {
+                        self.heading_cache = build_heading_cache(
+                            &self.buffer,
+                            start,
+                            *level,
+                            new_active[0].id,
+                            &opts,
+                            &self.committed_footnote_occurrences,
+                            self.next_footnote,
+                        );
+                    }
+                    RawBlockKind::HorizontalRule => {
+                        self.rule_cache = build_rule_cache(&self.buffer, start, new_active[0].id);
                     }
                     _ => {}
                 }
@@ -3281,6 +3496,325 @@ impl StreamParser {
         })
     }
 
+    /// O(new bytes) extension of an open component block at the tail (see
+    /// [`ComponentBlockCache`]). Feeds the appended body bytes RAW to the
+    /// recursive nested parser, tracks close/fence/nesting lines exactly like
+    /// `scan_component_block`, and reassembles `<Tag …>` + inner + `</Tag>`.
+    /// Returns `None` (dropping the cache → full reparse) on any BAIL condition.
+    fn try_incremental_component(&mut self) -> Option<Patch> {
+        let mut cache = self.component_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Tail-only check (same as the other caches).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Parity gate: when the buffer ends with a blank line the full rescan
+        // renders the open component — and ALL its inner sub-blocks — with
+        // `open_tail = false`, but the nested parser's frozen commits rendered
+        // with `force_open_tail = true`. Bail for this append (blank lines are
+        // legal component-body content, unlike in a `>` container).
+        if self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n") {
+            return None;
+        }
+        let delta_start = cache.fed_upto;
+        if component_delta_bails(&bytes[delta_start..end], cache.last_fed, cache.footnotes) {
+            return None;
+        }
+        // Classify the newly-complete lines (and the trailing partial) for the
+        // outer close — bails at the exact line `scan_component_block` would
+        // terminate the block on.
+        component_track_lines(bytes, end, &mut cache, &self.component_tags)?;
+        // Feed the delta (the nested parser owns partial-trailing-line
+        // speculation). An empty delta still re-renders the open inner tail.
+        cache.inner.append(&self.buffer[delta_start..end]);
+        cache.fed_upto = end;
+        if end > delta_start {
+            cache.last_fed = Some(bytes[end - 1]);
+        }
+
+        let html =
+            assemble_wrapped_body(&cache.wrapper_open, true, &cache.inner, &cache.wrapper_close);
+        let block = Block {
+            id: cache.id,
+            kind: cache.kind.clone(),
+            start: cache.start,
+            end,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.component_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// Arm the component-block cache for the open `<Tag>` block at `start`.
+    /// Returns `None` (no cache → full reparse) when the open-tag line is still
+    /// incomplete (more bytes could dissolve the block — `<Chart>x` is no
+    /// component — and the attrs aren't frozen), or on any feed BAIL over the
+    /// body already present. The first feed processes every body byte present;
+    /// later appends fold only new bytes.
+    fn build_component_block_cache(
+        &self,
+        start: usize,
+        tag: &str,
+        id: u64,
+        kind: BlockKind,
+    ) -> Option<ComponentBlockCache> {
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
+        let first_line_end = start + first_nl;
+        if bytes[start..first_line_end].contains(&b'\r') {
+            return None;
+        }
+        // Wrapper opener, byte-identical to `render_component`.
+        let slice = &self.buffer[start..end];
+        let open = slice.trim_start_matches([' ', '\t']);
+        let attrs = sanitize_attrs(open);
+        let mut wrapper_open = String::with_capacity(tag.len() + 16);
+        wrapper_open.push('<');
+        wrapper_open.push_str(tag);
+        for (k, v) in &attrs {
+            wrapper_open.push(' ');
+            wrapper_open.push_str(k);
+            wrapper_open.push_str("=\"");
+            escape_attr(v, &mut wrapper_open);
+            wrapper_open.push('"');
+        }
+        wrapper_open.push('>');
+        let mut wrapper_close = String::with_capacity(tag.len() + 3);
+        wrapper_close.push_str("</");
+        wrapper_close.push_str(tag);
+        wrapper_close.push('>');
+
+        // Recursive nested parser — same construction as the container-block
+        // cache (same flags; footnotes off, deep-cloned committed refs,
+        // force_open_tail matching `render_component`'s opts propagation to all
+        // inner sub-blocks; depth-bounded by the caller).
+        let mut inner = Box::new(StreamParser::new());
+        inner.unsafe_html = self.unsafe_html;
+        inner.gfm_autolinks = self.gfm_autolinks;
+        inner.gfm_alerts = self.gfm_alerts;
+        inner.gfm_footnotes = false;
+        inner.gfm_math = self.gfm_math;
+        inner.dir_auto = self.dir_auto;
+        inner.a11y = self.a11y;
+        inner.block_data = false;
+        inner.component_tags = self.component_tags.clone();
+        inner.inline_component_tags = self.inline_component_tags.clone();
+        inner.html_sanitize = self.html_sanitize;
+        inner.html_allowlist = self.html_allowlist.clone();
+        inner.html_drop = self.html_drop.clone();
+        inner.committed_refs = Rc::new((*self.committed_refs).clone());
+        inner.force_open_tail = true;
+        inner.container_depth = self.container_depth + 1;
+
+        // Body = everything past the open tag's `>` (`component_inner_range`,
+        // shared with `render_component`, so the boundary can't drift).
+        let (open_end_rel, _) = component_inner_range(slice, tag, false);
+        let mut cache = ComponentBlockCache {
+            start,
+            id,
+            tag: tag.to_string(),
+            kind,
+            wrapper_open,
+            wrapper_close,
+            inner,
+            fed_upto: start + open_end_rel,
+            lines_upto: first_line_end + 1,
+            depth: 1,
+            in_fence: false,
+            last_fed: None,
+            footnotes: self.gfm_footnotes,
+        };
+        let delta_start = cache.fed_upto;
+        if component_delta_bails(&bytes[delta_start..end], None, cache.footnotes) {
+            return None;
+        }
+        // The scan said `terminated: false`, so this can't hit the close; it
+        // establishes the fence/nesting state over the body already present.
+        component_track_lines(bytes, end, &mut cache, &self.component_tags)?;
+        cache.inner.append(&self.buffer[delta_start..end]);
+        cache.fed_upto = end;
+        if end > delta_start {
+            cache.last_fed = Some(bytes[end - 1]);
+        }
+        Some(cache)
+    }
+
+    /// O(new bytes) extension of a still-growing single-line ATX heading at the
+    /// tail (see [`HeadingCache`]). Commits the settled inline prefix once and
+    /// re-renders only the short active tail, exactly like
+    /// `try_incremental_paragraph`, inside the `<hN>` wrapper. Returns `None`
+    /// (dropping the cache → full reparse) when the line completes or the
+    /// closing-`#` trim reaches the frozen prefix.
+    fn try_incremental_heading(&mut self) -> Option<Patch> {
+        let mut cache = self.heading_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // Tail-only check.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Any newline ends the single-line heading — the full path owns it (and
+        // whatever new block follows). Only the new bytes are checked.
+        if bytes[cache.scanned_upto..len].iter().any(|&b| matches!(b, b'\n' | b'\r')) {
+            return None;
+        }
+        cache.scanned_upto = len;
+        // Mirror `render_heading`'s content window on the growing line. The
+        // closing-`#` trim is recomputed per append (O(trailing run)); if it
+        // ever reaches back into the frozen prefix, bail.
+        let trim_target = heading_trim_target(bytes, cache.content_start, len);
+        if trim_target < cache.cut {
+            return None;
+        }
+        // Extend the incremental numbering over the region's new bytes, then
+        // share it into the opts (O(1); mirrors the paragraph cache).
+        if self.gfm_footnotes {
+            cache.fn_nums.extend(&self.buffer, trim_target, &self.committed_footnotes);
+        }
+        let opts = self.build_inline_opts(&cache.fn_nums);
+        // Same settle-then-commit scheme as the paragraph cache.
+        let mut active = String::new();
+        let boundary_rel =
+            render_inline_boundary(&self.buffer[cache.cut..trim_target], &opts, &mut active);
+        let new_cut = cache.cut + boundary_rel;
+        if new_cut > cache.cut {
+            let mut seg = String::new();
+            render_inline(&self.buffer[cache.cut..new_cut], &opts, &mut seg);
+            resolve_footnote_ids(&seg, &mut cache.fn_occ, &mut cache.committed_inner);
+            cache.cut = new_cut;
+            active.clear();
+            render_inline(&self.buffer[cache.cut..trim_target], &opts, &mut active);
+        }
+        if self.gfm_footnotes {
+            let mut occ = cache.fn_occ.clone();
+            let mut resolved = String::with_capacity(active.len());
+            resolve_footnote_ids(&active, &mut occ, &mut resolved);
+            active = resolved;
+        }
+        // `<hN dir?>` + inner + `</hN>`, with the same trailing-whitespace trim
+        // as `render_heading_inner_trimmed`.
+        let mut html = String::with_capacity(
+            cache.committed_inner.len() + active.len() + opts.dir().len() + 10,
+        );
+        html.push_str("<h");
+        html.push((b'0' + cache.level) as char);
+        html.push_str(opts.dir());
+        html.push('>');
+        let body_start = html.len();
+        html.push_str(&cache.committed_inner);
+        html.push_str(&active);
+        while html.len() > body_start
+            && matches!(html.as_bytes()[html.len() - 1], b' ' | b'\t' | b'\n' | b'\r')
+        {
+            html.pop();
+        }
+        html.push_str("</h");
+        html.push((b'0' + cache.level) as char);
+        html.push('>');
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Heading { level: cache.level, rich: None },
+            start: cache.start,
+            end: len,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.heading_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of a still-growing thematic-break line at the tail
+    /// (see [`RuleCache`]). Validates that the appended bytes keep the line a
+    /// same-char break and re-emits the constant `<hr>` block; anything else —
+    /// including the completing newline — returns `None` (full reparse).
+    fn try_incremental_rule(&mut self) -> Option<Patch> {
+        let mut cache = self.rule_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // Tail-only check.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // `scan_hr`: a break line holds only its rule char, spaces, and tabs.
+        if bytes[cache.scanned_upto..len]
+            .iter()
+            .any(|&b| b != cache.ch && b != b' ' && b != b'\t')
+        {
+            return None;
+        }
+        cache.scanned_upto = len;
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Rule,
+            start: cache.start,
+            end: len,
+            html: String::from("<hr>"),
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.rule_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of a code fence whose opener line (info string) is
+    /// still growing (see [`FenceInfoCache`]). The block HTML and kind are
+    /// frozen; each append just validates the new bytes and re-emits. Returns
+    /// `None` (full reparse — which arms the real [`FenceCache`]) when the
+    /// opener line completes, or when a backtick lands in a backtick fence's
+    /// info (the scanner then rejects the whole fence, §4.5).
+    fn try_incremental_fence_info(&mut self) -> Option<Patch> {
+        let mut cache = self.fence_info_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // Tail-only check.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        if bytes[cache.scanned_upto..len]
+            .iter()
+            .any(|&b| matches!(b, b'\n' | b'\r') || (cache.backtick && b == b'`'))
+        {
+            return None;
+        }
+        cache.scanned_upto = len;
+        let block = Block {
+            id: cache.id,
+            kind: cache.kind.clone(),
+            start: cache.start,
+            end: len,
+            html: cache.html.clone(),
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.fence_info_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
     /// O(new bytes) extension of a long open list at the tail — flat OR nested.
     /// Each item is tracked as the FULL multi-line source span between two
     /// sibling markers; a sibling marker CLOSES the current item (its body, with
@@ -3927,23 +4461,238 @@ fn strip_container_delta(
 /// `render_block`'s output, with no trailing `\n`), and the wrapper closer —
 /// byte-identical to `render_blockquote` / `render_alert`.
 fn assemble_container_block(cache: &ContainerBlockCache) -> String {
-    let blocks: Vec<&Block> = cache.inner.all_blocks().collect();
+    assemble_wrapped_body(
+        &cache.wrapper_open,
+        cache.body_leading_nl,
+        &cache.inner,
+        &cache.wrapper_close,
+    )
+}
+
+/// Assemble a wrapper + nested-parser body: wrapper opener, a leading `\n` iff
+/// `body_leading_nl` and the body is non-empty (`render_blockquote` /
+/// `render_component`'s `!sub.is_empty()` newline; an alert's title line already
+/// supplied its separator), the inner sub-blocks each followed by `\n`, and the
+/// wrapper closer.
+fn assemble_wrapped_body(
+    wrapper_open: &str,
+    body_leading_nl: bool,
+    inner: &StreamParser,
+    wrapper_close: &str,
+) -> String {
+    let blocks: Vec<&Block> = inner.all_blocks().collect();
     let body_len: usize = blocks.iter().map(|b| b.html.len() + 1).sum();
-    let mut html = String::with_capacity(
-        cache.wrapper_open.len() + 1 + body_len + cache.wrapper_close.len(),
-    );
-    html.push_str(&cache.wrapper_open);
-    // Blockquote pushes a leading `\n` iff the body is non-empty (`!sub.is_empty()`);
-    // an alert's title line already supplied that separator.
-    if cache.body_leading_nl && !blocks.is_empty() {
+    let mut html =
+        String::with_capacity(wrapper_open.len() + 1 + body_len + wrapper_close.len());
+    html.push_str(wrapper_open);
+    if body_leading_nl && !blocks.is_empty() {
         html.push('\n');
     }
     for b in &blocks {
         html.push_str(&b.html);
         html.push('\n');
     }
-    html.push_str(&cache.wrapper_close);
+    html.push_str(wrapper_close);
     html
+}
+
+/// Scoping bail for RAW-fed component-body bytes, mirroring the tail checks in
+/// `strip_container_delta`: a `\r` (CRLF), a footnote `[^` (when the OUTER
+/// parser has footnotes on — the nested parser runs with them off), or a
+/// link-ref `]:` (document-global resolution). `last_fed` gives a 1-byte
+/// overlap so a marker split across two feeds is still caught.
+fn component_delta_bails(delta: &[u8], last_fed: Option<u8>, footnotes: bool) -> bool {
+    if delta.contains(&b'\r') {
+        return true;
+    }
+    if (footnotes && last_fed == Some(b'[') && delta.first() == Some(&b'^'))
+        || (last_fed == Some(b']') && delta.first() == Some(&b':'))
+    {
+        return true;
+    }
+    (footnotes && delta.windows(2).any(|w| w == b"[^")) || delta.windows(2).any(|w| w == b"]:")
+}
+
+/// Advance a [`ComponentBlockCache`]'s line classification over the newly
+/// complete body lines, mirroring `scan_component_block` exactly: a ```/~~~
+/// line toggles fence state; outside a fence, a clean `</Tag>` line closes one
+/// nesting level and a same-tag open line adds one. Returns `None` (the caller
+/// BAILS to the full reparse, which terminates the block) when the OUTER close
+/// lands — including on the trailing partial line, since the scan terminates on
+/// a close line even without its newline.
+fn component_track_lines(
+    bytes: &[u8],
+    end: usize,
+    cache: &mut ComponentBlockCache,
+    tags: &[Box<str>],
+) -> Option<()> {
+    let name = cache.tag.as_bytes();
+    let mut pos = cache.lines_upto;
+    while pos < end {
+        let next = match bytes[pos..end].iter().position(|&b| b == b'\n') {
+            Some(r) => pos + r + 1,
+            None => break,
+        };
+        let (_ind, lb) = strip_indent(&bytes[pos..next], 3);
+        if lb.starts_with(b"```") || lb.starts_with(b"~~~") {
+            cache.in_fence = !cache.in_fence;
+        } else if !cache.in_fence {
+            if is_clean_close_tag(lb, name) {
+                cache.depth -= 1;
+                if cache.depth == 0 {
+                    return None;
+                }
+            } else if let Some((n2, sc2, _)) = component_open_tag(lb, tags) {
+                if n2 == name && !sc2 {
+                    cache.depth += 1;
+                }
+            }
+        }
+        cache.lines_upto = next;
+        pos = next;
+    }
+    let partial = &bytes[cache.lines_upto..end];
+    if !partial.is_empty() && !cache.in_fence && cache.depth == 1 {
+        let (_ind, lb) = strip_indent(partial, 3);
+        if is_clean_close_tag(lb, name) {
+            return None;
+        }
+    }
+    Some(())
+}
+
+/// The end of an open (single-line) ATX heading's content window: strip
+/// trailing spaces from `bytes[i..len]`, then an optional closing-`#` run per
+/// `render_heading` — all-`#` content strips entirely; otherwise the run (plus
+/// its preceding space/tab separator) strips only when so separated.
+fn heading_trim_target(bytes: &[u8], i: usize, len: usize) -> usize {
+    let mut end = len;
+    while end > i && bytes[end - 1] == b' ' {
+        end -= 1;
+    }
+    let mut tail = end;
+    while tail > i && bytes[tail - 1] == b'#' {
+        tail -= 1;
+    }
+    if tail == i {
+        i
+    } else if tail < end && (bytes[tail - 1] == b' ' || bytes[tail - 1] == b'\t') {
+        let mut t = tail - 1;
+        while t > i && (bytes[t - 1] == b' ' || bytes[t - 1] == b'\t') {
+            t -= 1;
+        }
+        t
+    } else {
+        end
+    }
+}
+
+/// Arm the heading cache for the still-growing single-line ATX heading at
+/// `start` (see [`HeadingCache`]), rendering its initial settled prefix once.
+/// `None` when the line is already complete, nothing is committable yet, or
+/// `block_data` is on (the `rich` text+slug channel re-derives from the whole
+/// content — the full path owns it).
+fn build_heading_cache(
+    buffer: &str,
+    start: usize,
+    level: u8,
+    id: u64,
+    opts: &RenderOpts,
+    fn_base: &HashMap<String, usize>,
+    fn_next: usize,
+) -> Option<HeadingCache> {
+    if opts.block_data {
+        return None;
+    }
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    // Only a still-growing line arms — a completed heading can't grow (new
+    // bytes would belong to the NEXT block).
+    if bytes[start..len].iter().any(|&b| matches!(b, b'\n' | b'\r')) {
+        return None;
+    }
+    // Content start, mirroring `render_heading`: spaces, `#`s, then ws. Frozen
+    // once content exists (the line only grows at its end).
+    let mut i = start;
+    while i < len && bytes[i] == b' ' {
+        i += 1;
+    }
+    while i < len && bytes[i] == b'#' {
+        i += 1;
+    }
+    while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let trim_target = heading_trim_target(bytes, i, len);
+    if trim_target <= i {
+        return None;
+    }
+    let mut tmp = String::new();
+    let cut = i + render_inline_boundary(&buffer[i..trim_target], opts, &mut tmp);
+    if cut <= i {
+        return None;
+    }
+    // Same placeholder-render + resolve-on-commit as `build_paragraph_cache`.
+    let mut raw = String::new();
+    render_inline(&buffer[i..cut], opts, &mut raw);
+    let mut fn_occ = fn_base.clone();
+    let mut committed_inner = String::with_capacity(raw.len());
+    resolve_footnote_ids(&raw, &mut fn_occ, &mut committed_inner);
+    Some(HeadingCache {
+        start,
+        id,
+        level,
+        content_start: i,
+        cut,
+        committed_inner,
+        scanned_upto: len,
+        fn_occ,
+        fn_nums: RegionFnNums::new(start, fn_next),
+    })
+}
+
+/// Arm the rule cache for the still-growing thematic-break line at `start`
+/// (see [`RuleCache`]). `None` when the line is already complete.
+fn build_rule_cache(buffer: &str, start: usize, id: u64) -> Option<RuleCache> {
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    if bytes[start..len].iter().any(|&b| matches!(b, b'\n' | b'\r')) {
+        return None;
+    }
+    // The break char is the first non-space byte (`scan_hr`, ≤3 indent).
+    let ch = bytes[start..len].iter().copied().find(|&b| b != b' ')?;
+    if !matches!(ch, b'-' | b'*' | b'_') {
+        return None;
+    }
+    Some(RuleCache { start, id, ch, scanned_upto: len })
+}
+
+/// Arm the provisional fence-info cache for a code fence whose OPENER line is
+/// still growing at `start` (see [`FenceInfoCache`]). `None` when the opener
+/// is complete (the real [`FenceCache`] owns it) or the first info word isn't
+/// settled yet (no whitespace-separated info follows it — the language class
+/// would drift as the word grows, so the full path keeps that shape).
+fn build_fence_info_cache(
+    buffer: &str,
+    start: usize,
+    info: &str,
+    fence_char: u8,
+    id: u64,
+    kind: BlockKind,
+) -> Option<FenceInfoCache> {
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    if bytes[start..len].iter().any(|&b| matches!(b, b'\n' | b'\r')) {
+        return None;
+    }
+    let mut words = info.split_whitespace();
+    words.next()?; // a first word exists…
+    words.next()?; // …and is settled (more info follows it)
+    // Frozen block HTML — `render_code_fence` with an empty body.
+    let mut html = String::with_capacity(64);
+    push_code_fence_open(info, &mut html);
+    html.push_str("</code></pre>");
+    Some(FenceInfoCache { start, id, backtick: fence_char == b'`', html, kind, scanned_upto: len })
 }
 
 /// Strip the CommonMark blockquote marker (`>` with optional one space, after

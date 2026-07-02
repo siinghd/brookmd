@@ -1009,7 +1009,7 @@ pub fn line_slice(bytes: &[u8], start: usize) -> &[u8] {
 
 /// Strip up to `max` leading spaces (tabs count as 4). Returns (indent_width,
 /// trimmed_slice).
-fn strip_indent(line: &[u8], max: usize) -> (usize, &[u8]) {
+pub(crate) fn strip_indent(line: &[u8], max: usize) -> (usize, &[u8]) {
     let mut indent = 0;
     let mut i = 0;
     while i < line.len() && indent < max {
@@ -1328,7 +1328,7 @@ fn scan_html_block(bytes: &[u8], start: usize) -> Option<RawBlock> {
 /// allowlisted component open tag, return `(name, self_closing, end_in_body)`
 /// where `end_in_body` is just past the tag's `>`. `None` if it isn't an
 /// allowlisted open tag whose `>` is on this line (v1: single-line open tags).
-fn component_open_tag<'a>(body: &'a [u8], tags: &[Box<str>]) -> Option<(&'a [u8], bool, usize)> {
+pub(crate) fn component_open_tag<'a>(body: &'a [u8], tags: &[Box<str>]) -> Option<(&'a [u8], bool, usize)> {
     if body.first() != Some(&b'<') {
         return None;
     }
@@ -1379,7 +1379,7 @@ fn component_open_tag<'a>(body: &'a [u8], tags: &[Box<str>]) -> Option<(&'a [u8]
 /// True iff `body` (indent stripped) is exactly a `</name>` close tag followed by
 /// only whitespace — the content-aware "close line" (a `</name>` embedded in
 /// other text or a code span is not a clean close line, so it stays content).
-fn is_clean_close_tag(body: &[u8], name: &[u8]) -> bool {
+pub(crate) fn is_clean_close_tag(body: &[u8], name: &[u8]) -> bool {
     let mut i = 0;
     if !body.starts_with(b"</") {
         return false;

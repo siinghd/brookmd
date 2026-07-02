@@ -265,8 +265,10 @@ fn one_giant_word(target: usize) -> String {
     "a".repeat(target)
 }
 
-/// uncached-open-block-kinds: an open ComponentBlock has no incremental cache
-/// arm in `reparse_tail`, so its growing body full-rescans every append.
+/// uncached-open-block-kinds (FIXED): an open ComponentBlock had no
+/// incremental cache arm in `reparse_tail`, so its growing body full-rescanned
+/// every append; it now streams via ComponentBlockCache (recursive nested
+/// parser, like the container shapes).
 fn component_block_open(target: usize) -> String {
     let mut s = String::from("<Chart>\n");
     let mut i = 0usize;
@@ -275,6 +277,65 @@ fn component_block_open(target: usize) -> String {
         i += 1;
     }
     s // close tag never arrives
+}
+
+/// A single giant ATX heading line, still growing (no newline) — streams via
+/// HeadingCache (the paragraph cache's settled-prefix scheme in `<hN>`).
+fn heading_words(target: usize) -> String {
+    let mut s = String::from("# ");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("word{i} "));
+        i += 1;
+    }
+    s
+}
+
+/// Same shape with inline constructs: pre-cache this went ~cubic in wall time
+/// (quadratic re-scan × superlinear whole-line inline re-render).
+fn heading_emphasis(target: usize) -> String {
+    let mut s = String::from("# ");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("*word{i}* and **bold{i}** "));
+        i += 1;
+    }
+    s
+}
+
+/// A thematic-break line still growing — RuleCache (constant `<hr>`).
+fn growing_rule(target: usize) -> String {
+    "-".repeat(target)
+}
+
+/// A code fence whose OPENER line (info string) grows without a newline —
+/// FenceInfoCache (output frozen once the first info word settles).
+fn fence_giant_info(target: usize) -> String {
+    let mut s = String::from("```rust ");
+    while s.len() < target {
+        s.push_str("attr ");
+    }
+    s
+}
+
+/// KNOWN O(n²): a blockquote whose FIRST line never completes — both container
+/// caches require a complete first line (Blockquote-vs-Alert isn't settled),
+/// so every append full-rescans the growing tail.
+fn quote_giant_line(target: usize) -> String {
+    let mut s = String::from("> ");
+    while s.len() < target {
+        s.push_str("prose without any newline at all ");
+    }
+    s
+}
+
+/// KNOWN O(n²): same first-line bail, single giant CJK line (no spaces).
+fn bq_cjk_one_line(target: usize) -> String {
+    let mut s = String::from("> ");
+    while s.len() < target {
+        s.push_str("漢字の行が続く");
+    }
+    s
 }
 
 /// html-empty-partial-blank-close (FIXED): open raw-HTML block with 64-byte
@@ -828,7 +889,23 @@ fn shapes() -> Vec<Shape> {
         // run, so the cut cannot advance. Inert-run flavors (entity_soup,
         // punctuated_giant_word, autolinks-off) are FIXED and linear above.
         quad("giant-word-autolinks-pin", one_giant_word, base, KnownQuadratic, KnownQuadratic),
-        quad("uncached-open-block-kinds", component_block_open, chart_tag, KnownQuadratic, KnownQuadratic),
+        // uncached-open-block-kinds: FIXED — the five member shapes are pinned
+        // linear here; the two first-line-incomplete container flavors remain
+        // known-quadratic below.
+        Shape {
+            name: "component_block_open",
+            gen: component_block_open,
+            opts: chart_tag,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        lin("heading_words", heading_words, Linear),
+        lin("heading_emphasis", heading_emphasis, Linear),
+        lin("growing_rule", growing_rule, Linear),
+        lin("fence_giant_info", fence_giant_info, Linear),
         // html-empty-partial-blank-close: FIXED — promoted to the linear
         // html_type6/7_aligned shapes above.
         // footnote-global-state: FIXED — promoted to the four fn_* linear
@@ -845,6 +922,10 @@ fn shapes() -> Vec<Shape> {
         // compute-cut-pair-overlap-scan: FIXED — em_pairs_para promoted above.
         // crlf-cache-bail: FIXED — promoted to the seven crlf_* linear twins above.
         quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
+        // Residual first-line-incomplete container pins (both container caches
+        // need a complete first line before Blockquote-vs-Alert settles).
+        quad("container-first-line-pin", quote_giant_line, base, KnownQuadratic, KnownQuadratic),
+        quad("container-first-line-pin-cjk", bq_cjk_one_line, base, KnownQuadratic, KnownQuadratic),
         // list-interior-blank-loose-bail: FIXED — indented_code_with_interior_
         // blanks + loose_subs_one_item + staircase_blank_flap promoted above.
     ];
