@@ -177,3 +177,119 @@ fn cache_disarms_when_footnotes_on() {
     };
     assert_eq!(streamed, one_shot, "footnotes + table must converge across the stream");
 }
+
+// ---- partial-row sub-cache (the trailing newline-less row) -----------------
+//
+// The open-state (no finalize) HTML of every streamed prefix must equal the
+// one-shot open state of the same prefix — the partial-row sub-cache freezes
+// cells at each unescaped `|` and commits the open cell's settled inline
+// prefix, and none of that may show. Cases target the split automaton's edges:
+// escaped pipes at cell/line boundaries, the trailing decoration pipe,
+// Unicode whitespace, multi-byte chars, and inline constructs cut mid-way.
+
+fn open_state(p: &StreamParser) -> String {
+    collect(p)
+}
+
+fn one_shot_open(md: &str, footnotes: bool) -> String {
+    let mut p = StreamParser::new().with_gfm_footnotes(footnotes);
+    p.append(md);
+    open_state(&p)
+}
+
+fn streamed_open(md: &str, chunk: usize, footnotes: bool) -> String {
+    let mut p = StreamParser::new().with_gfm_footnotes(footnotes);
+    let b = md.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let mut e = (i + chunk).min(b.len());
+        while e < b.len() && (b[e] & 0xC0) == 0x80 {
+            e += 1;
+        }
+        p.append(&md[i..e]);
+        i = e;
+    }
+    open_state(&p)
+}
+
+/// `doc` = `head` (everything through the delimiter row's newline, prefix cuts
+/// inside it hit the documented paragraph→table boundary lag) + `tail`. Checks
+/// open-state parity for every char prefix that includes the full `head`.
+fn assert_partial_row_parity(head: &str, tail: &str, footnotes: bool) {
+    let doc = format!("{head}{tail}");
+    let cuts: Vec<usize> = doc
+        .char_indices()
+        .map(|(i, _)| i)
+        .filter(|&i| i >= head.len())
+        .chain(std::iter::once(doc.len()))
+        .collect();
+    for cut in cuts {
+        let prefix = &doc[..cut];
+        let one = one_shot_open(prefix, footnotes);
+        for chunk in [1usize, 3] {
+            let streamed = streamed_open(prefix, chunk, footnotes);
+            assert_eq!(
+                streamed, one,
+                "open-state mismatch (chunk={chunk}, fn={footnotes}) for prefix {prefix:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_row_prefix_parity() {
+    const HDR: &str = "| a | b |\n| :- | -: |\n";
+    let tails: &[&str] = &[
+        "| x | y |  ",
+        "| x \\| y",
+        "| x \\|",
+        "| x \\\\| y",
+        "| x \\\\\\| tail",
+        "| x | \\",
+        "|||",
+        "| |",
+        "| x | y | z | w",
+        "x | y",
+        "| **x** | *y* z",
+        "| `co | de` | x",
+        "| [link](https://a.b) | tex",
+        "| é中 | 🚀 word",
+        "\u{3000}| x",
+        "| x\u{3000} | y\u{3000}",
+        "| x | y |\n| p | q |\n| r ",
+        "| *em | ph* | tail",
+        "| a\\|b\\|c | d",
+        "| two  spaces  in  cell | x",
+    ];
+    for tail in tails {
+        assert_partial_row_parity(HDR, tail, false);
+    }
+}
+
+#[test]
+fn partial_row_prefix_parity_footnotes() {
+    // Footnote refs in frozen cells, the open cell's committed prefix, and the
+    // speculative tail must all resolve to the same occurrence ids as the full
+    // per-append re-render.
+    let docs: &[(&str, &str)] = &[
+        ("[^1]: note\n\n| a | b |\n| - | - |\n", "| [^1] x | [^1] y wor"),
+        ("[^a]: A\n\n| [^a] h | b |\n| - | - |\n", "| [^a] | [^a] more te"),
+        ("[^a]: A\n\n| a | b |\n| - | - |\n", "| [^a] \\| [^a] | z"),
+    ];
+    for (head, tail) in docs {
+        assert_partial_row_parity(head, tail, true);
+    }
+}
+
+#[test]
+fn unicode_blank_table_line_matches_full_render() {
+    // `is_blank_line` is ASCII-only but the full renderer's body filter is
+    // Unicode-aware (`.trim()`): an all-U+3000 line inside or trailing a
+    // streamed table must not fabricate an empty row.
+    let inside = "| a | b |\n| :- | -: |\n\u{3000}\n| x | y |\n";
+    let trailing = "| a | b |\n| :- | -: |\n\u{3000}";
+    for md in [inside, trailing] {
+        assert_eq!(streamed_open(md, 1, false), one_shot_open(md, false), "open state {md:?}");
+        assert_eq!(render_streamed(md), render(md), "finalized {md:?}");
+    }
+}

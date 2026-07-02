@@ -7,7 +7,7 @@ use crate::blocks::Block;
 use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
     is_fence_close_line, is_footnote_def_block, item_body, normalize_label,
-    parse_alignments, push_code_fence_open, push_table_cell, render_block,
+    parse_alignments, push_code_fence_open, push_table_cell, push_table_cell_open, render_block,
     render_footnote_section, render_item_body, resolve_footnote_ids, split_table_cells,
     trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
 };
@@ -425,6 +425,116 @@ struct TableCache {
     /// trailing partial row resolves from a CLONE of this (doesn't advance it).
     /// Unused (empty) when footnotes are off.
     fn_occ: HashMap<String, usize>,
+    /// Incremental state for the trailing newline-less partial row, so the
+    /// growing partial is split + rendered in O(new bytes) instead of whole
+    /// per append. `None` until the first partial byte arrives (and always
+    /// `None` when `block_data` is on — that path re-renders whole).
+    partial: Option<PartialRowCache>,
+}
+
+/// Two-level incremental render state for the TRAILING newline-less partial
+/// row of an open [`TableCache`] table. Without it, every append re-splits and
+/// re-inline-renders the whole growing partial line — O(n²/chunk) once the
+/// line stops getting `\n`s (one giant last cell, or one enormously wide row).
+///
+/// Level 1 — settled cells: a cell closed by an unescaped `|` can never
+/// change (earlier bytes are immutable, and the cells before any later `|`
+/// are the same whether that pipe turns out to be the row's trailing
+/// decoration or another delimiter), so each is split + rendered exactly once
+/// into `html`; only bytes at `scanned..` are examined per append. The scan
+/// mirrors `split_table_cells` char-for-char: leading whitespace plus one
+/// leading `|` are decoration, `\` swallows itself and makes the next char
+/// literal, an unescaped `|` closes a cell, and each cell is trimmed.
+///
+/// Level 2 — the still-open last cell: `render_inline_boundary` (the
+/// paragraph-cache primitive) commits the settled inline prefix of the cell's
+/// content into `cell_committed` and re-renders only the short unsettled tail
+/// per append.
+///
+/// Footnote-aware with the same cascading discipline as the row cache: `occ`
+/// advances per frozen cell, `cell_occ` (re-seeded from `occ`) advances per
+/// committed inline segment and is discarded when the cell closes, and the
+/// speculative active tail resolves from a clone.
+///
+/// Not used when `block_data` is on: the structured `TableCell {text, html}`
+/// channel needs a full `strip_inline_html` pass over the growing cell each
+/// append, so that path keeps the whole-partial re-render.
+struct PartialRowCache {
+    /// `lines_upto` this state belongs to; a mismatch (a row completed since)
+    /// resets the whole sub-cache.
+    line_start: usize,
+    /// Absolute offset of the first byte not yet fed through the split scan.
+    scanned: usize,
+    /// Split-level escape state at `scanned` (`\` seen; next char is literal).
+    esc: bool,
+    /// Still consuming the line's leading whitespace / one leading `|`.
+    leading: bool,
+    /// Absolute offset of the last non-whitespace char seen (drives the
+    /// trailing-`|`-decoration emulation at emit time).
+    last_nonws: Option<usize>,
+    /// Cells closed (frozen) so far. Can exceed `ncol`; cells past `ncol` are
+    /// counted but not rendered (the renderer drops them).
+    ncells: usize,
+    /// Absolute offset just past the last `|` the scan consumed as a cell
+    /// delimiter (or as the leading decoration pipe).
+    frozen_end: usize,
+    /// Rendered `<td>…</td>` HTML of the frozen cells, footnotes resolved.
+    html: String,
+    /// Footnote occurrences advanced through `html` (seeded from the row
+    /// cache's `fn_occ` clone at arm time).
+    occ: HashMap<String, usize>,
+    /// Escape-processed, left-trimmed content of the OPEN (last) cell —
+    /// exactly what `split_table_cells` would accumulate for it.
+    cellbuf: String,
+    /// `cellbuf` length through its last non-whitespace char (right trim).
+    trim_len: usize,
+    /// Resolved HTML of the settled inline prefix of the open cell.
+    cell_committed: String,
+    /// Settled inline boundary — byte offset into the open cell's content.
+    cell_cut: usize,
+    /// Content length `cell_cut` was last computed against. The boundary
+    /// contract only covers *extensions* of the analyzed input; the
+    /// trailing-`|` emulation can shrink the content, which resets level 2.
+    cell_len: usize,
+    /// Footnote occurrences advanced through `cell_committed` (seeded from
+    /// `occ`; discarded whenever the open cell closes or resets).
+    cell_occ: HashMap<String, usize>,
+}
+
+impl PartialRowCache {
+    fn new(line_start: usize, fn_occ: &HashMap<String, usize>) -> Self {
+        PartialRowCache {
+            line_start,
+            scanned: line_start,
+            esc: false,
+            leading: true,
+            last_nonws: None,
+            ncells: 0,
+            frozen_end: line_start,
+            html: String::new(),
+            occ: fn_occ.clone(),
+            cellbuf: String::new(),
+            trim_len: 0,
+            cell_committed: String::new(),
+            cell_cut: 0,
+            cell_len: 0,
+            cell_occ: fn_occ.clone(),
+        }
+    }
+
+    /// Append one escape-processed char to the open cell, trimming
+    /// incrementally: leading whitespace is skipped while the cell is empty,
+    /// and `trim_len` remembers the length through the last non-whitespace
+    /// char (the emit slices to it — `.trim()` equivalence).
+    fn push_cell_char(&mut self, ch: char) {
+        if self.cellbuf.is_empty() && ch.is_whitespace() {
+            return;
+        }
+        self.cellbuf.push(ch);
+        if !ch.is_whitespace() {
+            self.trim_len = self.cellbuf.len();
+        }
+    }
 }
 
 /// Incremental render state for a single open GFM blockquote / alert at the
@@ -2082,10 +2192,18 @@ impl StreamParser {
         // line bails: the table has ended, full reparse takes over so the block
         // boundary updates correctly.
         let mut pos = cache.lines_upto;
+        // The previous append's partial-row scan already proved there is no
+        // `\n` before `p.scanned`, so the newline search starts at the new
+        // bytes — O(new) per append instead of O(partial).
+        let nl_hint = match &cache.partial {
+            Some(p) if p.line_start == pos && p.scanned > pos => p.scanned.min(end),
+            _ => pos,
+        };
         while pos < end {
-            let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
+            let search = nl_hint.max(pos);
+            let r = match bytes[search..end].iter().position(|&b| b == b'\n') {
                 None => break, // trailing partial line — handled below
-                Some(r) => r,
+                Some(r) => search + r - pos,
             };
             let content_end = pos + r;
             let next = pos + r + 1;
@@ -2098,6 +2216,14 @@ impl StreamParser {
                 return None;
             }
             let line_str = std::str::from_utf8(&bytes[pos..content_end]).unwrap_or("");
+            // An all-Unicode-whitespace line (`is_blank_line` is ASCII-only, so
+            // it didn't end the table above): the full renderer drops trim-empty
+            // body lines without ending the table — fold no row for it.
+            if line_str.trim().is_empty() {
+                cache.lines_upto = next;
+                pos = next;
+                continue;
+            }
             let cells = split_table_cells(line_str);
             if !cache.tbody_opened {
                 cache.cached_prefix.push_str("<tbody>");
@@ -2145,50 +2271,66 @@ impl StreamParser {
 
         // Speculatively render the trailing partial line (no `\n`) as a row, if
         // it's non-empty and not blank. The full renderer treats a final
-        // newline-less line as the last row, so we must too. The partial is short
-        // (≤ one row's worth), so re-rendering it each append is O(row).
+        // newline-less line as the last row, so we must too.
         let partial = &bytes[cache.lines_upto..end];
         let mut partial_html = String::new();
         // Structured channel: the speculative partial row's cells, built parallel
         // to `partial_html` and NOT folded into `cache.body_cells` (mirrors how
         // `partial_html` is not folded into `cached_prefix`).
         let mut partial_row: Option<Vec<TableCell>> = None;
-        if !partial.is_empty() && !is_blank_line(bytes, cache.lines_upto) {
-            if partial.contains(&b'\r') {
-                return None;
-            }
-            let line_str = std::str::from_utf8(partial).unwrap_or("");
-            let cells = split_table_cells(line_str);
-            let mut raw_partial = String::with_capacity(line_str.len() + 16);
-            raw_partial.push_str("<tr>");
-            let mut row: Vec<TableCell> = Vec::new();
-            for i in 0..cache.ncol {
-                let cell = push_table_cell(
-                    "td",
-                    cells.get(i).map(String::as_str).unwrap_or(""),
-                    cache.aligns.get(i),
-                    &opts,
-                    &mut raw_partial,
-                );
-                if let Some(c) = cell {
-                    row.push(c);
-                }
-            }
-            raw_partial.push_str("</tr>");
-            // Resolve the speculative partial row from a CLONE of the frozen-prefix
-            // occurrence map (does NOT advance it). Byte-copy when footnotes off.
-            let mut occ = cache.fn_occ.clone();
-            resolve_footnote_ids(&raw_partial, &mut occ, &mut partial_html);
+        if !partial.is_empty() {
             if opts.block_data {
-                if opts.gfm_footnotes {
-                    let mut docc = cache.fn_occ.clone();
-                    for c in &mut row {
-                        let mut o = String::with_capacity(c.html.len());
-                        resolve_footnote_ids(&c.html, &mut docc, &mut o);
-                        c.html = o;
-                    }
+                // Whole-partial re-render: the structured cells need a full
+                // text+html rebuild per append anyway (see `PartialRowCache`).
+                if partial.contains(&b'\r') {
+                    return None;
                 }
-                partial_row = Some(row);
+                // Deterministic complexity probe (see `perf` in lib.rs): this
+                // path re-renders the whole partial per append — O(n²/chunk)
+                // while the trailing line never ends. Counted so a `block_data`
+                // scaling shape would see it.
+                #[cfg(feature = "perf_counters")]
+                crate::perf::add_scan(partial.len());
+                let line_str = std::str::from_utf8(partial).unwrap_or("");
+                // The full renderer drops trim-empty body lines (Unicode-aware;
+                // `is_blank_line` is ASCII-only) — render no row for one.
+                if !line_str.trim().is_empty() {
+                    let cells = split_table_cells(line_str);
+                    let mut raw_partial = String::with_capacity(line_str.len() + 16);
+                    raw_partial.push_str("<tr>");
+                    let mut row: Vec<TableCell> = Vec::new();
+                    for i in 0..cache.ncol {
+                        let cell = push_table_cell(
+                            "td",
+                            cells.get(i).map(String::as_str).unwrap_or(""),
+                            cache.aligns.get(i),
+                            &opts,
+                            &mut raw_partial,
+                        );
+                        if let Some(c) = cell {
+                            row.push(c);
+                        }
+                    }
+                    raw_partial.push_str("</tr>");
+                    // Resolve the speculative partial row from a CLONE of the
+                    // frozen-prefix occurrence map (does NOT advance it).
+                    // Byte-copy when footnotes off.
+                    let mut occ = cache.fn_occ.clone();
+                    resolve_footnote_ids(&raw_partial, &mut occ, &mut partial_html);
+                    if opts.gfm_footnotes {
+                        let mut docc = cache.fn_occ.clone();
+                        for c in &mut row {
+                            let mut o = String::with_capacity(c.html.len());
+                            resolve_footnote_ids(&c.html, &mut docc, &mut o);
+                            c.html = o;
+                        }
+                    }
+                    partial_row = Some(row);
+                }
+            } else if !self.extend_partial_row(&mut cache, end, &opts, &mut partial_html) {
+                // A `\r` arrived in the partial line — LF-only state; the full
+                // path renders CRLF rows (same fallback as the row loop above).
+                return None;
             }
         }
 
@@ -2238,6 +2380,172 @@ impl StreamParser {
         self.active_blocks = vec![block.clone()];
         self.table_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of the table's trailing newline-less partial row
+    /// (see [`PartialRowCache`]). Appends the speculative `<tr>…</tr>` to
+    /// `out`, byte-identical to the full renderer's
+    /// `split_table_cells` + `for i in 0..ncol { push_table_cell(…) }` over the
+    /// same line. Returns `false` when a `\r` arrives in the partial (the
+    /// caller drops the whole cache; the full path renders CRLF rows).
+    fn extend_partial_row(
+        &self,
+        cache: &mut TableCache,
+        end: usize,
+        opts: &RenderOpts,
+        out: &mut String,
+    ) -> bool {
+        // (Re-)arm on a fresh partial line — first partial byte ever, or a row
+        // completed since (`lines_upto` moved, and `fn_occ` advanced with it,
+        // so the seed clones are captured here).
+        if cache.partial.as_ref().map_or(true, |p| p.line_start != cache.lines_upto) {
+            cache.partial = Some(PartialRowCache::new(cache.lines_upto, &cache.fn_occ));
+        }
+        let p = cache.partial.as_mut().unwrap();
+
+        // Deterministic complexity probe (see `perf` in lib.rs): this path
+        // returns before the slow-path counter, so it counts its own re-render
+        // work — the newly scanned bytes here, plus the open cell's re-rendered
+        // tail below. Linear while the sub-cache is healthy; a stalled boundary
+        // or re-scan bug grows it quadratically, which tests/scaling.rs gates.
+        #[cfg(feature = "perf_counters")]
+        crate::perf::add_scan(end - p.scanned);
+
+        // Level 1: feed only the unscanned bytes through the cell-split
+        // automaton (char-for-char `split_table_cells` semantics). A cell
+        // closed by an unescaped `|` is final — earlier bytes are immutable,
+        // and the cells before any later `|` are the same whether that pipe
+        // ends the row (trailing decoration) or opens another cell — so it is
+        // rendered once here and never touched again.
+        for (off, ch) in self.buffer[p.scanned..end].char_indices() {
+            if ch == '\r' {
+                return false;
+            }
+            if p.leading {
+                if ch.is_whitespace() {
+                    continue;
+                }
+                p.leading = false;
+                p.last_nonws = Some(p.scanned + off);
+                if ch == '|' {
+                    // The row's one optional leading decoration pipe.
+                    p.frozen_end = p.scanned + off + 1;
+                    continue;
+                }
+            } else if !ch.is_whitespace() {
+                p.last_nonws = Some(p.scanned + off);
+            }
+            if p.esc {
+                p.esc = false;
+                p.push_cell_char(ch);
+            } else if ch == '\\' {
+                p.esc = true;
+            } else if ch == '|' {
+                // Freeze the just-closed cell: render once (placeholder
+                // footnote tokens), resolve into the frozen HTML advancing
+                // `occ`, and reset the open-cell (level 2) state.
+                if p.ncells < cache.ncol {
+                    let content = &p.cellbuf[..p.trim_len];
+                    let mut td = String::with_capacity(content.len() + 16);
+                    push_table_cell("td", content, cache.aligns.get(p.ncells), opts, &mut td);
+                    resolve_footnote_ids(&td, &mut p.occ, &mut p.html);
+                }
+                p.ncells += 1;
+                p.frozen_end = p.scanned + off + 1;
+                p.cellbuf.clear();
+                p.trim_len = 0;
+                p.cell_committed.clear();
+                p.cell_cut = 0;
+                p.cell_len = 0;
+                p.cell_occ = p.occ.clone();
+            } else {
+                p.push_cell_char(ch);
+            }
+        }
+        p.scanned = end;
+
+        // All-whitespace-so-far trailing line (Unicode-aware, unlike the ASCII
+        // `is_blank_line`): the full renderer drops trim-empty body lines, so
+        // emit no row — `out` stays empty and nothing below applies.
+        if p.last_nonws.is_none() {
+            return true;
+        }
+
+        // The open (last) cell's content — `split_table_cells`' trailing
+        // behavior, emulated: the line's trailing whitespace never counts
+        // (`trim_len`), and one trailing `|` is decoration, not content. If
+        // the line's last non-whitespace char is a `|` the scan did NOT
+        // consume, it can only be an escaped one sitting at the end of
+        // `cellbuf` as a literal — drop it and re-trim, matching the one-shot
+        // `strip_suffix('|')` on the raw trimmed line (which strips that pipe
+        // textually and leaves its backslash dangling, to be swallowed).
+        let strip_pipe = matches!(
+            p.last_nonws,
+            Some(pos)
+                if self.buffer.as_bytes()[pos] == b'|'
+                    && pos + 1 != p.frozen_end
+                    && p.trim_len > 0
+        );
+        let content_len = if strip_pipe {
+            debug_assert_eq!(p.cellbuf.as_bytes()[p.trim_len - 1], b'|');
+            p.cellbuf[..p.trim_len - 1].trim_end().len()
+        } else {
+            p.trim_len
+        };
+
+        // Assemble the speculative row: frozen cells + the open cell + empty
+        // padding to `ncol` (extra cells were counted but never rendered).
+        out.push_str("<tr>");
+        out.push_str(&p.html);
+        if p.ncells < cache.ncol {
+            push_table_cell_open("td", cache.aligns.get(p.ncells), opts, out);
+            // Level 2: the boundary contract only covers extensions of the
+            // analyzed input; the trailing-`|` emulation can shrink the
+            // content, so reset first when it did.
+            if content_len < p.cell_len {
+                p.cell_committed.clear();
+                p.cell_cut = 0;
+                p.cell_occ = p.occ.clone();
+            }
+            p.cell_len = content_len;
+            // The open cell's unsettled tail, re-rendered this append (the
+            // other half of this path's counted work — see above).
+            #[cfg(feature = "perf_counters")]
+            crate::perf::add_scan(content_len - p.cell_cut);
+            let mut active = String::new();
+            let boundary_rel =
+                render_inline_boundary(&p.cellbuf[p.cell_cut..content_len], opts, &mut active);
+            let new_cut = p.cell_cut + boundary_rel;
+            if new_cut > p.cell_cut {
+                // Commit [cell_cut..new_cut] by rendering that segment on its
+                // own — a clean boundary guarantees it equals its slice of the
+                // full render — then re-render the now-shorter active tail
+                // (same discipline as `try_incremental_paragraph`).
+                let mut seg = String::new();
+                render_inline(&p.cellbuf[p.cell_cut..new_cut], opts, &mut seg);
+                resolve_footnote_ids(&seg, &mut p.cell_occ, &mut p.cell_committed);
+                p.cell_cut = new_cut;
+                active.clear();
+                render_inline(&p.cellbuf[p.cell_cut..content_len], opts, &mut active);
+            }
+            out.push_str(&p.cell_committed);
+            // Resolve the speculative active tail from a CLONE of the open
+            // cell's occurrence map (does NOT advance persistent state).
+            if opts.gfm_footnotes {
+                let mut occ = p.cell_occ.clone();
+                let mut resolved = String::with_capacity(active.len());
+                resolve_footnote_ids(&active, &mut occ, &mut resolved);
+                out.push_str(&resolved);
+            } else {
+                out.push_str(&active);
+            }
+            out.push_str("</td>");
+            for i in p.ncells + 1..cache.ncol {
+                push_table_cell("td", "", cache.aligns.get(i), opts, out);
+            }
+        }
+        out.push_str("</tr>");
+        true
     }
 
     /// O(new bytes) extension of a long open blockquote / alert at the tail.
@@ -3333,6 +3641,7 @@ fn build_table_cache(
         header_cells: td_header_cells,
         body_cells: Vec::new(),
         fn_occ,
+        partial: None,
     })
 }
 

@@ -342,13 +342,40 @@ fn quoted_list_table(target: usize) -> String {
     s
 }
 
-/// table-partial-row-rerender: the trailing table row never gets its newline,
-/// so the speculative partial-row render re-splits + re-renders the whole
-/// growing partial every append (scan-counter-blind; `rendered` sees it).
+/// table-partial-row-rerender (FIXED): the trailing table row never gets its
+/// newline; the speculative partial-row render used to re-split + re-render
+/// the whole growing partial every append (scan-counter-blind; `rendered` saw
+/// it). The PartialRowCache freezes settled cells at each unescaped `|` and
+/// commits the open cell's settled inline prefix, so only new bytes are
+/// examined per append.
 fn growing_last_cell(target: usize) -> String {
     let mut s = String::from("| a | b |\n| --- | --- |\n| x | y |\n| last | ");
     while s.len() < target {
         s.push_str("word word word ");
+    }
+    s.push_str("|\n");
+    s
+}
+
+/// One header/alignment/data row with thousands of columns — the other
+/// partial-row flavor (growth across cells rather than inside one).
+fn wide_one_row(target: usize) -> String {
+    let cols = (target / 21).max(4);
+    let mut s = String::with_capacity(target + 64);
+    for i in 0..cols {
+        s.push_str("| h");
+        s.push_str(&i.to_string());
+        s.push(' ');
+    }
+    s.push_str("|\n");
+    for _ in 0..cols {
+        s.push_str("| --- ");
+    }
+    s.push_str("|\n");
+    for i in 0..cols {
+        s.push_str("| c");
+        s.push_str(&i.to_string());
+        s.push(' ');
     }
     s.push_str("|\n");
     s
@@ -612,6 +639,11 @@ fn shapes() -> Vec<Shape> {
             scanned: Linear,
             rendered: Linear,
         },
+        // Table partial-row shapes (hunt group table-partial-row-rerender,
+        // FIXED via the PartialRowCache) — the partial-row path self-counts
+        // into `scanned`, so both metrics now pin this class.
+        lin("growing_last_cell", growing_last_cell, Linear),
+        lin("wide_one_row", wide_one_row, Linear),
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
@@ -627,7 +659,8 @@ fn shapes() -> Vec<Shape> {
         // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
         quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
         quad("open-list-item-body-rerender", quoted_list_table, base, Linear, KnownQuadratic),
-        quad("table-partial-row-rerender", growing_last_cell, base, Linear, KnownQuadratic),
+        // table-partial-row-rerender: FIXED — growing_last_cell + wide_one_row
+        // promoted to linear shapes below.
         // resolve-delimiters-replace-range: FIXED — strikethrough_para promoted
         // to a linear shape above (the render-side win is wall-only).
         // compute-cut-pair-overlap-scan: FIXED — em_pairs_para promoted above.

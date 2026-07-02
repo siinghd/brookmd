@@ -1595,16 +1595,16 @@ pub(crate) fn render_cell_inner(content: &str, opts: &RenderOpts) -> String {
     s
 }
 
-/// Render a `<td>`/`<th>` cell into `out`. When `opts.block_data` is on, also
-/// returns the structured `TableCell` ({text,html}) for the same cell; returns
-/// `None` when off. The emitted HTML is byte-identical either way.
-pub(crate) fn push_table_cell(
+/// Emit a `<td>`/`<th>` opening tag (scope/alignment attrs included) — the
+/// single source of truth for the cell opener, shared by [`push_table_cell`]
+/// and the streaming partial-row cache (which splices cached inner HTML
+/// between the opener and closer).
+pub(crate) fn push_table_cell_open(
     tag: &str,
-    content: &str,
     align: Option<&Option<&'static str>>,
     opts: &RenderOpts,
     out: &mut String,
-) -> Option<TableCell> {
+) {
     out.push('<');
     out.push_str(tag);
     // a11y: scope a header cell to its column (helps screen readers; deviates
@@ -1618,6 +1618,19 @@ pub(crate) fn push_table_cell(
         out.push('"');
     }
     out.push('>');
+}
+
+/// Render a `<td>`/`<th>` cell into `out`. When `opts.block_data` is on, also
+/// returns the structured `TableCell` ({text,html}) for the same cell; returns
+/// `None` when off. The emitted HTML is byte-identical either way.
+pub(crate) fn push_table_cell(
+    tag: &str,
+    content: &str,
+    align: Option<&Option<&'static str>>,
+    opts: &RenderOpts,
+    out: &mut String,
+) -> Option<TableCell> {
+    push_table_cell_open(tag, align, opts, out);
     // OFF path (default): render straight into `out` — no intermediate String,
     // no memcpy (byte-identical to the pre-refactor behavior, zero new alloc).
     // ON path: capture the inner html once to also build the structured cell.

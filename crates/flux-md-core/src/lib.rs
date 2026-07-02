@@ -29,7 +29,10 @@ pub use parser::{Patch, StreamParser};
 /// - `scanned_bytes` — tail bytes the *slow path* re-scans. The incremental
 ///   caches (fence/paragraph/table/container/list/indented/html) extend an open
 ///   block in O(new bytes) and never reach this counter; only a cache miss
-///   falls through to `scan(tail)`, whose cost is `tail.len()`.
+///   falls through to `scan(tail)`, whose cost is `tail.len()`. One exception:
+///   the table cache's speculative partial-row path counts the bytes it
+///   scans/re-renders per append itself — it returns before the slow-path
+///   counter, and that exact cliff shipped once behind a linear-looking count.
 /// - `rendered_bytes` — input bytes fed through the inline renderer. Catches
 ///   cache-*internal* quadratics the scan counter is blind to: a cache that
 ///   stays armed but re-inline-renders a growing region on every append (open
