@@ -267,3 +267,126 @@ fn multi_paragraph_id_stable_across_paragraph_breaks() {
     let h = collect(&p);
     assert!(h.contains("first body") && h.contains("second body") && h.contains("third body"), "{h}");
 }
+
+#[test]
+fn lazy_continuation_matches_full_render() {
+    // Marker-less lazy paragraph-continuation lines (CommonMark laziness) —
+    // the cache glues them exactly like `blockquote_inner` instead of bailing,
+    // so a quote extended lazily streams in O(new bytes). Every chunking must
+    // stay byte-identical to one-shot.
+    let make = || alerts(StreamParser::new());
+
+    // A long lazy run (the O(n²) cliff shape) — the cache must stay armed.
+    let mut lazy_run = String::from("> the quoted paragraph starts here\n");
+    for i in 0..300 {
+        lazy_run.push_str(&format!("lazy continuation line {i} with plain prose words\n"));
+    }
+
+    let cases: Vec<&str> = vec![
+        // basic laziness + returning to marked lines
+        "> a\nlazy line\n",
+        "> a\nlazy one\nlazy two\n> back to marked\n",
+        "> a\nlazy **bold** and `code`\nmore lazy\n",
+        // left-trim: ≤3 spaces, ≥4 spaces (indented code can't interrupt), tabs
+        "> a\n  two-space lazy\n",
+        "> a\n    four-space lazy\n",
+        "> a\n\ttab lazy\n",
+        // a setext-looking lazy line stays paragraph text (glued, not underline)
+        "> a\n===\n",
+        // an ordered marker not starting at 1 cannot interrupt — lazy text
+        "> a\n5. not a list\n",
+        // lines that END the quote instead (block starters / blank)
+        "> a\n# heading\n",
+        "> a\n- item\n",
+        "> a\n> b\nlazy\n\nafter paragraph\n",
+        // laziness only continues an OPEN paragraph — after a blank `>` line
+        // a marker-less line is outside the quote
+        "> a\n>\noutside paragraph\n",
+        // alert body extended lazily
+        "> [!NOTE]\n> body line\nlazy body continuation\n",
+        // a lazy line right after the marker glues onto the TITLE line — the
+        // container dissolves into a plain blockquote
+        "> [!NOTE]\nlazy title continuation\n",
+        // multi-paragraph quote, second paragraph extended lazily
+        "> p1\n>\n> p2\nlazy p2 tail\n",
+        &lazy_run,
+    ];
+    for md in cases {
+        let one = render_with(make, md);
+        let preview: String = md.chars().take(60).collect();
+        assert_eq!(streamed_with(make, md), one, "char-stream != one-shot for {:?}", preview);
+        for n in 1..=9 {
+            assert_eq!(chunked_with(make, md, n), one, "chunk={n} != one-shot for {:?}", preview);
+        }
+    }
+}
+
+#[test]
+fn lazy_continuation_exact_bytes() {
+    // Pin the glue shape: the lazy line joins the previous one with a single
+    // space (soft break), left-trimmed — `blockquote_inner`'s exact transform.
+    let mut p = alerts(StreamParser::new());
+    p.append("> a\n");
+    p.append("lazy tail\n");
+    p.append("> c\n");
+    p.finalize();
+    assert_eq!(collect(&p), "<blockquote>\n<p>a lazy tail\nc</p>\n</blockquote>");
+}
+
+#[test]
+fn quote_hosted_ref_defs_match_full_render() {
+    // Link-reference definitions inside a container are document-global (§4.7).
+    // The recursive container-block cache now feeds them to its nested parser
+    // (no `]:` bail); the outer full reparse re-derives the global table when
+    // the quote closes, so post-quote uses resolve exactly as one-shot.
+    let make = || alerts(StreamParser::new());
+
+    // The cliff shape: a def-run quote long enough to arm + stream the cache.
+    let mut def_run = String::new();
+    for i in 0..60 {
+        def_run.push_str(&format!("> [r{i}]: https://example.com/page/{i} \"Title {i}\"\n"));
+    }
+    let def_run_then_use = format!("{def_run}\nsee [zero][r0] and [last][r59] after the quote\n");
+
+    let cases: Vec<&str> = vec![
+        // def inside the quote, used after the quote closes
+        "> [r]: https://example.com/x \"T\"\n\nuse [link][r] here\n",
+        // def inside the quote, used later inside the same quote
+        "> [r]: https://example.com/x\n> see [link][r] inside\n",
+        // def mixed with quote prose before and after
+        "> intro paragraph\n> [r]: https://example.com/x\n> outro [use][r]\n",
+        // def whose title arrives on the following line
+        "> [r]: https://example.com/x\n> \"Title on next line\"\n\nuse [link][r]\n",
+        // `[^label]:` with footnotes OFF is a plain link-ref def (label `^f`)
+        "> [^f]: https://example.com/n\n\nuse [note][^f] after\n",
+        // defs inside an alert body
+        "> [!NOTE]\n> [r]: https://example.com/x\n> body [use][r]\n",
+        // invalid def (unquoted trailing text) stays a paragraph — no def
+        "> [r]: https://example.com/x trailing words\n",
+        &def_run,
+        &def_run_then_use,
+    ];
+    for md in cases {
+        let one = render_with(make, md);
+        let preview: String = md.chars().take(60).collect();
+        assert_eq!(streamed_with(make, md), one, "char-stream != one-shot for {:?}", preview);
+        for n in 1..=9 {
+            assert_eq!(chunked_with(make, md, n), one, "chunk={n} != one-shot for {:?}", preview);
+        }
+    }
+}
+
+#[test]
+fn quote_hosted_ref_def_resolves_after_close_exact_bytes() {
+    let mut p = alerts(StreamParser::new());
+    for ch in "> [r]: https://example.com/x \"T\"\n\nsee [it][r]\n".chars() {
+        let mut buf = [0u8; 4];
+        p.append(ch.encode_utf8(&mut buf));
+    }
+    p.finalize();
+    assert_eq!(
+        collect(&p),
+        "<blockquote></blockquote><p>see <a href=\"https://example.com/x\" title=\"T\" \
+         target=\"_blank\" rel=\"noopener noreferrer nofollow\">it</a></p>"
+    );
+}

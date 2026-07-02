@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::blocks::Block;
 use crate::render::{
-    blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
+    alert_head, blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
     collect_footnote_refs_overlay, extend_footnote_refs, is_fence_close_line,
     is_footnote_def_block, item_body, item_directly_loose, last_footnote_def_opener,
     normalize_label, parse_alignments, push_code_fence_open, push_table_cell,
@@ -64,7 +64,13 @@ const MAX_REF_DEPTH: usize = 100;
 /// anywhere near this deep.
 const MAX_CONTAINER_DEPTH: usize = 24;
 
-fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx, depth: usize) {
+fn collect_refs(
+    text: &str,
+    refs: &mut HashMap<String, LinkRef>,
+    ctx: ScanCtx,
+    alerts: bool,
+    depth: usize,
+) {
     if depth >= MAX_REF_DEPTH {
         return;
     }
@@ -78,14 +84,28 @@ fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx, d
             }
             RawBlockKind::Blockquote => {
                 let inner = blockquote_inner(&text[raw.range.clone()]);
-                collect_refs(&inner, refs, ctx, depth + 1);
+                // Align with `render_alert`: an alert's body starts on line 2
+                // (the `[!KIND]` marker line is the title, not body content).
+                // Scanning the title line as body would glue a first-body-line
+                // definition onto the title "paragraph" here while the render
+                // side's body scan treats it as a definition — the def would be
+                // dropped from output yet never collected (a swallowed def).
+                let inner_body = if alerts && alert_head(&inner).is_some() {
+                    match inner.find('\n') {
+                        Some(nl) => &inner[nl + 1..],
+                        None => "",
+                    }
+                } else {
+                    &inner[..]
+                };
+                collect_refs(inner_body, refs, ctx, alerts, depth + 1);
             }
             RawBlockKind::List { .. } => {
                 // Re-split the list into items and recurse into each body.
                 let slice = &text[raw.range.clone()];
                 for item in split_list_items(slice) {
                     if let Some(body) = item_body(item.as_bytes()) {
-                        collect_refs(&body, refs, ctx, depth + 1);
+                        collect_refs(&body, refs, ctx, alerts, depth + 1);
                     }
                 }
             }
@@ -740,12 +760,15 @@ enum ContainerCacheKind {
 /// the SAME `scan()` + `render_block()` engine run on the `>`-stripped inner: a
 /// fresh `StreamParser` fed that identical stripped inner reproduces the inner
 /// HTML exactly (chunk-independence), and `force_open_tail` makes its committed
-/// sub-blocks match the full path's all-blocks-open_tail propagation. The cache
-/// BAILS to the full reparse (correct, just O(n²)) on anything the nested parser
-/// can't reproduce identically: a `\r` (CRLF), a non-`>` lazy continuation line,
-/// a footnote ref/def (`[^`, document-global numbering), a link-reference
-/// definition (`]:`, document-global resolution), or `block_data` (the nested
-/// `ContainerData` channel is not populated in v1).
+/// sub-blocks match the full path's all-blocks-open_tail propagation. Link-ref
+/// definitions inside the container are handled NATIVELY by the nested parser
+/// (its own def-run commit keeps them O(new bytes)); document-global resolution
+/// is preserved because the container only ever commits through a full outer
+/// reparse, which re-collects refs from source. The cache BAILS to the full
+/// reparse (correct, just O(n²)) on anything the nested parser can't reproduce
+/// identically: a `\r` (CRLF), a non-`>` lazy continuation line, a footnote
+/// ref/def (`[^` with footnotes on — numbering is document-global), or
+/// `block_data` (the nested `ContainerData` channel is not populated in v1).
 struct ContainerBlockCache {
     /// Absolute byte offset of the container's first line in `buffer`.
     start: usize,
@@ -770,8 +793,8 @@ struct ContainerBlockCache {
     /// True when mid inner-line: the current line's `>` prefix was already
     /// consumed and partial content fed; continuation bytes feed raw (no prefix).
     mid_line: bool,
-    /// Last byte fed to `inner` (for catching a `[^` / `]:` marker split across
-    /// two feeds). `None` until the first non-empty feed.
+    /// Last byte fed to `inner` (for catching a `[^` marker split across two
+    /// feeds when footnotes are on). `None` until the first non-empty feed.
     last_fed: Option<u8>,
     /// Whether the outer parser has footnotes on (then a `[^` inner marker BAILS,
     /// since the nested parser runs with footnotes off).
@@ -1554,7 +1577,7 @@ impl StreamParser {
         // lookup time (first-definition-wins).
         let committed_refs = Rc::clone(&self.committed_refs);
         let mut tail_refs = HashMap::new();
-        collect_refs(tail, &mut tail_refs, ctx, 0);
+        collect_refs(tail, &mut tail_refs, ctx, self.gfm_alerts, 0);
 
         // Renderable blocks: skip link-ref defs (no output) and, when footnotes
         // are on, footnote definitions (collected into the section instead).
@@ -2195,7 +2218,13 @@ impl StreamParser {
             // future change stashes a clone of the committed table, this fires in
             // tests before the silent O(n²) regression ships.
             debug_assert_eq!(Rc::strong_count(&self.committed_refs), 1);
-            collect_refs(committed_slice, Rc::make_mut(&mut self.committed_refs), ctx, 0);
+            collect_refs(
+                committed_slice,
+                Rc::make_mut(&mut self.committed_refs),
+                ctx,
+                self.gfm_alerts,
+                0,
+            );
         }
 
         Patch { newly_committed, active: new_active }
@@ -3097,8 +3126,10 @@ impl StreamParser {
 
         // Fold every newly-complete `> `-marker line. A blank `>` line closes
         // the current paragraph (rendered once into `committed_paras_html`)
-        // and starts a fresh one; any other line is folded into the current
-        // paragraph's `inner_buffer`. Bails on `\r` or a non-`>` line.
+        // and starts a fresh one; a marker-less line that the scanner keeps as a
+        // LAZY paragraph continuation glues onto the previous line; any other
+        // line is folded into the current paragraph's `inner_buffer`. Bails on
+        // `\r` or a marker-less line that ends the quote.
         let mut pos = cache.lines_upto;
         while pos < end {
             let r = match bytes[pos..end].iter().position(|&b| b == b'\n') {
@@ -3110,7 +3141,37 @@ impl StreamParser {
             if bytes[pos..content_end].contains(&b'\r') {
                 return None;
             }
-            let stripped = strip_blockquote_marker(&bytes[pos..content_end])?;
+            let line = &bytes[pos..content_end];
+            let stripped = match strip_blockquote_marker(line) {
+                Some(s) => s,
+                None => {
+                    // Marker-less line. It stays in the quote only as a lazy
+                    // paragraph continuation, under the scanner's exact rule
+                    // (`scan_blockquote`): the inner paragraph must be open, the
+                    // line non-blank, and the line must not itself start a block.
+                    // Anything else ends the quote here — bail to the full
+                    // reparse, which commits the container.
+                    if cache.inner_buffer.is_empty()
+                        || line.iter().all(|&b| matches!(b, b' ' | b'\t'))
+                        || would_start_other_block(line, 0, opts.scan_ctx())
+                    {
+                        return None;
+                    }
+                    // Glue exactly like `blockquote_inner`: the previous line's
+                    // `\n` becomes a single space and the lazy line is
+                    // left-trimmed, so the re-scan can't reinterpret it as a new
+                    // block and a soft break renders as a space anyway.
+                    let lazy = std::str::from_utf8(line).ok()?.trim_start();
+                    debug_assert!(cache.inner_buffer.ends_with('\n'));
+                    cache.inner_buffer.pop();
+                    cache.inner_buffer.push(' ');
+                    cache.inner_buffer.push_str(lazy);
+                    cache.inner_buffer.push('\n');
+                    cache.lines_upto = next;
+                    pos = next;
+                    continue;
+                }
+            };
             if stripped.iter().all(|&b| matches!(b, b' ' | b'\t')) {
                 // Blank `>` line → close the current paragraph (if any).
                 // Consecutive blanks collapse: nothing to push when the
@@ -3145,6 +3206,7 @@ impl StreamParser {
         // see the same committed state.
         let partial = &bytes[cache.lines_upto..end];
         let mut partial_pushed = 0usize;
+        let mut partial_glued = false;
         if !partial.is_empty() {
             if partial.contains(&b'\r') {
                 return None;
@@ -3166,10 +3228,31 @@ impl StreamParser {
                     cache.inner_buffer.push_str(stripped_str);
                     partial_pushed = stripped_str.len();
                 }
+            } else if partial.iter().all(|&b| matches!(b, b' ' | b'\t')) {
+                // All-whitespace so far — could still become a `>` marker line
+                // (or a blank line that ends the quote). No visible content
+                // either way: render with what we have committed so far.
+            } else if cache.inner_buffer.is_empty()
+                || would_start_other_block(partial, 0, opts.scan_ctx())
+            {
+                // The scanner already excludes this (partial) line from the
+                // quote at this prefix — bail so the full reparse owns the
+                // container boundary.
+                return None;
             } else {
-                // No `>` marker yet on the partial — could still become one as
-                // more bytes arrive (e.g. just `>` or leading spaces). Render
-                // with what we have committed so far.
+                // Speculative LAZY continuation, mirroring the one-shot scan of
+                // this exact prefix: glue like the complete-line path (the
+                // previous `\n` becomes a space). Truncated back — and the `\n`
+                // restored — after rendering, so committed state is unchanged.
+                let lazy = std::str::from_utf8(partial).ok()?.trim_start();
+                debug_assert!(cache.inner_buffer.ends_with('\n'));
+                cache.inner_buffer.pop();
+                cache.inner_buffer.push(' ');
+                cache.inner_buffer.push_str(lazy);
+                // Counts the replaced `\n` too, so `committed_inner_end` lands
+                // just before the glue space.
+                partial_pushed = lazy.len() + 1;
+                partial_glued = true;
             }
         }
         let post_partial_len = cache.inner_buffer.len();
@@ -3281,8 +3364,12 @@ impl StreamParser {
         html.push_str(&cache.wrapper_close);
 
         // Drop the speculative partial bytes so the cache's committed state is
-        // unchanged for the next append.
+        // unchanged for the next append (a glued lazy partial also consumed the
+        // previous line's `\n` — put it back).
         cache.inner_buffer.truncate(committed_inner_end);
+        if partial_glued {
+            cache.inner_buffer.push('\n');
+        }
 
         // Assemble the opt-in `nested` channel: the stable committed paragraphs
         // (O(paras) clone of cheap entries) plus the current open paragraph.
@@ -3406,8 +3493,9 @@ impl StreamParser {
     /// could not reproduce the inner byte-for-byte: an incomplete first line (the
     /// Blockquote/Alert distinction isn't settled), a wrong block kind,
     /// `block_data` (v1 doesn't fill the nested data channel), or any of the feed
-    /// BAILs (CRLF / lazy continuation / footnote / ref-def). The first feed
-    /// processes every line already present; later appends fold only new bytes.
+    /// BAILs (CRLF / lazy continuation / footnote marker with footnotes on). The
+    /// first feed processes every line already present; later appends fold only
+    /// new bytes.
     fn build_container_block_cache(
         &self,
         start: usize,
@@ -4355,11 +4443,16 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
 /// output, so rendering with what's committed stays byte-faithful.
 ///
 /// Returns `None` (the caller BAILS to the full reparse) on a `\r` (CRLF), a
-/// non-`>` line (a lazy continuation the nested parser can't see verbatim), or a
-/// scoping marker: a footnote `[^` (when `footnotes`) or a link-ref `]:` — both
-/// document-global, so the independent nested parser would mis-handle them.
-/// `last_fed` (the previous feed's last byte) catches a marker split across two
-/// feeds. On success returns the delta plus the new consumed offset.
+/// non-`>` line (a lazy continuation the nested parser can't see verbatim), or —
+/// only when `footnotes` is on — a `[^` marker (footnote numbering is
+/// document-global and the nested parser runs with footnotes off). Link-ref
+/// definitions do NOT bail: the nested parser parses them natively (its own
+/// def-run commit + committed-ref fold), and the outer parser re-derives the
+/// document-global table from source at every commit/finalize boundary (the
+/// container only ever commits through a full reparse), so post-quote text
+/// resolves quote-hosted defs exactly as one-shot does. `last_fed` (the previous
+/// feed's last byte) catches a `[^` split across two feeds. On success returns
+/// the delta plus the new consumed offset.
 fn strip_container_delta(
     bytes: &[u8],
     from: usize,
@@ -4439,15 +4532,13 @@ fn strip_container_delta(
             }
         }
     }
-    // Scoping bail (over-conservative substring match; a 1-byte overlap with the
-    // previous feed catches a `[^` / `]:` marker split across the feed boundary).
+    // Footnote scoping bail (over-conservative substring match; a 1-byte overlap
+    // with the previous feed catches a `[^` marker split across the feed boundary).
     let db = delta.as_bytes();
-    if (footnotes && *last_fed == Some(b'[') && db.first() == Some(&b'^'))
-        || (*last_fed == Some(b']') && db.first() == Some(&b':'))
-    {
+    if footnotes && *last_fed == Some(b'[') && db.first() == Some(&b'^') {
         return None;
     }
-    if (footnotes && delta.contains("[^")) || delta.contains("]:") {
+    if footnotes && delta.contains("[^") {
         return None;
     }
     if let Some(&b) = db.last() {
@@ -5051,21 +5142,35 @@ fn build_container_cache(
     // Don't arm for a container whose committed inner content already has BLOCK
     // structure (a list, nested blockquote, heading, fence, …): this cache only
     // renders plain paragraphs, so arming would re-arm-then-bail every append.
-    // Let the full reparse own it.
+    // Marker-less lines are fine when they are lazy paragraph continuations
+    // (the scanner's rule: inner paragraph open, non-blank, not a block start —
+    // `try_incremental_container` glues them); a marker-less line that instead
+    // ENDS the quote means the tail isn't a single growing container, so arming
+    // would bail every append. Let the full reparse own both bad shapes.
     {
+        let mut para_open = false;
         let mut p = lines_upto;
         while p < end {
             let r = match bytes[p..end].iter().position(|&b| b == b'\n') {
                 None => break, // trailing partial — settled by try_incremental_container
                 Some(r) => r,
             };
-            if let Some(stripped) = strip_blockquote_marker(&bytes[p..p + r]) {
-                if !stripped.iter().all(|&b| matches!(b, b' ' | b'\t'))
-                    && container_inner_breaks_paragraph(stripped, opts.scan_ctx())
-                {
+            let line = &bytes[p..p + r];
+            if let Some(stripped) = strip_blockquote_marker(line) {
+                if stripped.iter().all(|&b| matches!(b, b' ' | b'\t')) {
+                    para_open = false;
+                } else if container_inner_breaks_paragraph(stripped, opts.scan_ctx()) {
                     return None;
+                } else {
+                    para_open = true;
                 }
+            } else if !para_open
+                || line.iter().all(|&b| matches!(b, b' ' | b'\t'))
+                || would_start_other_block(line, 0, opts.scan_ctx())
+            {
+                return None;
             }
+            // else: a lazy continuation — the paragraph stays open.
             p += r + 1;
         }
     }

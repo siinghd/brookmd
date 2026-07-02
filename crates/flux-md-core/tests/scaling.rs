@@ -189,6 +189,72 @@ fn big_blockquote(target: usize) -> String {
     )
 }
 
+fn bq_lazy_continuation(target: usize) -> String {
+    // One `>` line, then marker-less lazy paragraph-continuation lines forever
+    // (CommonMark laziness). The container cache used to bail on every lazy
+    // line, so the never-committing quote re-scanned its whole tail per append
+    // (O(n²)); the cache now glues lazy lines exactly like `blockquote_inner`.
+    let mut s = String::from("> the quoted paragraph starts here\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("lazy continuation line {i} with plain prose words\n"));
+        i += 1;
+    }
+    s
+}
+
+fn quote_ref_defs(target: usize) -> String {
+    // A blockquote hosting a growing run of link-reference definitions. The
+    // recursive container-block cache used to refuse any container holding a
+    // `]:` (document-global scoping), so the quote armed NO cache and the whole
+    // growing tail re-scanned per append (O(n²), 44 s @ 512 KB). The nested
+    // parser now consumes def lines natively (its own def-run commit), and the
+    // outer full reparse re-derives the global ref table whenever the container
+    // closes/commits.
+    let mut s = String::with_capacity(target + 64);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("> [r{i}]: https://example.com/page/{i} \"Title {i}\"\n"));
+        i += 1;
+    }
+    s
+}
+
+fn quote_footnote_defs(target: usize) -> String {
+    // Same shape with `[^label]:` defs. With footnotes OFF (this harness),
+    // `[^f0]:` is a plain link-ref def whose label happens to start with `^` —
+    // it must stream linearly like `quote_ref_defs`. (With footnotes ON the
+    // container cache still bails on `[^` — document-global numbering — and
+    // that flavor remains a known-quadratic follow-up.)
+    let mut s = String::with_capacity(target + 64);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("> [^f{i}]: https://example.com/note/{i} \"Note {i}\"\n"));
+        i += 1;
+    }
+    s
+}
+
+fn quote_depth_growing(target: usize) -> String {
+    // Ever-deepening nested blockquotes: line k carries k `>` markers. The
+    // recursive container-block cache spends one nested parser per level and is
+    // capped at MAX_CONTAINER_DEPTH; past the cap the innermost parser
+    // full-reparses its growing tail every append with O(depth) marker
+    // restripping per line — worse than quadratic. Fixing this needs an
+    // iterative wrapper-stack representation (fold the settled shallower level
+    // once when the stack deepens, single innermost parser).
+    let mut s = String::with_capacity(target + 4096);
+    let mut k = 1usize;
+    while s.len() < target {
+        for _ in 0..k {
+            s.push_str("> ");
+        }
+        s.push_str(&format!("level {k} prose with **bold**\n"));
+        k += 1;
+    }
+    s
+}
+
 fn big_alert(target: usize) -> String {
     // The 0.18.4 shape: a `> [!NOTE]` alert with structured inner blocks. The
     // recursive container-block cache renders the `>`-stripped inner through a
@@ -417,18 +483,6 @@ fn g_big_list_refs(target: usize) -> String {
     let mut i = 0usize;
     while s.len() < target {
         s.push_str(&format!("- item {i} cites a source[^g{i}] here\n"));
-        i += 1;
-    }
-    s
-}
-
-/// global-defs-inside-container: link-ref defs inside a blockquote defeat the
-/// recursive container-block cache (document-global scoping bail).
-fn quote_ref_defs(target: usize) -> String {
-    let mut s = String::with_capacity(target + 64);
-    let mut i = 0usize;
-    while s.len() < target {
-        s.push_str(&format!("> [r{i}]: https://example.com/page/{i} \"Title {i}\"\n"));
         i += 1;
     }
     s
@@ -685,22 +739,6 @@ fn indented_code_blanks(target: usize) -> String {
     s
 }
 
-/// container-stack-churn-lazy: blockquote depth grows line by line, churning
-/// the container stack (O(n²·depth) — worse than plain quadratic in wall, so
-/// sizes stay tiny).
-fn quote_depth_growing(target: usize) -> String {
-    let mut s = String::with_capacity(target + 4096);
-    let mut k = 1usize;
-    while s.len() < target {
-        for _ in 0..k {
-            s.push_str("> ");
-        }
-        s.push_str(&format!("level {k} prose with **bold**\n"));
-        k += 1;
-    }
-    s
-}
-
 // ---- the per-shape table ----------------------------------------------------
 
 /// Default span for shapes cheap enough to run big: 16x. Linear work grows
@@ -835,6 +873,13 @@ fn shapes() -> Vec<Shape> {
         lin("loose_subs_one_item", loose_subs_one_item, Linear),
         lin("staircase_blank_flap", staircase_blank_flap, Linear),
         lin("indented_code_with_interior_blanks", indented_code_blanks, Linear),
+        // Container defs + laziness (hunt groups global-defs-inside-container,
+        // FIXED, and the lazy half of container-stack-churn-lazy, FIXED): the
+        // nested parser consumes quote-hosted def runs natively, and lazy
+        // marker-less continuation lines glue exactly like blockquote_inner.
+        lin("quote_ref_defs", quote_ref_defs, Linear),
+        lin("quote_footnote_defs", quote_footnote_defs, Linear),
+        lin("bq_lazy_continuation", bq_lazy_continuation, Linear),
         // Footnote shapes (hunt group footnote-global-state, FIXED): def-run
         // tails commit up to the last def opener, the per-cache footnote
         // numbering extends over only NEW bytes (`RegionFnNums`, self-counted
@@ -912,7 +957,9 @@ fn shapes() -> Vec<Shape> {
         // shapes below (def-run commit cut + incremental per-cache footnote
         // numbering + list-cache `[^` bail narrowed to genuine def lines).
         // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
-        quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
+        // global-defs-inside-container: FIXED — quote_ref_defs,
+        // quote_footnote_defs and bq_lazy_continuation promoted to linear
+        // shapes below (footnotes-ON quote-hosted defs remain a follow-up).
         // open-list-item-body-rerender: FIXED — quoted_list_table and the
         // list_* shapes promoted to linear below.
         // table-partial-row-rerender: FIXED — growing_last_cell + wide_one_row
@@ -961,8 +1008,13 @@ fn shapes() -> Vec<Shape> {
         scanned: KnownQuadratic,
         rendered: KnownQuadratic,
     });
+    // The DEPTH half of container-stack-churn-lazy remains: per-line O(depth)
+    // marker restripping past MAX_CONTAINER_DEPTH is slightly worse than pure
+    // n² (~104x across this 8x span); the quad guard leaves headroom over the
+    // measured curve. Fix = iterative wrapper-stack (fold settled shallower
+    // levels once), a follow-up.
     v.push(Shape {
-        name: "container-stack-churn-lazy",
+        name: "container-depth-growth-pin",
         gen: quote_depth_growing,
         opts: base,
         chunk: CHUNK,

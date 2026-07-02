@@ -622,3 +622,47 @@ fn blockquote_inner_all_block_types_not_flattened() {
     assert_parity("> [home]: https://example.com \"Home\"\n> See the [home] page.\n"); // ref def (no output)
     assert_parity("> ---\n"); // thematic break
 }
+
+#[test]
+fn lazy_continuation_streams_with_parity() {
+    // The container cache folds marker-less lazy paragraph-continuation lines
+    // (glued like `blockquote_inner`) instead of bailing — including the
+    // still-partial trailing lazy line, which the one-shot scan already keeps
+    // in the quote at the same prefix.
+    assert_parity("> a\nlazy");
+    assert_parity("> a\nlazy line\n");
+    assert_parity("> a\nlazy one\nlazy two");
+    assert_parity("> a\nlazy one\n> back to marked\n");
+    assert_parity("> a\n  indented laz");
+    assert_parity("> a\n===");
+    assert_parity("> a\n5. not a list\n");
+    assert_parity("> [!NOTE]\n> body\nlazy body tail");
+    // A lazy line directly after the `[!NOTE]` marker glues onto the TITLE
+    // line, so the container is no longer an alert at all — the cache must
+    // hand the boundary back to the full reparse.
+    assert_parity("> [!NOTE]\nlazy title continuation");
+    assert_parity("> [!NOTE]\nlazy title continuation\n");
+    // Lines that END the quote at this prefix instead (block start / blank /
+    // no open paragraph) — the full path owns the boundary.
+    assert_parity("> a\n# h");
+    assert_parity("> a\n- item");
+    assert_parity("> a\n>\noutside");
+    assert_parity("> a\n\nafter");
+}
+
+#[test]
+fn quote_hosted_ref_defs_stream_with_parity() {
+    // Link-ref defs inside an open quote are consumed natively by the nested
+    // parser (defs render to nothing; uses resolve once the def is complete) —
+    // mid-stream output must match the one-shot view of the same prefix.
+    assert_parity("> [r]: https://example.com/x \"T\"\n");
+    assert_parity("> [r]: https://example.com/x \"T\"\n> [s]: https://example.com/y\n");
+    assert_parity("> [r]: https://example.com/x\n> see [it][r] resolved\n");
+    assert_parity("> [r]: https://example.com/x\n> partial [it][r");
+    assert_parity("> [!NOTE]\n> [r]: https://example.com/x\n> body [use][r]\n");
+    // half-typed def at the tail (dest, then title still arriving)
+    assert_parity("> [r]: https://exa");
+    assert_parity("> [r]: https://example.com/x \"Tit");
+    // `[^…]:` with footnotes off is a plain link-ref def
+    assert_parity("> [^f]: https://example.com/n\n");
+}
