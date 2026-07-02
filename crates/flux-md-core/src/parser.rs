@@ -1811,9 +1811,12 @@ impl StreamParser {
             }
         }
         // The trailing partial line is re-processed each append (it is short). It
-        // ends the block iff it satisfies the close condition — bail then.
+        // ends the block iff it satisfies the close condition — bail then. An
+        // EMPTY partial (buffer ends exactly at `\n`) is "no next line yet", not
+        // a blank line, so it must not trip the type-6/7 blank-line close (that
+        // check is vacuously true on zero bytes).
         let partial = &bytes[cache.lines_upto..end];
-        if html_block_closes_here(partial, html_type, partial) {
+        if !partial.is_empty() && html_block_closes_here(partial, html_type, partial) {
             return None;
         }
         let mut html = String::with_capacity(cache.cached_prefix.len() + partial.len() + 32);
@@ -3688,8 +3691,10 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
             }
         }
     }
+    // An EMPTY partial (buffer ends exactly at `\n`) is "no next line yet", not
+    // the type-6/7 closing blank line — keep arming (mirrors try_incremental_html).
     let partial = &bytes[lines_upto..end];
-    if html_block_closes_here(partial, html_type, partial) {
+    if !partial.is_empty() && html_block_closes_here(partial, html_type, partial) {
         return None;
     }
     Some(HtmlBlockCache { start, id, html_type, pass_through, cached_prefix, lines_upto })

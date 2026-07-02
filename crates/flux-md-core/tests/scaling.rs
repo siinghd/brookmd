@@ -273,13 +273,14 @@ fn component_block_open(target: usize) -> String {
     s // close tag never arrives
 }
 
-/// html-empty-partial-blank-close: type-6 HTML block with 64-byte lines so
-/// chunked appends always end newline-aligned — the empty trailing partial is
-/// misclassified as the closing blank line and the HTML cache drops every
-/// append.
-fn html_div_aligned(target: usize) -> String {
+/// html-empty-partial-blank-close (FIXED): open raw-HTML block with 64-byte
+/// lines so every chunk=128 append ends precisely at a line boundary (empty
+/// trailing partial). An empty partial used to vacuously pass the type-6/7
+/// blank-line close test, dropping the HtmlBlockCache (and refusing to re-arm)
+/// on every such append -> O(n²); now it stays armed and streams linearly.
+fn html_block_aligned(opener: &str, target: usize) -> String {
     let mut s = String::with_capacity(target + 64);
-    let mut open = String::from("<div class=\"wrap\">");
+    let mut open = String::from(opener);
     while open.len() < 63 {
         open.push(' ');
     }
@@ -290,6 +291,14 @@ fn html_div_aligned(target: usize) -> String {
         s.push_str(line);
     }
     s
+}
+
+fn html_type6_aligned(target: usize) -> String {
+    html_block_aligned("<div class=\"wrap\">", target)
+}
+
+fn html_type7_aligned(target: usize) -> String {
+    html_block_aligned("<mytag class=\"wrap\">", target)
 }
 
 /// footnote-global-state: paragraph + a no-blank run of single-line footnote
@@ -517,12 +526,20 @@ fn shapes() -> Vec<Shape> {
         lin("big_table", big_table, Linear),
         lin("big_code", big_code, Linear),
         lin("big_math", big_math, Linear),
+        // Open HTML block (types 6/7) with newline-aligned appends ->
+        // HtmlBlockCache (incremental). Was O(n²) (hunt group
+        // html-empty-partial-blank-close): a zero-byte trailing partial
+        // vacuously passed the blank-line close test, so the cache dropped and
+        // never re-armed whenever an append ended exactly at `\n`.
+        lin("html_type6_aligned", html_type6_aligned, Linear),
+        lin("html_type7_aligned", html_type7_aligned, Linear),
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
         quad("commit-cut-pinned-no-boundary", one_giant_word, base, KnownQuadratic, KnownQuadratic),
         quad("uncached-open-block-kinds", component_block_open, chart_tag, KnownQuadratic, KnownQuadratic),
-        quad("html-empty-partial-blank-close", html_div_aligned, base, KnownQuadratic, Linear),
+        // html-empty-partial-blank-close: FIXED — promoted to the linear
+        // html_type6/7_aligned shapes above.
         quad("footnote-global-state", fn_def_run_noblank, footnotes, KnownQuadratic, KnownQuadratic),
         // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
         quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
