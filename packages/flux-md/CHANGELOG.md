@@ -4,6 +4,78 @@ Notable changes to flux-md. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.20.0 — 2026-07-02
+
+### Added
+
+- **Streaming links render cleanly from the first character.** An open link's
+  label used to show as raw bracketed text (`[Earnings Call](`) until the URL
+  started arriving, then snap into an anchor. The label now renders inside an
+  inert pending anchor from its first character — no brackets, no raw URL, and
+  the pending HTML is byte-stable through the whole URL so completion is a
+  single attribute swap (no DOM churn). Pending anchors carry
+  `data-flux-pending=""` (gone the moment `href` lands, never in final output)
+  so you can style them like settled links immediately; the optional theme
+  does this out of the box. Deliberate exclusions so common non-link brackets
+  never flash as links: footnote refs (`[^1]`), task checkboxes, alert
+  markers, and all-digit citation labels (`[1]`, `[12]`).
+- **`gfmTagfilter`** — the GFM "Disallowed Raw HTML" extension, opt-in like
+  the other GFM options (`gfm-tagfilter` on the custom element,
+  `with_gfm_tagfilter` in the core). With raw HTML enabled, the nine
+  page-hijacking tags (`title`, `textarea`, `style`, `xmp`, `iframe`,
+  `noembed`, `noframes`, `script`, `plaintext`) get their leading `<`
+  escaped, matching GitHub's rendering. The GFM extension suite is now 24/24.
+
+### Performance
+
+- **Fourteen classes of streaming O(n²) eliminated.** An adversarial
+  multi-agent audit probed 137 document shapes, confirmed 17 quadratic
+  root-cause groups at the work-counter level, and this release fixes 14 —
+  every one now streams in O(new bytes) and is pinned linear by the
+  deterministic complexity gate (now three counters: slow-path scans,
+  inline-render bytes, emitted bytes). Highlights at 512 KB streamed in
+  256-byte chunks unless noted:
+  - **CRLF input** made every incremental cache bail — a plain list cost
+    49.4 s; now line endings normalize at ingest and CRLF streams cost the
+    same as LF (210 ms).
+  - **Footnotes**: a no-blank run of definitions stalled commits and every
+    append recloned the footnote maps — a list with per-item refs cost 48 s
+    at 256 KB; now 200 ms.
+  - **Link-reference definitions inside blockquotes** armed no cache
+    (44 s → 134 ms); lazy continuation lines no longer disarm quote caches.
+  - **Open list items with multi-line bodies** re-rendered whole every
+    append (23 s → 0.3 s); legal interior blank lines no longer permanently
+    disarm the list/indented-code caches (5 s → 54 ms).
+  - **Tables**: the growing trailing row re-split and re-rendered every
+    append (23.8 s → 254 ms; a thousand-column row 25.4 s → 65 ms).
+  - **`blockData` mode** disabled the container cache outright (a 256 KB
+    alert cost 41.7 s → 226 ms, 185×) and rebuilt code/math/list/table data
+    channels from scratch per append (512 KB math fence 7.4 s → 132 ms).
+  - **Streaming component blocks** (`<Chart>` bodies), giant headings,
+    thematic breaks, and growing fence info strings had no incremental cache
+    at all (a 256 KB component body 48 s → 345 ms).
+  - **Inline engine**: emphasis edits now apply in one forward pass instead
+    of per-pair splicing, unpairable delimiters no longer rescan the whole
+    stack (the CommonMark mod-3 pathology was 54 s for a one-shot 256 KB
+    render — now 51 ms, and it hit server-side rendering too), unmatched `$`
+    with math enabled no longer rescans to end-of-input per candidate
+    (57.7 s → 33 ms), and space-free text (entities, long tokens) commits
+    incrementally instead of pinning the whole paragraph.
+  - HTML blocks whose appends landed exactly on line boundaries dropped
+    their cache every append (7.7 s → 59 ms).
+- WASM binary: 197 KB (+28 KB), the cost of seven new incremental caches.
+
+### Fixed
+
+- CRLF documents no longer leak raw `\r` bytes into rendered code blocks;
+  CRLF output is byte-identical to the LF equivalent (line endings are
+  equivalent per CommonMark).
+- Two latent mid-stream parity divergences (speculative rendering at
+  whitespace-only tails; a link-reference definition on an alert's first
+  body line) now match the one-shot render exactly.
+- A link awaiting its title (`[label](url "ti…`) no longer flashes literal
+  source mid-stream.
+
 ## 0.19.0 — 2026-06-30
 
 ### Added
