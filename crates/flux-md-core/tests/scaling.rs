@@ -305,13 +305,57 @@ fn html_type7_aligned(target: usize) -> String {
     html_block_aligned("<mytag class=\"wrap\">", target)
 }
 
-/// footnote-global-state: paragraph + a no-blank run of single-line footnote
-/// defs scans as one never-committing non-renderable block.
-fn fn_def_run_noblank(target: usize) -> String {
+/// footnote-global-state (FIXED) — four member shapes, streamed with
+/// `gfm_footnotes` ON. All used to cliff via document-global footnote state:
+///   a1: a NO-blank run of single-line defs scans as ONE raw block, so the
+///       pure-def-tail commit never advanced past it (ctr ratio 248 pre-fix);
+///       fixed by committing the run up to its last def-opener line.
+///   a2: blank-separated defs — the pre-existing >=2 def-block commit branch;
+///       linear before, guarded here against regressing.
+///   c:  ONE paragraph with thousands of distinct refs — the numbering
+///       pre-pass re-collected the WHOLE cache region per append:
+///       wall-quadratic (199x) but counter-BLIND pre-fix. The incremental
+///       per-cache numbering (`RegionFnNums`) is itself counter-instrumented
+///       now, so this entry really gates the class.
+///   g:  flat list where every item carries a distinct ref — the list cache
+///       used to line_bail on any `[^` (ctr ratio 160 pre-fix); now only
+///       genuine def lines bail.
+fn a1_def_run_noblank(target: usize) -> String {
     let mut s = String::from("Intro paragraph citing a note.[^f0]\n\n");
     let mut i = 0usize;
     while s.len() < target {
         s.push_str(&format!("[^f{i}]: footnote text number {i} with some words\n"));
+        i += 1;
+    }
+    s
+}
+
+fn a2_def_run_blank(target: usize) -> String {
+    let mut s = String::from("Intro paragraph citing a note.[^f0]\n\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("[^f{i}]: footnote text number {i} with some words\n\n"));
+        i += 1;
+    }
+    s
+}
+
+fn c_many_refs_one_para(target: usize) -> String {
+    let mut s = String::new();
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("word{i} [^c{i}] and"));
+        s.push(if i % 8 == 7 { '\n' } else { ' ' });
+        i += 1;
+    }
+    s
+}
+
+fn g_big_list_refs(target: usize) -> String {
+    let mut s = String::new();
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("- item {i} cites a source[^g{i}] here\n"));
         i += 1;
     }
     s
@@ -730,6 +774,52 @@ fn shapes() -> Vec<Shape> {
         lin("loose_subs_one_item", loose_subs_one_item, Linear),
         lin("staircase_blank_flap", staircase_blank_flap, Linear),
         lin("indented_code_with_interior_blanks", indented_code_blanks, Linear),
+        // Footnote shapes (hunt group footnote-global-state, FIXED): def-run
+        // tails commit up to the last def opener, the per-cache footnote
+        // numbering extends over only NEW bytes (`RegionFnNums`, self-counted
+        // into `scanned`), the committed footnote tables are Rc-shared (no
+        // per-append map clones), and the list cache streams footnote REFS
+        // (only genuine def lines bail).
+        Shape {
+            name: "fn_a1_def_run_noblank",
+            gen: a1_def_run_noblank,
+            opts: footnotes,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        Shape {
+            name: "fn_a2_def_run_blank",
+            gen: a2_def_run_blank,
+            opts: footnotes,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        Shape {
+            name: "fn_c_many_refs_one_para",
+            gen: c_many_refs_one_para,
+            opts: footnotes,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        Shape {
+            name: "fn_g_big_list_refs",
+            gen: g_big_list_refs,
+            opts: footnotes,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
@@ -741,7 +831,9 @@ fn shapes() -> Vec<Shape> {
         quad("uncached-open-block-kinds", component_block_open, chart_tag, KnownQuadratic, KnownQuadratic),
         // html-empty-partial-blank-close: FIXED — promoted to the linear
         // html_type6/7_aligned shapes above.
-        quad("footnote-global-state", fn_def_run_noblank, footnotes, KnownQuadratic, KnownQuadratic),
+        // footnote-global-state: FIXED — promoted to the four fn_* linear
+        // shapes below (def-run commit cut + incremental per-cache footnote
+        // numbering + list-cache `[^` bail narrowed to genuine def lines).
         // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
         quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
         // open-list-item-body-rerender: FIXED — quoted_list_table and the

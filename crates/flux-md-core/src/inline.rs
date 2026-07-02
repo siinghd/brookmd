@@ -373,6 +373,13 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                         None
                     };
                     if let Some(consumed) = fnref {
+                        // A ref whose `]` abuts the slice end is only
+                        // PROVISIONALLY a ref: the very next byte decides ref
+                        // vs. def opener (`[^x]:`), so a streaming boundary
+                        // must never settle (freeze) it mid-stream.
+                        if track && consumed == bytes.len() && pos < unstable {
+                            unstable = pos;
+                        }
                         pos = consumed;
                     } else if opts.open_tail
                         && !opts.in_link
@@ -1622,7 +1629,7 @@ fn try_footnote_ref(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut Str
         return None;
     }
     let label = std::str::from_utf8(&bytes[start + 2..j]).ok()?;
-    let num = *opts.footnotes.get(label)?;
+    let num = opts.footnote_num(label)?;
     let n = num.to_string();
     out.push_str("<sup class=\"footnote-ref\"><a href=\"#fn-");
     out.push_str(&n);

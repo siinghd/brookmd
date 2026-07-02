@@ -80,12 +80,19 @@ pub struct RenderOpts {
     /// `{"type":"Table"}`, no `data` key).
     pub block_data: bool,
     /// GFM footnotes. Off by default. When on, an inline `[^label]` whose label
-    /// appears in `footnotes` renders as a superscript link.
+    /// appears in `footnotes`/`tail_footnotes` renders as a superscript link.
     pub gfm_footnotes: bool,
     /// label → footnote number, assigned in first-reference order across the
-    /// whole document (stable across reparses via the committed map). Empty
-    /// unless `gfm_footnotes` is on.
-    pub footnotes: HashMap<String, usize>,
+    /// whole document. Split in two layers so the streaming parser never clones
+    /// the (growing) committed table per append (mirrors `committed_refs` /
+    /// `tail_refs`): `footnotes` is a shared snapshot of the committed numbers
+    /// (cheap `Rc` clone, O(1)); `tail_footnotes` holds the numbers of labels
+    /// first referenced in the current uncommitted tail. A label appears in at
+    /// most one layer with a given number assigned once (first-reference-wins),
+    /// so lookups via [`RenderOpts::footnote_num`] check committed first. Both
+    /// empty unless `gfm_footnotes` is on.
+    pub footnotes: Rc<HashMap<String, usize>>,
+    pub tail_footnotes: Rc<HashMap<String, usize>>,
     /// Per-label occurrence counter, mutated as `[^label]` references render
     /// (in document order) so the Kth reference to a label gets a unique id
     /// (`fnref-N`, `fnref-N-2`, …). Interior-mutable because emitting unique
@@ -126,6 +133,12 @@ impl RenderOpts {
         let key = normalize_label(label);
         // Committed (permanent) definitions win over tail ones — first-wins.
         self.committed_refs.get(&key).or_else(|| self.tail_refs.get(&key))
+    }
+
+    /// Footnote number for `label`, looked up across both layers (committed
+    /// first — a label is only ever numbered once, so the order is cosmetic).
+    pub(crate) fn footnote_num(&self, label: &str) -> Option<usize> {
+        self.footnotes.get(label).or_else(|| self.tail_footnotes.get(label)).copied()
     }
 
     /// Scanner feature flags derived from these render options, so sub-blocks
@@ -991,6 +1004,40 @@ pub(crate) fn footnote_defs(slice: &str) -> Vec<(String, String)> {
     defs
 }
 
+/// Byte offset (within `slice`) of the start of the LAST line that opens a
+/// footnote definition, or 0 when only the first line (or none) does. Lines are
+/// split exactly like [`footnote_defs`]' `slice.lines()` (a trailing `\r` is
+/// stripped before the opener test; the trailing newline-less partial line
+/// counts). Everything before that line belongs to earlier, SEALED definitions
+/// — a def opener always terminates the previous def — so the streaming parser
+/// can commit up to it while only the final def's body can still grow. The
+/// opener test is byte-frozen: once a (possibly still-growing) line parses as
+/// `[^label]: …`, appended bytes only extend its content, never un-open it.
+pub(crate) fn last_footnote_def_opener(slice: &str) -> usize {
+    let bytes = slice.as_bytes();
+    let mut best = 0;
+    let mut ls = 0;
+    while ls < bytes.len() {
+        let le = bytes[ls..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |r| ls + r);
+        let mut ce = le;
+        if ce > ls && bytes[ce - 1] == b'\r' {
+            ce -= 1;
+        }
+        if ls > 0 {
+            if let Ok(line) = std::str::from_utf8(&bytes[ls..ce]) {
+                if parse_def_line(line).is_some() {
+                    best = ls;
+                }
+            }
+        }
+        ls = le + 1;
+    }
+    best
+}
+
 /// Visit every footnote *reference* `[^label]` in `text`, in document order.
 /// Definition lines (`[^x]:`) are skipped.
 fn for_each_footnote_ref(text: &str, mut f: impl FnMut(&str)) {
@@ -1029,6 +1076,93 @@ pub(crate) fn collect_footnote_refs(
             *next += 1;
         }
     });
+}
+
+/// [`collect_footnote_refs`], layered: new labels go into `overlay`, first-wins
+/// checked against BOTH `committed` and `overlay` — so the streaming pre-pass
+/// numbers a tail without cloning the (growing) committed table per append.
+pub(crate) fn collect_footnote_refs_overlay(
+    text: &str,
+    committed: &HashMap<String, usize>,
+    overlay: &mut HashMap<String, usize>,
+    next: &mut usize,
+) {
+    for_each_footnote_ref(text, |label| {
+        if !committed.contains_key(label) && !overlay.contains_key(label) {
+            overlay.insert(label.to_string(), *next);
+            *next += 1;
+        }
+    });
+}
+
+/// Incremental [`collect_footnote_refs_overlay`] over a GROWING region: extends
+/// first-occurrence numbering over `text[from..]` and returns the offset up to
+/// which classification is SETTLED (future appends resume there instead of
+/// re-scanning the whole region — first-occurrence numbering over an
+/// append-only region is prefix-stable). Byte-for-byte mirror of
+/// [`for_each_footnote_ref`], except at the region's edge, where a candidate's
+/// ref-vs-def classification can still depend on unseen bytes:
+///   - `[^label` with no `]` yet → nothing after it can be a candidate (the
+///     label scan admits no `[`), so stop and re-scan from the `[` next append;
+///   - `[^label]` whose `]` is the region's FINAL byte → `for_each_footnote_ref`
+///     counts it as a ref NOW (`bytes.get(j+1) != Some(b':')`), but a `:`
+///     arriving next append would turn it into a def opener — so it is numbered
+///     for this append and reported back as SPECULATIVE; the caller retracts it
+///     before the next extension re-classifies from the same `[`.
+/// The returned speculative label is `Some` only when this call inserted it.
+pub(crate) fn extend_footnote_refs(
+    text: &str,
+    from: usize,
+    committed: &HashMap<String, usize>,
+    overlay: &mut HashMap<String, usize>,
+    next: &mut usize,
+) -> (usize, Option<String>) {
+    let bytes = text.as_bytes();
+    let mut i = from;
+    while i + 2 < bytes.len() {
+        if bytes[i] == b'[' && bytes[i + 1] == b'^' {
+            let mut j = i + 2;
+            let mut ok = true;
+            while j < bytes.len() && bytes[j] != b']' {
+                if bytes[j] == b'[' || bytes[j].is_ascii_whitespace() {
+                    ok = false;
+                    break;
+                }
+                j += 1;
+            }
+            if ok && j >= bytes.len() {
+                // No `]` yet: unclassifiable, and no `[` follows within the
+                // label scan — resume from this candidate next append.
+                return (i, None);
+            }
+            if ok && j > i + 2 && bytes.get(j + 1) != Some(&b':') {
+                let label = &text[i + 2..j];
+                let inserted = if !committed.contains_key(label) && !overlay.contains_key(label) {
+                    overlay.insert(label.to_string(), *next);
+                    *next += 1;
+                    true
+                } else {
+                    false
+                };
+                if j + 1 == bytes.len() {
+                    // `]` is the region's final byte: counted now, but a `:`
+                    // may still arrive — speculative.
+                    return (i, if inserted { Some(label.to_string()) } else { None });
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    // The trailing <3 bytes are never examined by the scan above, but a `[`
+    // there can begin a future candidate — never settle past it.
+    for p in i..bytes.len() {
+        if bytes[p] == b'[' {
+            return (p, None);
+        }
+    }
+    (bytes.len(), None)
 }
 
 // Note: a raw `count_footnote_refs(committed_slice)` used to advance the
@@ -1078,6 +1212,40 @@ pub(crate) const FN_TOK_TAG: u8 = b'F';
 /// matches what the non-placeholder path would have produced byte-for-byte).
 /// O(src.len()).
 pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, out: &mut String) {
+    resolve_footnote_tokens(src, out, |label| {
+        let c = occ.entry(label.to_string()).or_insert(0);
+        let k = *c;
+        *c += 1;
+        k
+    });
+}
+
+/// [`resolve_footnote_ids`], layered: the running count for a label starts from
+/// `base` (the Rc-shared committed occurrence map, never mutated) and advances
+/// in `overlay` — so a full-tail resolve pass never clones the committed map.
+pub(crate) fn resolve_footnote_ids_overlay(
+    src: &str,
+    base: &HashMap<String, usize>,
+    overlay: &mut HashMap<String, usize>,
+    out: &mut String,
+) {
+    resolve_footnote_tokens(src, out, |label| {
+        let c = overlay
+            .entry(label.to_string())
+            .or_insert_with(|| base.get(label).copied().unwrap_or(0));
+        let k = *c;
+        *c += 1;
+        k
+    });
+}
+
+/// Shared token walk for the `resolve_footnote_ids*` variants. `occurrence_of`
+/// returns the 0-based occurrence index for a label and advances its counter.
+fn resolve_footnote_tokens(
+    src: &str,
+    out: &mut String,
+    mut occurrence_of: impl FnMut(&str) -> usize,
+) {
     let bytes = src.as_bytes();
     let out_start = out.len();
     let mut i = 0;
@@ -1102,9 +1270,7 @@ pub(crate) fn resolve_footnote_ids(src: &str, occ: &mut HashMap<String, usize>, 
             if j < bytes.len() && k < bytes.len() {
                 let n = &src[n_start..j];
                 let label = &src[label_start..k];
-                let c = occ.entry(label.to_string()).or_insert(0);
-                let occurrence = *c;
-                *c += 1;
+                let occurrence = occurrence_of(label);
                 // The token sits inside `id="fnref-<token>"`, so emit ONLY the
                 // occurrence suffix (`N` or `N-K`), not the `fnref-` prefix.
                 out.push_str(n);

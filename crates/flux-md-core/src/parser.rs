@@ -6,10 +6,11 @@ use std::rc::Rc;
 use crate::blocks::Block;
 use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
-    is_fence_close_line, is_footnote_def_block, item_body, item_directly_loose,
+    collect_footnote_refs_overlay, extend_footnote_refs, is_fence_close_line,
+    is_footnote_def_block, item_body, item_directly_loose, last_footnote_def_opener,
     normalize_label, parse_alignments, push_code_fence_open, push_table_cell,
-    push_table_cell_open, render_block,
-    render_footnote_section, render_item_body, resolve_footnote_ids, split_table_cells,
+    push_table_cell_open, render_block, render_footnote_section, render_item_body,
+    resolve_footnote_ids, resolve_footnote_ids_overlay, split_table_cells,
     trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
@@ -95,19 +96,25 @@ fn collect_refs(text: &str, refs: &mut HashMap<String, LinkRef>, ctx: ScanCtx, d
 /// Resolve every footnote-ref placeholder token in a fully-produced `Block`
 /// (its `html` plus any opt-in `kind.data` channel HTML) in document order.
 ///
-/// `occ` is the running per-label occurrence map; it is advanced by exactly the
-/// tokens in `block.html` (the canonical document-order stream). The structured
-/// `kind.data` HTML carries the SAME tokens (same content, same order) duplicated
-/// for the keyed renderer, so it is resolved from a CLONE of `occ` snapshotted
-/// at the start of this block — that yields suffixes byte-identical to `html`
-/// without double-counting occurrences. (Cell `text` is inline-stripped, so it
-/// never contains a token.)
-fn resolve_block_footnotes(block: &mut Block, occ: &mut HashMap<String, usize>) {
-    // Snapshot for the data channel BEFORE html advances `occ`.
-    let data_seed = occ.clone();
+/// The occurrence count is layered: `base` is the (Rc-shared, never mutated)
+/// committed occurrence map and `over` the running per-reparse overlay,
+/// advanced by exactly the tokens in `block.html` (the canonical document-order
+/// stream) — so a reparse never clones the growing committed map. The
+/// structured `kind.data` HTML carries the SAME tokens (same content, same
+/// order) duplicated for the keyed renderer, so it is resolved from a CLONE of
+/// the (small) overlay snapshotted at the start of this block — that yields
+/// suffixes byte-identical to `html` without double-counting occurrences. (Cell
+/// `text` is inline-stripped, so it never contains a token.)
+fn resolve_block_footnotes(
+    block: &mut Block,
+    base: &HashMap<String, usize>,
+    over: &mut HashMap<String, usize>,
+) {
+    // Snapshot for the data channel BEFORE html advances the overlay.
+    let data_seed = over.clone();
 
     let mut new_html = String::with_capacity(block.html.len());
-    resolve_footnote_ids(&block.html, occ, &mut new_html);
+    resolve_footnote_ids_overlay(&block.html, base, over, &mut new_html);
     block.html = new_html;
 
     // Resolve the structured data channel (if any) from the snapshot, replaying
@@ -115,7 +122,7 @@ fn resolve_block_footnotes(block: &mut Block, occ: &mut HashMap<String, usize>) 
     let resolve_one = |s: &str| -> String {
         let mut seed = data_seed.clone();
         let mut o = String::with_capacity(s.len());
-        resolve_footnote_ids(s, &mut seed, &mut o);
+        resolve_footnote_ids_overlay(s, base, &mut seed, &mut o);
         o
     };
     match &mut block.kind {
@@ -208,11 +215,14 @@ pub struct StreamParser {
     /// Footnote numbering/defs from the *committed* region (permanent), mirroring
     /// `committed_refs`. `next_footnote` is the next number to assign; the tail
     /// continues from here so committed `<sup>N</sup>` numbers stay stable.
-    committed_footnotes: HashMap<String, usize>,
-    committed_footnote_defs: HashMap<String, String>,
+    // `Rc` (like `committed_refs`) so each reparse / tail cache shares the
+    // committed tables with `RenderOpts` in O(1) instead of cloning per append;
+    // folded via `Rc::make_mut` at commit time.
+    committed_footnotes: Rc<HashMap<String, usize>>,
+    committed_footnote_defs: Rc<HashMap<String, String>>,
     /// Total references per label in the committed region — seeds the tail's
     /// occurrence counter so repeated-reference ids stay unique across commits.
-    committed_footnote_occurrences: HashMap<String, usize>,
+    committed_footnote_occurrences: Rc<HashMap<String, usize>>,
     next_footnote: usize,
     unsafe_html: bool,
     gfm_autolinks: bool,
@@ -343,6 +353,67 @@ fn line_contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Incremental footnote-NUMBERING state for a tail cache's region. The full
+/// path's numbering pre-pass re-collects `[^label]` refs over the WHOLE region
+/// per append (O(region), so a ref-heavy open block streams O(n²) wall even
+/// when the byte counter looks linear). First-occurrence numbering over an
+/// append-only region is prefix-stable, so each cache keeps this state and
+/// extends it over only the NEW bytes (see [`extend_footnote_refs`] for the
+/// exact region-edge classification rules this relies on). The committed layer
+/// is Rc-shared through `RenderOpts::footnotes`; region-local labels live in
+/// the `tail` overlay, Rc-shared through `RenderOpts::tail_footnotes` — O(1)
+/// per append, no map clones. Inert (empty, never extended) when footnotes off.
+struct RegionFnNums {
+    /// label → number for labels first referenced inside the region.
+    tail: Rc<HashMap<String, usize>>,
+    /// Next number to assign (continues committed + `tail`). Frozen relative to
+    /// the parser's `next_footnote` while the cache is armed (no commits).
+    next: usize,
+    /// Absolute buffer offset; numbering over `[region_start..upto)` is settled.
+    upto: usize,
+    /// Label numbered speculatively because its `]` was the region's final byte
+    /// (a `:` arriving next would make it a def opener, not a ref). Retracted at
+    /// the start of the next extension, which re-classifies from the same `[`.
+    spec: Option<String>,
+}
+
+impl RegionFnNums {
+    fn new(region_start: usize, next: usize) -> Self {
+        Self { tail: Rc::new(HashMap::new()), next, upto: region_start, spec: None }
+    }
+
+    /// Extend the numbering over `buffer[upto..region_end)`. `committed` is the
+    /// parser's committed numbering table (the other first-wins layer).
+    fn extend(&mut self, buffer: &str, region_end: usize, committed: &HashMap<String, usize>) {
+        if let Some(label) = self.spec.take() {
+            // The cache is the sole Rc holder between appends (per-append
+            // RenderOpts clones are dropped with the patch), so this mutates in
+            // place. The speculative label was the last number assigned and
+            // nothing was assigned after it — pop it and re-classify below.
+            Rc::make_mut(&mut self.tail).remove(&label);
+            self.next -= 1;
+        }
+        if self.upto >= region_end {
+            return;
+        }
+        // Deterministic complexity probe (mirrors the `reparse_tail` counter):
+        // this scan is cache-internal, so without it a numbering-pre-pass
+        // regression (`upto` stalling → whole-region re-scans) would be
+        // counter-invisible even though the wall goes quadratic.
+        #[cfg(feature = "perf_counters")]
+        crate::perf::add_scan(region_end - self.upto);
+        let (upto, spec) = extend_footnote_refs(
+            &buffer[..region_end],
+            self.upto,
+            committed,
+            Rc::make_mut(&mut self.tail),
+            &mut self.next,
+        );
+        self.upto = upto;
+        self.spec = spec;
+    }
+}
+
 /// Incremental render state for a single open paragraph at the tail. Streaming
 /// a long paragraph is otherwise O(n²) — the whole growing, uncommitted
 /// paragraph is re-`render_inline`d each append. Unlike code, inline output is
@@ -369,6 +440,9 @@ struct ParagraphCache {
     /// segment's placeholder tokens are resolved into `committed_inner`. The
     /// speculative active tail resolves from a CLONE. Unused when footnotes off.
     fn_occ: HashMap<String, usize>,
+    /// Incremental footnote NUMBERING over the paragraph region (see
+    /// [`RegionFnNums`]). Inert when footnotes are off.
+    fn_nums: RegionFnNums,
 }
 
 /// Incremental render state for a single open GFM table at the tail. Streaming
@@ -426,6 +500,9 @@ struct TableCache {
     /// trailing partial row resolves from a CLONE of this (doesn't advance it).
     /// Unused (empty) when footnotes are off.
     fn_occ: HashMap<String, usize>,
+    /// Incremental footnote NUMBERING over the table region (see
+    /// [`RegionFnNums`]). Inert when footnotes are off.
+    fn_nums: RegionFnNums,
     /// Incremental state for the trailing newline-less partial row, so the
     /// growing partial is split + rendered in O(new bytes) instead of whole
     /// per append. `None` until the first partial byte arrives (and always
@@ -614,13 +691,19 @@ struct ContainerCache {
     /// re-rendered whole). The current open paragraph never advances this map.
     /// Unused when footnotes off.
     fn_occ: HashMap<String, usize>,
-    /// Footnote occurrence map for the current OPEN paragraph's settled prefix
-    /// (`committed_inner_html`). Reset to `fn_occ.clone()` when a paragraph
-    /// starts; advanced as the inline boundary commits segments into
-    /// `committed_inner_html`. The active tail resolves from a CLONE of this.
-    /// Because the open paragraph is re-rendered whole on close (advancing the
-    /// persistent `fn_occ`), this sub-map is discarded then — no double-count.
+    /// Footnote occurrence OVERLAY (layered over `fn_occ`, which is never
+    /// cloned) for the current OPEN paragraph's settled prefix
+    /// (`committed_inner_html`). Cleared when a paragraph starts; advanced as
+    /// the inline boundary commits segments into `committed_inner_html`; holds
+    /// only the open paragraph's own labels. The active tail resolves from a
+    /// CLONE of this (small) overlay. Because the open paragraph is re-rendered
+    /// whole on close (advancing the persistent `fn_occ`), the overlay is
+    /// discarded then — no double-count.
     inner_fn_occ: HashMap<String, usize>,
+    /// Incremental footnote NUMBERING over the container region (marker-included
+    /// raw slice, mirroring the full path's pre-pass; see [`RegionFnNums`]).
+    /// Inert when footnotes are off.
+    fn_nums: RegionFnNums,
 }
 
 #[derive(Clone, Copy)]
@@ -792,6 +875,9 @@ struct ListCache {
     /// The baseline occurrence map captured at arm time (committed counts), kept
     /// so the tight→loose rebuild can reset `fn_occ` and replay every item.
     fn_occ_base: HashMap<String, usize>,
+    /// Incremental footnote NUMBERING over the list region (see
+    /// [`RegionFnNums`]). Inert when footnotes are off.
+    fn_nums: RegionFnNums,
 }
 
 /// Body-size threshold (bytes) past which the OPEN list item's multi-line body
@@ -831,8 +917,11 @@ const OPEN_ITEM_STREAM_MIN: usize = 1024;
 ///     (`stream_disabled`) and the per-append fold takes over (today's cost),
 ///   - the checkbox prefix `[x] ` is stripped from the feed and re-emitted by
 ///     the assembly (mirroring `render_item_body`),
-///   - CRLF / `[^` (footnotes on) / `]:` already bail the whole list cache
-///     before any line is fed,
+///   - CRLF / a `]:` def line already bail the whole list cache before any
+///     line is fed; a footnote REF `[^x]` streams through the cache's fold
+///     (placeholder tokens) but the nested parser runs with footnotes OFF, so
+///     `[^` anywhere in the open item's body disables the STREAM only (the
+///     arm/feed scoping check below — the fold owns the item then),
 ///   - the item's CLOSE (a sibling marker) still folds the full span through
 ///     `fold_item_body` — the committed prefix bytes are produced by the same
 ///     code as before, the stream only serves the speculative open view.
@@ -960,9 +1049,9 @@ impl StreamParser {
             next_id: 0,
             finalized: false,
             committed_refs: Rc::new(HashMap::new()),
-            committed_footnotes: HashMap::new(),
-            committed_footnote_defs: HashMap::new(),
-            committed_footnote_occurrences: HashMap::new(),
+            committed_footnotes: Rc::new(HashMap::new()),
+            committed_footnote_defs: Rc::new(HashMap::new()),
+            committed_footnote_occurrences: Rc::new(HashMap::new()),
             next_footnote: 1,
             unsafe_html: false,
             gfm_autolinks: false,
@@ -1306,16 +1395,24 @@ impl StreamParser {
             .filter(|r| !is_footnote_def(&tail[r.range.clone()]))
             .collect();
 
-        // Footnote numbering pre-pass: committed numbers (permanent) + tail
-        // references continuing from `next_footnote`, in document order over the
-        // renderable (non-def) content only.
-        let mut fn_nums = self.committed_footnotes.clone();
+        // Footnote numbering pre-pass: committed numbers (permanent, shared by
+        // an O(1) `Rc` clone — never copied per append) + a tail overlay of
+        // labels first referenced in the tail, continuing from `next_footnote`,
+        // in document order over the renderable (non-def) content only.
+        let fn_committed = Rc::clone(&self.committed_footnotes);
+        let mut fn_tail: HashMap<String, usize> = HashMap::new();
         let mut fn_next = self.next_footnote;
         if gfm_footnotes {
             for raw in &renderable {
-                collect_footnote_refs(&tail[raw.range.clone()], &mut fn_nums, &mut fn_next);
+                collect_footnote_refs_overlay(
+                    &tail[raw.range.clone()],
+                    &fn_committed,
+                    &mut fn_tail,
+                    &mut fn_next,
+                );
             }
         }
+        let fn_tail = Rc::new(fn_tail);
 
         let opts = RenderOpts {
             unsafe_html: self.unsafe_html,
@@ -1336,10 +1433,12 @@ impl StreamParser {
             a11y: self.a11y,
             block_data: self.block_data,
             gfm_footnotes,
-            footnotes: fn_nums.clone(),
-            // Seed the per-label occurrence counter from the committed counts so
-            // ref ids stay unique across the commit boundary.
-            footnote_occ: std::cell::RefCell::new(self.committed_footnote_occurrences.clone()),
+            footnotes: Rc::clone(&fn_committed),
+            tail_footnotes: Rc::clone(&fn_tail),
+            // Placeholder mode never touches the occurrence counter (produced
+            // blocks are resolved in document order just below); the def-render
+            // opts that DO render live override this with their own seed.
+            footnote_occ: std::cell::RefCell::new(HashMap::new()),
             // Full-reparse body renders footnote refs as placeholder tokens (when
             // footnotes are on) so it agrees byte-for-byte with the cache path;
             // each produced block's html is then resolved in document order
@@ -1434,33 +1533,44 @@ impl StreamParser {
 
         // Resolve the placeholder-token footnote ids in every produced block, in
         // document order, seeded from the committed occurrence counts. The token
-        // replay is the SOLE source of truth for advancing the occurrence map, so
-        // after resolving all blocks `total_occ` holds the exact per-label
-        // reference count (committed + tail) used for backref generation. (When
-        // footnotes are off, no tokens exist and this is a cheap byte-copy.)
+        // replay is the SOLE source of truth for advancing the occurrence count,
+        // which is layered — the (Rc-shared, never-cloned) committed base plus
+        // the per-reparse `occ_over` overlay of ABSOLUTE counts for the labels
+        // this tail's blocks actually reference. (When footnotes are off, no
+        // tokens exist and this is a cheap byte-copy.)
         //
-        // `occ_after_block[i]` snapshots the occurrence map after resolving the
-        // first i+1 produced blocks; the committed-region advance is read from it
-        // once `to_commit` is known, so the persistent committed occurrence map is
-        // advanced by exactly the COMMITTED blocks' real refs (never by `[^x]`
-        // inside code spans / escaped text, which emit no token). `produced` is a
-        // handful of top-level blocks (not proportional to table rows / list
-        // items), so the per-block snapshot clone is cheap.
-        let mut total_occ = self.committed_footnote_occurrences.clone();
-        let mut occ_after_block: Vec<HashMap<String, usize>> = Vec::new();
+        // `occ_over_after_block[i]` snapshots the OVERLAY after resolving the
+        // first i+1 produced blocks; the committed-region advance replays it
+        // once `to_commit` is known, so the persistent committed occurrence map
+        // is advanced by exactly the COMMITTED blocks' real refs (never by
+        // `[^x]` inside code spans / escaped text, which emit no token).
+        // `produced` is a handful of top-level blocks and the overlay holds only
+        // tail-referenced labels, so the per-block snapshot clone is cheap.
+        let mut occ_over: HashMap<String, usize> = HashMap::new();
+        let mut occ_over_after_block: Vec<HashMap<String, usize>> = Vec::new();
         if gfm_footnotes {
-            occ_after_block.reserve(produced.len());
+            occ_over_after_block.reserve(produced.len());
             for block in &mut produced {
-                resolve_block_footnotes(block, &mut total_occ);
-                occ_after_block.push(total_occ.clone());
+                resolve_block_footnotes(block, &self.committed_footnote_occurrences, &mut occ_over);
+                occ_over_after_block.push(occ_over.clone());
             }
         }
-        // Definition bodies render at finalize, AFTER the total_occ snapshot, with
-        // placeholder mode OFF (the live path): a def-body `[^x]` continues the
-        // occurrence sequence past total_occ (matching the historical behavior)
-        // and is intentionally not counted into the section's backref total.
-        let mut fn_defs = self.committed_footnote_defs.clone();
-        if gfm_footnotes {
+        // Definition bodies render at finalize, AFTER the total-occurrence
+        // snapshot, with placeholder mode OFF (the live path): a def-body `[^x]`
+        // continues the occurrence sequence past total_occ (matching the
+        // historical behavior) and is intentionally not counted into the
+        // section's backref total. Finalize-ONLY: `fn_defs`/`total_occ` feed
+        // nothing but the section, so a live append skips the whole-tail def
+        // render (and the committed-map clones) this used to pay per append —
+        // live commits fold defs at commit time below instead.
+        let mut fn_defs: HashMap<String, String> = HashMap::new();
+        let mut total_occ: HashMap<String, usize> = HashMap::new();
+        if gfm_footnotes && finalizing {
+            total_occ = (*self.committed_footnote_occurrences).clone();
+            for (k, v) in &occ_over {
+                total_occ.insert(k.clone(), *v);
+            }
+            fn_defs = (*self.committed_footnote_defs).clone();
             let defs_opts = RenderOpts {
                 footnote_placeholder: false,
                 footnote_occ: std::cell::RefCell::new(total_occ.clone()),
@@ -1593,11 +1703,27 @@ impl StreamParser {
             // until a later block proves it complete. (At finalize, the `commit_all`
             // walk below commits the whole run.) Routes through the
             // `last_raw_end_to_commit > 0` block so ref/footnote tables stay correct.
-            if raw_blocks.len() >= 2 {
+            let base = if raw_blocks.len() >= 2 {
                 raw_blocks[raw_blocks.len() - 2].range.end
             } else {
                 0
-            }
+            };
+            // A NO-blank-line run of `[^x]: …` footnote defs scans as ONE raw
+            // block, so the >=2 rule above never fires for it and the run would
+            // still stall. Adjacent def-opener lines are separate defs
+            // (`footnote_defs`) and an opener seals every def before it, so
+            // commit the trailing def block up to its LAST opener line — only
+            // the final def, whose body can still grow by soft-continuation
+            // lines, stays speculative.
+            let intra = raw_blocks.last().map_or(0, |raw| {
+                let slice = &tail[raw.range.clone()];
+                if is_footnote_def(slice) {
+                    raw.range.start + last_footnote_def_opener(slice)
+                } else {
+                    0
+                }
+            });
+            base.max(intra)
         } else if commit_all || raw_blocks.len() > to_commit.saturating_add(0) {
             // Walk the raw_blocks and find the boundary corresponding to our
             // commit decision. Concretely: after committing `to_commit`
@@ -1640,9 +1766,16 @@ impl StreamParser {
             // so the table is mutated in place rather than copied.
             let committed_slice = &self.buffer[tail_start..tail_start + last_raw_end_to_commit];
             if gfm_footnotes {
+                // `opts.footnotes` still aliases the committed table here, so
+                // `make_mut` copies on a committing append. That copy is
+                // bounded by the committed REF-label count (defs don't grow
+                // it) and replaces the every-append clone this path used to
+                // pay; folding via a post-`drop(opts)` merge (like the
+                // link-ref fold) would break arm-time seeding below, which
+                // needs the post-fold tables.
                 collect_footnote_refs(
                     committed_slice,
-                    &mut self.committed_footnotes,
+                    Rc::make_mut(&mut self.committed_footnotes),
                     &mut self.next_footnote,
                 );
                 // BELT-AND-SUSPENDERS: advance the persistent committed occurrence
@@ -1650,38 +1783,59 @@ impl StreamParser {
                 // from `count_footnote_refs` over the raw committed slice. The raw
                 // scan counts `[^x]` inside code spans and escaped `\[^x\]`, which
                 // emit no ref token → it would over-count, shifting every later
-                // suffix and breaking backrefs. `occ_after_block[to_commit-1]` is
-                // the map after replaying exactly the committed blocks' real refs,
-                // so seed == tokens by construction. `to_commit == 0` (nothing
-                // renderable committed, only def blocks) leaves the map unchanged.
+                // suffix and breaking backrefs. `occ_over_after_block[to_commit-1]`
+                // is the overlay (ABSOLUTE counts) after replaying exactly the
+                // committed blocks' real refs, so seed == tokens by construction.
+                // `to_commit == 0` (nothing renderable committed, only def blocks)
+                // leaves the map unchanged. Nothing else holds this `Rc` (the
+                // render opts carry an empty occurrence seed), so `make_mut`
+                // mutates in place.
                 if to_commit > 0 {
-                    if let Some(snap) = occ_after_block.get(to_commit - 1) {
-                        self.committed_footnote_occurrences = snap.clone();
+                    if let Some(over) = occ_over_after_block.get(to_commit - 1) {
+                        if !over.is_empty() {
+                            let occ = Rc::make_mut(&mut self.committed_footnote_occurrences);
+                            for (k, v) in over {
+                                occ.insert(k.clone(), *v);
+                            }
+                        }
                     }
                 }
                 // Committed def bodies render with placeholder mode OFF (they are
                 // stored permanently and re-emitted in the section verbatim), with
                 // the occurrence counter seeded PAST the committed refs so a
                 // def-body `[^x]` continues the sequence (mirrors the historical
-                // live path + the finalize def path).
-                let commit_defs_opts = RenderOpts {
-                    footnote_placeholder: false,
-                    footnote_occ: std::cell::RefCell::new(
-                        self.committed_footnote_occurrences.clone(),
-                    ),
-                    ..opts.clone()
-                };
-                collect_footnote_defs(
-                    committed_slice,
-                    &mut self.committed_footnote_defs,
-                    &commit_defs_opts,
-                );
+                // live path + the finalize def path). A def block requires a
+                // `[^`, so a slice without one skips the fold (and its
+                // occurrence-seed clone). `fn_defs` is finalize-local (never an
+                // `Rc` alias), so `make_mut` mutates the def table in place.
+                if committed_slice.contains("[^") {
+                    let commit_defs_opts = RenderOpts {
+                        footnote_placeholder: false,
+                        footnote_occ: std::cell::RefCell::new(
+                            (*self.committed_footnote_occurrences).clone(),
+                        ),
+                        ..opts.clone()
+                    };
+                    collect_footnote_defs(
+                        committed_slice,
+                        Rc::make_mut(&mut self.committed_footnote_defs),
+                        &commit_defs_opts,
+                    );
+                }
             }
             self.committed_offset = tail_start + last_raw_end_to_commit;
         }
 
         // At finalize, emit the footnote section as a final block (once).
         if finalizing && gfm_footnotes {
+            // One-time merge of the two numbering layers. `fn_committed` is the
+            // PRE-fold snapshot (the fold above copied-on-write), so def-body-only
+            // labels folded this call don't appear — matching the one-shot
+            // pre-pass, which numbers renderable content only.
+            let mut fn_nums = (*fn_committed).clone();
+            for (k, v) in fn_tail.iter() {
+                fn_nums.insert(k.clone(), *v);
+            }
             let section = render_footnote_section(&fn_nums, &fn_defs, &total_occ, opts.dir());
             if !section.is_empty() {
                 let id = self.next_id;
@@ -1747,6 +1901,7 @@ impl StreamParser {
                             new_active[0].id,
                             &opts,
                             &self.committed_footnote_occurrences,
+                            self.next_footnote,
                         );
                     }
                     // Footnotes stay ARMED: the cache renders refs as
@@ -1762,6 +1917,7 @@ impl StreamParser {
                             new_active[0].id,
                             &opts,
                             &self.committed_footnote_occurrences,
+                            self.next_footnote,
                         );
                     }
                     RawBlockKind::Blockquote => {
@@ -1772,6 +1928,7 @@ impl StreamParser {
                             &new_active[0].kind,
                             &opts,
                             &self.committed_footnote_occurrences,
+                            self.next_footnote,
                         );
                         // The paragraph-only cache bails (returns None) on
                         // STRUCTURED inner content (a list/quote/heading/table/…).
@@ -1796,6 +1953,7 @@ impl StreamParser {
                             *list_start_num,
                             &opts,
                             &self.committed_footnote_occurrences,
+                            self.next_footnote,
                         );
                     }
                     RawBlockKind::IndentedCode => {
@@ -2142,14 +2300,12 @@ impl StreamParser {
 
     /// Inline-render options for a streaming tail render. Reference + footnote
     /// tables come from the committed region (an open block defines none of its
-    /// own); footnote numbers continue from the committed count over
-    /// `footnote_region`, mirroring the full path's pre-pass.
-    fn build_inline_opts(&self, footnote_region: &str) -> RenderOpts {
-        let mut footnotes = self.committed_footnotes.clone();
-        if self.gfm_footnotes {
-            let mut next = self.next_footnote;
-            collect_footnote_refs(footnote_region, &mut footnotes, &mut next);
-        }
+    /// own); footnote numbers continue from the committed count over the cache
+    /// region via `fn_nums`, which the caller has already extended over the
+    /// region's NEW bytes — mirroring the full path's pre-pass at O(new bytes)
+    /// per append instead of O(region). Every map here is an O(1) `Rc` share or
+    /// a fresh empty one.
+    fn build_inline_opts(&self, fn_nums: &RegionFnNums) -> RenderOpts {
         RenderOpts {
             unsafe_html: self.unsafe_html,
             // O(1) Rc share of the committed table; an open paragraph defines no
@@ -2169,8 +2325,11 @@ impl StreamParser {
             a11y: self.a11y,
             block_data: self.block_data,
             gfm_footnotes: self.gfm_footnotes,
-            footnotes,
-            footnote_occ: std::cell::RefCell::new(self.committed_footnote_occurrences.clone()),
+            footnotes: Rc::clone(&self.committed_footnotes),
+            tail_footnotes: Rc::clone(&fn_nums.tail),
+            // Placeholder mode never touches the occurrence counter — the cache
+            // folds resolve tokens against their own cache-local maps.
+            footnote_occ: std::cell::RefCell::new(HashMap::new()),
             // Cache fold + builders render footnote refs as placeholder tokens
             // when footnotes are on (occurrence-independent → safe to freeze);
             // the caller resolves them on commit (frozen prefix) or per-append
@@ -2215,7 +2374,12 @@ impl StreamParser {
         if content_end < cache.cut {
             return None;
         }
-        let opts = self.build_inline_opts(&self.buffer[cache.start..content_end]);
+        // Extend the incremental numbering over the region's new bytes, then
+        // share it into the opts (O(1); mirrors the full path's pre-pass).
+        if self.gfm_footnotes {
+            cache.fn_nums.extend(&self.buffer, content_end, &self.committed_footnotes);
+        }
+        let opts = self.build_inline_opts(&cache.fn_nums);
         // Render the active region and learn how far of it is now settled — past
         // closed emphasis / code spans / inline links, but not an unpaired opener
         // or unclosed construct. `boundary_rel` is relative to the active slice.
@@ -2236,13 +2400,15 @@ impl StreamParser {
             active.clear();
             render_inline(&self.buffer[cache.cut..content_end], &opts, &mut active);
         }
-        // Resolve the speculative active tail per-append from a CLONE of the
-        // frozen-prefix occurrence map (does NOT advance persistent state). No-op
-        // byte-copy when footnotes are off (no tokens present).
+        // Resolve the speculative active tail per-append from a discarded
+        // OVERLAY seeded lazily from the frozen-prefix occurrence map (does NOT
+        // advance persistent state, and never clones the growing map — the
+        // overlay holds only the short active tail's labels). No-op byte-copy
+        // when footnotes are off (no tokens present).
         if self.gfm_footnotes {
-            let mut occ = cache.fn_occ.clone();
+            let mut over = HashMap::new();
             let mut resolved = String::with_capacity(active.len());
-            resolve_footnote_ids(&active, &mut occ, &mut resolved);
+            resolve_footnote_ids_overlay(&active, &cache.fn_occ, &mut over, &mut resolved);
             active = resolved;
         }
         // Assemble in a single buffer with 1× memcpy of `committed_inner` (was
@@ -2307,8 +2473,12 @@ impl StreamParser {
         // backs cached-row rendering and the speculative partial-row render. The
         // open table's OWN cells may carry the first reference to a footnote
         // label, so the footnote-numbering pre-pass must see the table content
-        // (mirrors the full path, which numbers refs over every renderable block).
-        let opts = self.build_inline_opts(&self.buffer[cache.start..end]);
+        // (mirrors the full path, which numbers refs over every renderable
+        // block) — extended incrementally over only the region's new bytes.
+        if self.gfm_footnotes {
+            cache.fn_nums.extend(&self.buffer, end, &self.committed_footnotes);
+        }
+        let opts = self.build_inline_opts(&cache.fn_nums);
 
         // Fold every newly-complete body row into the cache. A blank/interrupting
         // line bails: the table has ended, full reparse takes over so the block
@@ -2354,9 +2524,10 @@ impl StreamParser {
             // Render the row into a scratch buffer (placeholder tokens when
             // footnotes on), then resolve its tokens into `cached_prefix`,
             // advancing the cache-local occurrence map. Once folded the row is
-            // never re-rendered (frozen-prefix invariant). The data-channel cells
-            // resolve from a CLONE captured before the row advances `fn_occ`.
-            let data_seed = cache.fn_occ.clone();
+            // never re-rendered (frozen-prefix invariant). The data-channel
+            // cells resolve BEFORE the row advances `fn_occ`, from a discarded
+            // overlay seeded lazily off it (same pre-row counts as the old
+            // full-map clone, without copying the growing map).
             let mut row_html = String::with_capacity(line_str.len() + 16);
             row_html.push_str("<tr>");
             let mut row: Vec<TableCell> = Vec::new();
@@ -2373,20 +2544,21 @@ impl StreamParser {
                 }
             }
             row_html.push_str("</tr>");
-            resolve_footnote_ids(&row_html, &mut cache.fn_occ, &mut cache.cached_prefix);
             // Structured channel: fold this committed row's cells in lock-step
-            // with its `<tr>` — once folded it's never re-rendered (HTML invariant).
+            // with its `<tr>` — once folded it's never re-rendered (HTML
+            // invariant). Resolved first (pre-advance `fn_occ` = the row's seed).
             if opts.block_data {
                 if opts.gfm_footnotes {
-                    let mut occ = data_seed;
+                    let mut over = HashMap::new();
                     for c in &mut row {
                         let mut o = String::with_capacity(c.html.len());
-                        resolve_footnote_ids(&c.html, &mut occ, &mut o);
+                        resolve_footnote_ids_overlay(&c.html, &cache.fn_occ, &mut over, &mut o);
                         c.html = o;
                     }
                 }
                 cache.body_cells.push(Rc::new(row));
             }
+            resolve_footnote_ids(&row_html, &mut cache.fn_occ, &mut cache.cached_prefix);
             cache.lines_upto = next;
             pos = next;
         }
@@ -2434,16 +2606,22 @@ impl StreamParser {
                         }
                     }
                     raw_partial.push_str("</tr>");
-                    // Resolve the speculative partial row from a CLONE of the
-                    // frozen-prefix occurrence map (does NOT advance it).
-                    // Byte-copy when footnotes off.
-                    let mut occ = cache.fn_occ.clone();
-                    resolve_footnote_ids(&raw_partial, &mut occ, &mut partial_html);
+                    // Resolve the speculative partial row from a discarded
+                    // OVERLAY over the frozen-prefix occurrence map (does NOT
+                    // advance it and never clones the growing map). Byte-copy
+                    // when footnotes off.
+                    let mut over = HashMap::new();
+                    resolve_footnote_ids_overlay(
+                        &raw_partial,
+                        &cache.fn_occ,
+                        &mut over,
+                        &mut partial_html,
+                    );
                     if opts.gfm_footnotes {
-                        let mut docc = cache.fn_occ.clone();
+                        let mut dover = HashMap::new();
                         for c in &mut row {
                             let mut o = String::with_capacity(c.html.len());
-                            resolve_footnote_ids(&c.html, &mut docc, &mut o);
+                            resolve_footnote_ids_overlay(&c.html, &cache.fn_occ, &mut dover, &mut o);
                             c.html = o;
                         }
                     }
@@ -2693,10 +2871,14 @@ impl StreamParser {
 
         // Inline opts — built once, shared by the close-paragraph render and the
         // per-append boundary pass. The open container's inner may carry the first
-        // reference to a footnote label, so the numbering pre-pass scans the whole
+        // reference to a footnote label, so the numbering pre-pass covers the whole
         // container region (the `>` markers don't break `[^label]` matching), so
-        // in-container refs get the same number as the full path assigns.
-        let opts = self.build_inline_opts(&self.buffer[cache.start..end]);
+        // in-container refs get the same number as the full path assigns —
+        // extended incrementally over only the region's new bytes.
+        if self.gfm_footnotes {
+            cache.fn_nums.extend(&self.buffer, end, &self.committed_footnotes);
+        }
+        let opts = self.build_inline_opts(&cache.fn_nums);
 
         // Fold every newly-complete `> `-marker line. A blank `>` line closes
         // the current paragraph (rendered once into `committed_paras_html`)
@@ -2796,8 +2978,13 @@ impl StreamParser {
             let mut seg = String::new();
             render_inline(&cache.inner_buffer[cache.inner_cut..new_cut], &opts, &mut seg);
             // Resolve the just-settled segment into the open paragraph's frozen
-            // prefix, advancing its (discard-on-close) occurrence sub-map.
-            resolve_footnote_ids(&seg, &mut cache.inner_fn_occ, &mut cache.committed_inner_html);
+            // prefix, advancing its (discard-on-close) occurrence overlay.
+            resolve_footnote_ids_overlay(
+                &seg,
+                &cache.fn_occ,
+                &mut cache.inner_fn_occ,
+                &mut cache.committed_inner_html,
+            );
             cache.inner_cut = new_cut;
             active_html.clear();
             render_inline(
@@ -2806,12 +2993,13 @@ impl StreamParser {
                 &mut active_html,
             );
         }
-        // Resolve the speculative active tail from a CLONE of the open paragraph's
-        // occurrence sub-map (does NOT advance it). Byte-copy when footnotes off.
+        // Resolve the speculative active tail from a CLONE of the open
+        // paragraph's (small) occurrence overlay, layered over the never-cloned
+        // `fn_occ` (does NOT advance either). Byte-copy when footnotes off.
         if self.gfm_footnotes {
-            let mut occ = cache.inner_fn_occ.clone();
+            let mut over = cache.inner_fn_occ.clone();
             let mut resolved = String::with_capacity(active_html.len());
-            resolve_footnote_ids(&active_html, &mut occ, &mut resolved);
+            resolve_footnote_ids_overlay(&active_html, &cache.fn_occ, &mut over, &mut resolved);
             active_html = resolved;
         }
 
@@ -3103,7 +3291,9 @@ impl StreamParser {
     /// siblings flips the list loose (§5.3) with a one-time O(items so far)
     /// rebuild — sticky once set. The cache bails on an interior blank (directly
     /// loose), a foreign-family / shallower-than-content marker, `\r`, or a
-    /// document-global scoping marker (`[^` footnote / `]:` link-ref def).
+    /// document-global scoping DEFINITION line (`]:` — link-ref or footnote
+    /// def); a plain footnote REF `[^x]` streams through the placeholder/
+    /// resolve machinery instead.
     fn try_incremental_list(&mut self) -> Option<Patch> {
         let mut cache = self.list_cache.take()?;
         let bytes = self.buffer.as_bytes();
@@ -3143,14 +3333,23 @@ impl StreamParser {
             };
             probe.iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n'))
         };
-        let footnotes = self.gfm_footnotes;
         let block_data = self.block_data;
 
         // The open list's OWN items may carry the first reference to a footnote
-        // label, so the numbering pre-pass scans the whole list region (mirrors
-        // the full path).
-        let mut opts = self.build_inline_opts(&self.buffer[cache.start..end]);
+        // label, so the numbering pre-pass covers the whole list region (mirrors
+        // the full path) — extended incrementally over only the region's new
+        // bytes. Footnote REFS then stream through the cache's placeholder/
+        // resolve machinery (`fn_occ`); only DEF-shaped lines bail (below).
+        if self.gfm_footnotes {
+            cache.fn_nums.extend(&self.buffer, end, &self.committed_footnotes);
+        }
+        let mut opts = self.build_inline_opts(&cache.fn_nums);
         opts.open_tail = open_tail;
+
+        // Committing folds advance `cache.fn_occ` in place as the overlay of a
+        // layered resolve (empty base); speculative folds use `fn_occ` as the
+        // never-mutated base instead (see `fold_item_body`).
+        let fn_base_empty: HashMap<String, usize> = HashMap::new();
 
         // Sibling test (the family half; the indent half is inline so it can use
         // the live `cur_ci`). Copy captures so the loop can hold `&mut cache`.
@@ -3158,11 +3357,12 @@ impl StreamParser {
         let same_family = |m: &MarkerScan| m.ordered == c_ordered && m.delim == c_delim;
         // A line/slice that forces the full reparse: `\r` (CRLF) or a
         // document-global scoping marker the region-scoped cache opts can't get
-        // right — a footnote ref/def `[^` (footnotes on) or a link-ref def `]:`.
+        // right — a link-ref or footnote DEFINITION (both carry `]:`; a def
+        // only parses with the `:` on the opener's own line, so the check is
+        // line-local). A plain footnote REF `[^x]` has no `]:` and stays on
+        // the fast path.
         let line_bails = |s: &[u8]| -> bool {
-            s.contains(&b'\r')
-                || (footnotes && s.windows(2).any(|w| w == b"[^"))
-                || s.windows(2).any(|w| w == b"]:")
+            s.contains(&b'\r') || s.windows(2).any(|w| w == b"]:")
         };
 
         // Walk every COMPLETE line, classifying it exactly as the full path's
@@ -3234,6 +3434,7 @@ impl StreamParser {
                             &opts,
                             &mut cache.cached_prefix,
                             Some(&mut cache.item_html),
+                            &fn_base_empty,
                             &mut cache.fn_occ,
                         )?;
                         cache.items.push((s, pos));
@@ -3331,14 +3532,17 @@ impl StreamParser {
             // the slow-path scan counter, so count it for the scaling gate.
             #[cfg(feature = "perf_counters")]
             crate::perf::add_scan(end - cache.open_item_start);
-            let mut partial_occ = cache.fn_occ.clone();
+            // Speculative folds resolve from a discarded OVERLAY over the
+            // frozen-prefix occurrence map (never clones the growing map).
+            let mut partial_over: HashMap<String, usize> = HashMap::new();
             fold_item_body(
                 &bytes[cache.open_item_start..cache.lines_upto],
                 cache.loose,
                 &opts,
                 &mut partial_html,
                 Some(&mut partial_item),
-                &mut partial_occ,
+                &cache.fn_occ,
+                &mut partial_over,
             )?;
             fold_item_body(
                 partial,
@@ -3346,7 +3550,8 @@ impl StreamParser {
                 &opts,
                 &mut partial_html,
                 Some(&mut partial_item),
-                &mut partial_occ,
+                &cache.fn_occ,
+                &mut partial_over,
             )?;
         } else {
             // The partial (continuation, nested marker, trailing blanks, or
@@ -3391,17 +3596,20 @@ impl StreamParser {
                 // item) for this append. Feature-gated work accounting so the
                 // scaling gate can see this class of re-render work (it bypasses
                 // the slow-path scan counter — the wall-only half of the
-                // open-item cliff).
+                // open-item cliff). Resolves from a discarded OVERLAY over the
+                // frozen-prefix occurrence map (does NOT advance it, and never
+                // clones the growing map).
                 #[cfg(feature = "perf_counters")]
                 crate::perf::add_scan(end - cache.open_item_start);
-                let mut partial_occ = cache.fn_occ.clone();
+                let mut partial_over: HashMap<String, usize> = HashMap::new();
                 fold_item_body(
                     &bytes[cache.open_item_start..end],
                     cache.loose,
                     &opts,
                     &mut partial_html,
                     Some(&mut partial_item),
-                    &mut partial_occ,
+                    &cache.fn_occ,
+                    &mut partial_over,
                 )?;
             }
         }
@@ -3463,6 +3671,22 @@ impl StreamParser {
             }
         }
         if let Some(st) = cache.open_stream.as_mut() {
+            // Document-global scoping bail (mirrors `strip_container_delta`'s
+            // over-conservative substring match): the nested parser runs with
+            // footnotes OFF, so a footnote ref reaching the open item's body
+            // must hand the item back to the fold (which renders refs as
+            // placeholder tokens). The 1-byte overlap catches a `[^` marker
+            // split across two feeds.
+            if self.gfm_footnotes
+                && line_contains(
+                    &self.buffer.as_bytes()[st.fed_outer.saturating_sub(1)..end],
+                    b"[^",
+                )
+            {
+                cache.open_stream = None;
+                cache.stream_disabled = true;
+                return;
+            }
             if feed_open_item(st, self.buffer.as_bytes(), end).is_none() {
                 cache.open_stream = None;
                 cache.stream_disabled = true;
@@ -3492,6 +3716,12 @@ impl StreamParser {
     ) -> Option<Box<OpenItemStream>> {
         let bytes = self.buffer.as_bytes();
         let start = cache.open_item_start;
+        // Scoping bail, arm-time flavor: the whole body present so far feeds at
+        // arm, so a `[^` anywhere in it keeps the fold owning the item (the
+        // nested parser runs with footnotes off — see `update_open_item_stream`).
+        if self.gfm_footnotes && line_contains(&bytes[start..end], b"[^") {
+            return None;
+        }
         // A complete first line settles the marker + content byte.
         let nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
         let first_line_end = start + nl + 1;
@@ -3553,6 +3783,8 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
     // every item, so the re-rendered loose items get the SAME footnote ids in the
     // same document order as the tight items they replace.
     cache.fn_occ = cache.fn_occ_base.clone();
+    // Committing replay: `fn_occ` advances in place as the overlay (empty base).
+    let fn_base_empty: HashMap<String, usize> = HashMap::new();
     // Borrow `items` separately so `cached_prefix`/`item_html` can be mutated.
     let spans = std::mem::take(&mut cache.items);
     for &(s, e) in &spans {
@@ -3562,6 +3794,7 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
             opts,
             &mut cache.cached_prefix,
             Some(&mut cache.item_html),
+            &fn_base_empty,
             &mut cache.fn_occ,
         )
         .is_none()
@@ -3884,6 +4117,7 @@ fn build_table_cache(
     id: u64,
     opts: &RenderOpts,
     fn_base: &HashMap<String, usize>,
+    fn_next: usize,
 ) -> Option<TableCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
@@ -3966,6 +4200,7 @@ fn build_table_cache(
         header_cells: td_header_cells,
         body_cells: Vec::new(),
         fn_occ,
+        fn_nums: RegionFnNums::new(start, fn_next),
         partial: None,
     })
 }
@@ -4003,9 +4238,9 @@ fn close_container_paragraph(cache: &mut ContainerCache, opts: &RenderOpts) {
     cache.inner_buffer.clear();
     cache.inner_cut = 0;
     cache.committed_inner_html.clear();
-    // Next paragraph's open-prefix occurrence map starts from the now-advanced
-    // closed-paras baseline.
-    cache.inner_fn_occ = cache.fn_occ.clone();
+    // Next paragraph's open-prefix occurrence OVERLAY starts empty over the
+    // now-advanced closed-paras baseline (`fn_occ` — never cloned).
+    cache.inner_fn_occ.clear();
 }
 
 /// Arm the container cache for an open blockquote / alert at `start`. Returns
@@ -4020,6 +4255,7 @@ fn build_container_cache(
     block_kind: &BlockKind,
     opts: &RenderOpts,
     fn_base: &HashMap<String, usize>,
+    fn_next: usize,
 ) -> Option<ContainerCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
@@ -4100,7 +4336,8 @@ fn build_container_cache(
         inner_cut: 0,
         committed_inner_html: String::new(),
         fn_occ: fn_base.clone(),
-        inner_fn_occ: fn_base.clone(),
+        inner_fn_occ: HashMap::new(),
+        fn_nums: RegionFnNums::new(start, fn_next),
     })
 }
 
@@ -4118,6 +4355,7 @@ fn build_list_cache(
     list_start_num: u32,
     opts: &RenderOpts,
     fn_base: &HashMap<String, usize>,
+    fn_next: usize,
 ) -> Option<ListCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
@@ -4171,6 +4409,7 @@ fn build_list_cache(
         item_html: Vec::new(),
         fn_occ: fn_base.clone(),
         fn_occ_base: fn_base.clone(),
+        fn_nums: RegionFnNums::new(start, fn_next),
     })
 }
 
@@ -4181,32 +4420,36 @@ fn build_list_cache(
 /// (the keyed-renderer channel). De-indents via `item_body` and renders via the
 /// SHARED `render_item_body`, so a nested sub-list is rendered recursively exactly
 /// as the full path does (byte-identical). Footnote refs render as occurrence-
-/// independent placeholder tokens resolved into `out` advancing `occ`; the inner
-/// `<li>` span is resolved from a CLONE taken at item start (matching ids, no
-/// double-count). When footnotes are off this is a token-free byte copy. Returns
-/// `None` (so the caller can bail) on the invalid-UTF-8 / no-marker path.
-/// `out`/`html_sink` are passed separately so the speculative open/partial item
-/// can capture into a scratch buffer without committing it to the cache.
+/// independent placeholder tokens resolved into `out` advancing the LAYERED
+/// occurrence state `base`+`over` — `base` is a never-mutated seed (the cache's
+/// frozen map for a speculative fold; empty for a committing fold that advances
+/// its full map as `over` in place) so no growing map is ever cloned. The inner
+/// `<li>` span is resolved BEFORE the advance from a clone of the (small)
+/// overlay (same pre-item counts, matching ids, no double-count). When
+/// footnotes are off this is a token-free byte copy. Returns `None` (so the
+/// caller can bail) on the invalid-UTF-8 / no-marker path. `out`/`html_sink`
+/// are passed separately so the speculative open/partial item can capture into
+/// a scratch buffer without committing it to the cache.
 fn fold_item_body(
     item: &[u8],
     loose: bool,
     opts: &RenderOpts,
     out: &mut String,
     html_sink: Option<&mut Vec<ListItemData>>,
-    occ: &mut HashMap<String, usize>,
+    base: &HashMap<String, usize>,
+    over: &mut HashMap<String, usize>,
 ) -> Option<()> {
     let body = item_body(item)?;
     let mut tmp = String::new();
     // `span` is `Some((lo, hi))` only when `block_data` is on.
     let span = render_item_body(body, loose, opts, &mut tmp);
-    let data_seed = occ.clone();
-    resolve_footnote_ids(&tmp, occ, out);
     if let (Some(sink), Some((lo, hi))) = (html_sink, span) {
-        let mut seed = data_seed;
+        let mut seed = over.clone();
         let mut inner = String::with_capacity(hi - lo);
-        resolve_footnote_ids(&tmp[lo..hi], &mut seed, &mut inner);
+        resolve_footnote_ids_overlay(&tmp[lo..hi], base, &mut seed, &mut inner);
         sink.push(ListItemData { html: inner });
     }
+    resolve_footnote_ids_overlay(&tmp, base, over, out);
     out.push('\n');
     Some(())
 }
@@ -4507,6 +4750,7 @@ fn build_paragraph_cache(
     id: u64,
     opts: &RenderOpts,
     fn_base: &HashMap<String, usize>,
+    fn_next: usize,
 ) -> Option<ParagraphCache> {
     let bytes = buffer.as_bytes();
     let mut content_end = bytes.len();
@@ -4526,7 +4770,14 @@ fn build_paragraph_cache(
     let mut fn_occ = fn_base.clone();
     let mut committed_inner = String::with_capacity(raw.len());
     resolve_footnote_ids(&raw, &mut fn_occ, &mut committed_inner);
-    Some(ParagraphCache { start, id, cut, committed_inner, fn_occ })
+    Some(ParagraphCache {
+        start,
+        id,
+        cut,
+        committed_inner,
+        fn_occ,
+        fn_nums: RegionFnNums::new(start, fn_next),
+    })
 }
 
 /// True iff `line` (content only, no terminator) is an indented-code line:
