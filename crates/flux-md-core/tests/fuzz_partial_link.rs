@@ -54,6 +54,9 @@ const ALPHABET: &[&str] = &[
     "http", "://", "https://x", "example.com", "/path", "?q=1", "url",
     "<", ">", "\"title\"", "javascript:", "file:", ".org", ".png",
     "**bold**", "`code`", "x",
+    // Label/ref/`]`-at-EOF phase mirrors (speculative label rendering): ref
+    // openers, def openers, footnote/checkbox lookalikes, quoted titles.
+    ":", "^", "][", "x] ", "'t'",
 ];
 
 fn random_link_doc(rng: &mut Rng, max_tokens: usize) -> String {
@@ -185,6 +188,20 @@ fn fuzz_directed_edge_prefixes() {
         "[nested [inner](u)](http",
         "[a](url(paren))",
         "\\![esc](http",
+        // Label-phase / ref-phase / `]`-at-EOF mirrors.
+        "[Earnings Call](https://example.com/q3-earnings) today.",
+        "[just brackets] end.",
+        "[label][ref] x",
+        "[label][] x",
+        "[label][",
+        "[docs]: https://docs.example",
+        "[see [nested] thing](https://x)",
+        "[`code` label](https://x)",
+        "[two\nline](url)",
+        "[a](url \"ti tle words\") x",
+        "[a](url 'ti",
+        "[a](url (pa",
+        "[a](<u> \"t\") y",
     ];
     for doc in seeds {
         let mut byte = 0;

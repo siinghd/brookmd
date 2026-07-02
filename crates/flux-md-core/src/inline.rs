@@ -385,12 +385,15 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                         && !opts.in_link
                         && speculative_link_tail(bytes, pos, opts, out).is_some()
                     {
-                        // Speculative open-tail link: `[label](` whose destination
-                        // is still streaming to EOF rendered an INERT `<a>` (no
-                        // href). Unstable — a later `)` (the real link) or any
-                        // hard terminator can change it. `speculative_link_tail`
-                        // only returns Some when it ran to bytes.len(), so this is
-                        // always the final construct in the slice.
+                        // Speculative open-tail link: a link still streaming to
+                        // EOF — open label `[Earnings Ca`, `]` at EOF, ref name
+                        // `[t][re`, or destination/title `[t](https://exa` —
+                        // rendered an INERT pending `<a>` (no href,
+                        // data-flux-pending). Unstable — the next byte (a `)`,
+                        // a hard terminator, a def-opener `:`…) can change it.
+                        // `speculative_link_tail` only returns Some when it ran
+                        // to bytes.len(), so this is always the final construct
+                        // in the slice.
                         if track && pos < unstable {
                             unstable = pos;
                         }
@@ -1790,18 +1793,37 @@ fn write_link(
     end_pos
 }
 
+/// Max streaming-LABEL length the speculative phases will wrap in a pending
+/// anchor. A prose paragraph with a stray unclosed `[` would otherwise restyle
+/// everything after it as a pending link until the block closes; past any
+/// realistic label length we downgrade to literal (UX bound only — parity is
+/// untouched, both open views apply it identically).
+const MAX_SPECULATIVE_LABEL_LEN: usize = 512;
+
 /// Speculative open-tail link render (streaming only — gated by `opts.open_tail`
-/// at the call site). When a `[label](` has streamed and its destination is
-/// still being typed (runs to EOF with no closing `)` and no hard terminator),
-/// emit an INERT `<a target=… rel=…>label</a>` with NO `href` (a half-typed /
-/// empty URL must not be navigable) and return `Some(bytes.len())`. The target +
-/// rel byte-for-byte match a real complete link so that when `)` finally lands,
-/// the only difference the DOM differ sees is the added `href` (node reuse — no
-/// inert→real teardown). Returns `None` (writing nothing) when this is NOT a
-/// still-streaming destination: no `]`, the next char after `]` isn't `(`, the
-/// label contains a complete nested link (§6.6), or the destination has already
-/// terminated (a `)`, whitespace, control char, or closed `<…>`) — those fall
-/// through to the real `try_link` (complete link or literal).
+/// at the call site). Covers every phase of a link being typed at buffer EOF,
+/// emitting the same INERT pending anchor (see [`write_pending_anchor`]) for
+/// each so the label never flashes as raw `[bracket` text:
+///
+///   - LABEL phase: `[Earnings Ca` — no closing `]` yet, the label itself is
+///     still streaming (guards: [`speculable_label`]).
+///   - `]`-at-EOF: `[Earnings Call]` — the very next byte decides the form
+///     (`(` inline, `[` ref, `:` def opener, other → shortcut ref); keep the
+///     pending anchor for this frame instead of flashing the brackets.
+///   - REF phase: `[label][re` — the ref name is still streaming. When it
+///     closes, the real `try_link` resolves against known defs exactly as
+///     before (unknown refs downgrade to literal — the documented forward-ref
+///     behavior).
+///   - URL phase (0.16.1): `[label](https://exa` — destination (and now
+///     title, `[l](url "ti`) still streaming; the load-bearing mirror of
+///     `read_link_destination` is [`dest_streams_to_eof`].
+///
+/// Returns `Some(bytes.len())` (all phases consume to EOF by construction) or
+/// `None` (writing nothing) when this is NOT a still-streaming link: those fall
+/// through to the real `try_link` (complete link, resolved/downgraded ref, or
+/// literal). `[t]x` (shortcut-ref followed by anything but `(`/`[`) is settled
+/// — resolve-or-downgrade as before, deliberately: an unknown `[1] and` snaps
+/// from pending `1` to literal `[1] and` (uncommon, pinned by test).
 fn speculative_link_tail(
     bytes: &[u8],
     start: usize,
@@ -1811,9 +1833,10 @@ fn speculative_link_tail(
     // Image marker guard: `![label](url…` is IMAGE syntax, never a link. When the
     // image is incomplete, `try_image` fails, emits a literal `!`, and the `[` arm
     // re-processes `[label](url…` — which must NOT speculate (a partial image
-    // stays literal text, never an inert `<a>`). Block speculation when an
-    // UNESCAPED `!` immediately precedes this `[`. (An escaped `\!` is a literal
-    // `!` followed by a real link, so it may still speculate — hence the
+    // stays literal text, never an inert `<a>` — the alt phase mirrors the URL
+    // phase, which has always kept incomplete images literal). Block speculation
+    // when an UNESCAPED `!` immediately precedes this `[`. (An escaped `\!` is a
+    // literal `!` followed by a real link, so it may still speculate — hence the
     // backslash check.)
     if start > 0
         && bytes[start - 1] == b'!'
@@ -1821,81 +1844,211 @@ fn speculative_link_tail(
     {
         return None;
     }
-    // Read the link text (None if no closing `]` yet → nothing to speculate).
-    let (text_range, after_text) = read_balanced_brackets(bytes, start)?;
-    // Only an INLINE link can speculate: the next byte must be `(`. Reference
-    // forms (`[t][r]`, `[t][]`, `[t]`) are left to the real `try_link` so they
-    // resolve (or stay literal) unchanged.
-    if bytes.get(after_text) != Some(&b'(') {
-        return None;
+    match scan_brackets(bytes, start) {
+        // Caps tripped / not a bracket: the real parse renders literal.
+        BracketScan::Reject => None,
+        // LABEL phase: `[label…` still streaming — no closing `]` yet.
+        BracketScan::OpenAtEof => {
+            let label = start + 1..bytes.len();
+            if label.is_empty() {
+                // Lone trailing `[`: the very next byte decides link vs
+                // footnote vs checkbox vs literal — wait one frame.
+                return None;
+            }
+            if !speculable_label(bytes, &label, opts) {
+                return None;
+            }
+            // §6.6: a complete nested link inside the (partial) label already
+            // disqualifies this link — same guard the real `try_link` applies.
+            if text_has_nested_link(bytes, label.clone(), opts) {
+                return None;
+            }
+            Some(write_pending_anchor(bytes, &label, opts, out))
+        }
+        BracketScan::Closed(text_range, after_text) => {
+            // §6.6: a complete nested link inside the label disqualifies this
+            // link — same guard `try_link` applies, so we never speculate where
+            // the real parse would reject.
+            if text_has_nested_link(bytes, text_range.clone(), opts) {
+                return None;
+            }
+            match bytes.get(after_text) {
+                // URL phase: destination/title must be genuinely still
+                // streaming to EOF (no closing `)`, no hard terminator).
+                Some(&b'(') => {
+                    if !dest_streams_to_eof(bytes, after_text + 1) {
+                        return None;
+                    }
+                    Some(write_pending_anchor(bytes, &text_range, opts, out))
+                }
+                // REF phase: `[label][re` — keep the pending anchor while the
+                // ref name streams. A closed ref (`[t][r]`, `[t][]`) or a
+                // capped scan falls to the real `try_link` (resolve against
+                // known defs / literal downgrade), unchanged.
+                Some(&b'[') => match scan_brackets(bytes, after_text) {
+                    BracketScan::OpenAtEof
+                        if speculable_label(bytes, &text_range, opts) =>
+                    {
+                        Some(write_pending_anchor(bytes, &text_range, opts, out))
+                    }
+                    _ => None,
+                },
+                // `]` abuts EOF: the NEXT byte picks the form — hold the
+                // pending anchor for one more frame rather than flashing
+                // `[label]` (even a def-known shortcut ref: a following
+                // `(url)` would change its href, so no href until settled).
+                None => {
+                    if !speculable_label(bytes, &text_range, opts) {
+                        return None;
+                    }
+                    Some(write_pending_anchor(bytes, &text_range, opts, out))
+                }
+                // `]` followed by anything else: shortcut-ref semantics,
+                // settled — resolve or literal-downgrade via `try_link`.
+                _ => None,
+            }
+        }
     }
-    // §6.6: a complete nested link inside the label disqualifies this link —
-    // same guard `try_link` applies, so we never speculate where the real parse
-    // would reject.
-    if text_has_nested_link(bytes, text_range.clone(), opts) {
-        return None;
+}
+
+/// Shared guards for the speculative phases that fire BEFORE the `](` of an
+/// inline link has streamed (label / `]`-at-EOF / ref). The URL phase keeps its
+/// 0.16.1 semantics untouched — by the time `](` has streamed, link intent is
+/// unambiguous and these candidates can no longer form.
+///
+/// POSITION-INDEPENDENCE INVARIANT: every guard here must be a function of the
+/// bytes from the `[` to EOF (plus opts) only — never of where the `[` sits in
+/// the slice. The streaming caches re-render the SAME open block from a
+/// committed cut (`try_incremental_paragraph` & co.), so the `[` that sits
+/// mid-slice in the full rescan is slice-initial in the cache's active tail; a
+/// `start`-keyed guard would make the two views diverge (caught by
+/// `fuzz_partial_link`). The trade: the checkbox/alert exclusions fire on
+/// lookalike content ANYWHERE (one extra literal frame for `[x`-/`[!Note`-
+/// shaped labels), which is the safe direction — literal is the pre-existing
+/// behavior.
+fn speculable_label(
+    bytes: &[u8],
+    label: &core::ops::Range<usize>,
+    opts: &RenderOpts,
+) -> bool {
+    let content = &bytes[label.clone()];
+    // Footnote candidate: `[^…` may still become a footnote ref (a def-known
+    // ref settles in `try_footnote_ref` before we run) or a `[^x]:` def opener
+    // — stay literal, exactly as today.
+    if opts.gfm_footnotes && content.first() == Some(&b'^') {
+        return false;
     }
-    // The destination must be genuinely still streaming to EOF (no `)`, no hard
-    // terminator). This is the load-bearing mirror of `read_link_destination`.
-    if !dest_streams_to_eof(bytes, after_text + 1) {
-        return None;
+    // Nothing may follow the label except its own `]` abutting EOF — true in
+    // the label phase (label runs to EOF) and the `]`-at-EOF phase; false in
+    // the ref phase (`[t][re` continues past the `]`), where the checkbox /
+    // alert forms below are already ruled out.
+    let bare_to_eof = bytes.len() <= label.end + 1;
+    // Task-list checkbox candidate: `[c` / `[c]` (c ∈ ` xX`, nothing after) is
+    // `- [x` mid-checkbox when the `[` opens a list item's body — stay literal
+    // until the form is ruled out (`[x](…` hands off to the URL phase, `[xy`
+    // speculates).
+    if bare_to_eof && content.len() == 1 && matches!(content[0], b' ' | b'x' | b'X') {
+        return false;
     }
-    // Emit the inert anchor. Match `write_link`'s tail bytes EXACTLY (target +
-    // rel, same order) so node reuse holds when the `)` arrives and `href` is
-    // inserted — NO href here (inert).
-    out.push_str("<a target=\"_blank\" rel=\"noopener noreferrer nofollow\">");
+    // Alert-marker candidate: with alerts on, `[!NOTE`-shaped content (`!` +
+    // letters only, nothing past an optional trailing `]` at EOF) may still
+    // become `> [!NOTE]` chrome when the `[` opens a quote body's first line —
+    // stay literal rather than styling the marker as a pending link.
+    if opts.gfm_alerts
+        && bare_to_eof
+        && content.first() == Some(&b'!')
+        && content[1..].iter().all(|b| b.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    // Numeric-citation candidate: an all-digit label so far (`[1`, `[12`) is
+    // far more often a bare `[1]` citation than a link in LLM/RAG output —
+    // styling every citation as a pending link that snaps back to literal
+    // would flash constantly. Stay literal while all-digit; a genuine
+    // `[1](url)` still upgrades at `](`, and a label like `[1 more` starts
+    // speculating at its first non-digit byte. (Pure function of `content`,
+    // keeping the guard position-independent.)
+    if !content.is_empty() && content.iter().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    // UX blast-radius bounds: an open label spanning a newline or growing past
+    // any realistic length is prose with a stray `[`, not a link being typed —
+    // restyling the rest of the block as a pending link would be worse than
+    // the flash. (A genuine multi-line-label link still upgrades at `](`.)
+    content.len() <= MAX_SPECULATIVE_LABEL_LEN && !content.contains(&b'\n')
+}
+
+/// Emit the inert pending anchor shared by every speculative link phase: NO
+/// `href` (a half-typed / empty URL must not be navigable), and
+/// `data-flux-pending=""` so consumers can style the anchor as a link while it
+/// streams (an `<a>` without `href` gets no default link styling). The marker
+/// sits exactly where `href` will land and the tail bytes (target + rel)
+/// byte-match [`write_link`], so when the link completes the only diff the DOM
+/// differ sees is attributes swapping on the same node (no inert→real
+/// teardown). Never in committed/finalize output: speculation itself is
+/// active-tail-only (`open_tail`), forced off at finalize.
+fn write_pending_anchor(
+    bytes: &[u8],
+    text_range: &core::ops::Range<usize>,
+    opts: &RenderOpts,
+    out: &mut String,
+) -> usize {
+    out.push_str("<a data-flux-pending=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">");
     let text = std::str::from_utf8(&bytes[text_range.clone()]).unwrap_or("");
-    // Render the label inline. in_link=true (no nested links, §6.6) and
-    // open_tail=false (the label itself is fully present, not the streaming tail).
+    // Render the label through the SAME path a real link uses: in_link=true (no
+    // nested links, §6.6) and open_tail=false (label semantics stay settled — a
+    // construct still open inside the label renders literally, exactly as
+    // `write_link` will render it if the label closes without it completing, so
+    // the label never flip-flops when the link settles).
     let mut inner_opts = opts.clone();
     inner_opts.in_link = true;
     inner_opts.open_tail = false;
     render_inline(text, &inner_opts, out);
     out.push_str("</a>");
-    Some(bytes.len())
+    bytes.len()
 }
 
 /// Does the link destination starting at `start` (just after the opening `(`)
-/// describe a destination that is genuinely STILL STREAMING to EOF — i.e. it has
-/// not yet been terminated by a `)`, whitespace, control char, or a closed
-/// `<…>`? Returns `true` only in that case (so the speculative open-tail link
-/// fires); `false` means the destination has ended (a `)` is required and either
-/// present → real link, or absent-after-terminator → malformed → literal).
+/// describe a destination (or its optional title) that is genuinely STILL
+/// STREAMING to EOF — i.e. the link has not yet been closed by a depth-0 `)`
+/// nor permanently broken? Returns `true` only in that case (so the speculative
+/// open-tail link fires); `false` means the parse is settled (a real link, or
+/// malformed-forever → literal).
 ///
 /// MUST mirror [`read_link_destination`] exactly so that for every byte-prefix
 /// the speculative path and the real one-shot path agree on parity:
 ///   - skip leading ws (` `,`\t`,`\n`); same set `read_link_destination` skips.
 ///   - EOF reached (empty dest, still streaming) → true.
 ///   - immediate `)` (empty dest closed) → false (real empty link).
-///   - bracketed `<…`: true iff no closing `>`/`\n`/`<` before EOF (still open);
-///     a closed `>` (or a forbidden `\n`/`<`) ends/breaks it → false.
-///   - bare dest: walk with `(`/`)` depth; a space/tab/newline ENDS the bare
-///     dest (now needs a `)` which is absent → malformed-final → literal) → false;
-///     a control char `<0x20` is illegal → false; a depth-0 `)` closes it → false;
-///     reaching EOF still inside the bare dest → true (still streaming).
+///   - bracketed `<…`: no closing `>` before EOF → true (still open); a
+///     forbidden `\n`/`<` breaks it forever → false; a closed `>` hands off to
+///     the title phase ([`post_dest_streams_to_eof`]).
+///   - bare dest: walk with `(`/`)` depth; a control char `<0x20` is illegal →
+///     false; a depth-0 `)` closes it → false; a space/tab/newline ENDS the
+///     bare dest and hands off to the title phase; reaching EOF still inside
+///     the bare dest → true (still streaming).
 fn dest_streams_to_eof(bytes: &[u8], start: usize) -> bool {
     let mut i = start;
     while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n') {
         i += 1;
     }
-    // Empty destination, still streaming to EOF.
-    if i >= bytes.len() {
-        return true;
-    }
-    // Immediate `)` → empty dest already closed (real empty link).
-    if bytes[i] == b')' {
-        return false;
-    }
-    let streaming = if bytes[i] == b'<' {
+    let streaming = if i >= bytes.len() {
+        // Empty destination, still streaming to EOF.
+        true
+    } else if bytes[i] == b')' {
+        // Immediate `)` → empty dest already closed (real empty link).
+        false
+    } else if bytes[i] == b'<' {
         // Bracketed `<…>`: still streaming iff no closing `>` (and no forbidden
-        // `\n`/`<`) before EOF.
+        // `\n`/`<`) before EOF; a closed `>` moves on to the title phase.
         let mut j = i + 1;
         loop {
             if j >= bytes.len() {
                 break true; // ran to EOF inside the brackets → still streaming
             }
             match bytes[j] {
-                b'>' | b'\n' | b'<' => break false, // closed or broken → terminated
+                b'>' => break post_dest_streams_to_eof(bytes, j + 1),
+                b'\n' | b'<' => break false, // broken → permanently literal
                 b'\\' if j + 1 < bytes.len() => j += 2,
                 _ => j += 1,
             }
@@ -1910,9 +2063,8 @@ fn dest_streams_to_eof(bytes: &[u8], start: usize) -> bool {
             }
             let b = bytes[j];
             if matches!(b, b' ' | b'\t' | b'\n') {
-                // Whitespace ends the bare dest; a `)` is now required and absent
-                // at EOF → malformed-final → literal (not still streaming).
-                break false;
+                // Whitespace ends the bare dest → the title phase decides.
+                break post_dest_streams_to_eof(bytes, j);
             }
             if b == b'\\' && j + 1 < bytes.len() {
                 j += 2;
@@ -1950,6 +2102,66 @@ fn dest_streams_to_eof(bytes: &[u8], start: usize) -> bool {
         std::str::from_utf8(&bytes[start..]).unwrap_or("<non-utf8>")
     );
     streaming
+}
+
+/// Title phase of [`dest_streams_to_eof`]: the destination has ENDED cleanly at
+/// `start` (bare dest hit whitespace, or a bracketed `<…>` closed) and what
+/// remains may only be optional whitespace, an optional `"…"`/`'…'`/`(…)`
+/// title, more optional whitespace, then the closing `)`. Still-streaming iff
+/// EOF arrives anywhere a further byte could still complete the link. Mirrors
+/// `read_link_destination`'s post-destination walk byte-for-byte:
+///   - ws then EOF → true (awaiting title or `)`).
+///   - `)` → false (complete link — the real parse takes it).
+///   - a title opener: unclosed at EOF → true (title still streaming); a blank
+///     line inside → false (malformed forever); closed → optional ws, then EOF
+///     → true (awaiting `)`), `)` → false (complete), else false (junk after
+///     the title can never parse).
+///   - any other byte where `read_link_destination` requires `)` → false.
+fn post_dest_streams_to_eof(bytes: &[u8], start: usize) -> bool {
+    let mut i = start;
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return true;
+    }
+    if !matches!(bytes[i], b'"' | b'\'' | b'(') {
+        // `)` → complete link; anything else → permanently malformed.
+        return false;
+    }
+    let close = match bytes[i] {
+        b'"' => b'"',
+        b'\'' => b'\'',
+        _ => b')',
+    };
+    let mut j = i + 1;
+    let mut prev_was_nl = false;
+    while j < bytes.len() && bytes[j] != close {
+        if bytes[j] == b'\\' && j + 1 < bytes.len() {
+            j += 2;
+            prev_was_nl = false;
+            continue;
+        }
+        if bytes[j] == b'\n' {
+            if prev_was_nl {
+                // Blank line inside the title → malformed forever.
+                return false;
+            }
+            prev_was_nl = true;
+        } else if !matches!(bytes[j], b' ' | b'\t' | b'\r') {
+            prev_was_nl = false;
+        }
+        j += 1;
+    }
+    if j >= bytes.len() {
+        return true; // title still streaming (no closer yet)
+    }
+    // Title closed at `j`; only optional ws then the final `)` may follow.
+    let mut k = j + 1;
+    while k < bytes.len() && matches!(bytes[k], b' ' | b'\t' | b'\n') {
+        k += 1;
+    }
+    k >= bytes.len() // EOF → awaiting `)`; `)` → complete; junk → malformed
 }
 
 fn try_image(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut String) -> Option<usize> {
@@ -2046,15 +2258,31 @@ const MAX_BRACKET_DEPTH: usize = 32;
 /// label and keeps the per-`[` scan from going quadratic on unbalanced input.
 const MAX_BRACKET_TEXT_LEN: usize = 8 * 1024;
 
-fn read_balanced_brackets(bytes: &[u8], start: usize) -> Option<(core::ops::Range<usize>, usize)> {
+/// Outcome of the balanced-bracket walk. One shared core serves both the real
+/// parse ([`read_balanced_brackets`] — only `Closed` counts) and the
+/// speculative open-tail label phase, which must additionally distinguish a
+/// bracket that ran to buffer EOF still open (a label STILL STREAMING — may
+/// speculate) from one the caps rejected (adversarial — the real parse renders
+/// it literal, so speculation must too). Sharing the walk keeps the two
+/// consumers incapable of drifting.
+enum BracketScan {
+    /// Balanced close found: (inner text range, offset just past the `]`).
+    Closed(core::ops::Range<usize>, usize),
+    /// Ran to EOF with the bracket still open — the text is still streaming.
+    OpenAtEof,
+    /// No `[` at `start`, or the depth/length caps tripped — literal.
+    Reject,
+}
+
+fn scan_brackets(bytes: &[u8], start: usize) -> BracketScan {
     if bytes.get(start) != Some(&b'[') {
-        return None;
+        return BracketScan::Reject;
     }
     let mut depth = 1;
     let mut i = start + 1;
     while i < bytes.len() {
         if depth > MAX_BRACKET_DEPTH || i - start > MAX_BRACKET_TEXT_LEN {
-            return None;
+            return BracketScan::Reject;
         }
         match bytes[i] {
             b'\\' if i + 1 < bytes.len() => i += 2,
@@ -2081,7 +2309,7 @@ fn read_balanced_brackets(bytes: &[u8], start: usize) -> Option<(core::ops::Rang
             b']' => {
                 depth -= 1;
                 if depth == 0 {
-                    return Some((start + 1..i, i + 1));
+                    return BracketScan::Closed(start + 1..i, i + 1);
                 }
                 i += 1;
             }
@@ -2089,7 +2317,14 @@ fn read_balanced_brackets(bytes: &[u8], start: usize) -> Option<(core::ops::Rang
             _ => i += 1,
         }
     }
-    None
+    BracketScan::OpenAtEof
+}
+
+fn read_balanced_brackets(bytes: &[u8], start: usize) -> Option<(core::ops::Range<usize>, usize)> {
+    match scan_brackets(bytes, start) {
+        BracketScan::Closed(r, end) => Some((r, end)),
+        _ => None,
+    }
 }
 
 /// If bytes starting at `start` form a complete code span, return the byte

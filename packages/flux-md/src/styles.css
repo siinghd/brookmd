@@ -113,6 +113,12 @@
 /* ---- inline ---------------------------------------------------------------- */
 .flux-md a { color: var(--flux-accent); text-decoration: none; }
 .flux-md a:hover { text-decoration: underline; }
+/* A streaming link whose URL hasn't finished arriving renders as an inert
+   `<a data-flux-pending>` with no href — the UA gives an href-less anchor no
+   link styling, so restate the settled resting style here (identical color and
+   decoration, so completion changes nothing visually). Cursor stays default:
+   not clickable yet. */
+.flux-md a[data-flux-pending] { color: var(--flux-accent); text-decoration: none; cursor: default; }
 .flux-md strong { font-weight: 600; }
 .flux-md em { font-style: italic; }
 .flux-md del { color: var(--flux-fg-muted); }

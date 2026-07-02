@@ -204,10 +204,11 @@ fn speculative_link_golden_sweep() {
         // Mid-stream view matches one-shot-open exactly.
         assert_parity(md);
         let html = streamed_open(md);
-        // Inert anchor: same target/rel as a real link, but NO href.
+        // Inert anchor: pending marker where href will land, then the same
+        // target/rel tail as a real link — but NO href.
         assert!(
-            html.contains("<a target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link text Here</a>"),
-            "expected inert <a> for {md:?}, got: {html}"
+            html.contains("<a data-flux-pending=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link text Here</a>"),
+            "expected inert pending <a> for {md:?}, got: {html}"
         );
         assert!(!html.contains("href="), "inert link must have NO href for {md:?}: {html}");
         // No raw URL leaking as visible text (regex-ish: `>` then non-`<` then https).
@@ -257,7 +258,10 @@ fn speculative_inert_shape_no_href() {
     ] {
         assert_parity(md);
         let html = streamed_open(md);
-        assert!(html.contains("<a target="), "expected inert <a> for {md:?}: {html}");
+        assert!(
+            html.contains("<a data-flux-pending=\"\" target="),
+            "expected inert pending <a> for {md:?}: {html}"
+        );
         assert!(!html.contains("href="), "inert link must have NO href for {md:?}: {html}");
     }
 }
@@ -268,7 +272,7 @@ fn speculative_security_javascript_scheme_suppressed() {
     let open = streamed_open("[x](javascript:alert(1");
     assert!(!open.contains("javascript:"), "javascript: must not appear mid-stream: {open}");
     assert!(!open.contains("href="), "no href mid-stream: {open}");
-    assert!(open.contains("<a target="), "inert <a> mid-stream: {open}");
+    assert!(open.contains("<a data-flux-pending=\"\" target="), "inert pending <a> mid-stream: {open}");
     // Closed: sanitize_url drops the dangerous scheme (href present but scrubbed).
     let closed = streamed_open("[x](javascript:alert(1))");
     assert_parity("[x](javascript:alert(1))");
@@ -317,28 +321,50 @@ fn speculative_closed_block_trap() {
 
 #[test]
 fn speculative_reference_links_untouched() {
-    // Reference forms never speculate (next char after `]` isn't `(`).
+    // CLOSED reference forms settle the OUTER form exactly as before (unknown
+    // ref → literal downgrade); `[t]` abutting EOF holds the pending anchor
+    // for a frame (the next byte decides its form); a settled shortcut
+    // (`[t] (`) is literal. All stay parity-clean.
     for md in ["[t][r]", "[t][]", "[t]", "[t] ("] {
         assert_parity(md);
     }
+    assert!(streamed_open("[t]").contains("<a data-flux-pending=\"\" target="));
+    assert!(!streamed_open("[t] (").contains("data-flux-pending"), "settled shortcut is literal");
+    // `[t][r]` at EOF: the outer full-ref is literal, but its trailing inner
+    // `[r]` abuts EOF and re-speculates on its own — `[t][r](url)` really
+    // would parse as literal `[t]` + inline link `[r](url)`.
+    let html = streamed_open("[t][r]");
+    assert!(
+        html.contains("[t]") && html.contains("<a data-flux-pending=\"\" target="),
+        "outer literal + inner pending expected: {html}"
+    );
 }
 
 #[test]
-fn speculative_title_midstream_is_literal() {
-    // `[a](url "ti` — the space after the bare dest ends it → not still-streaming
-    // → literal (mid-stream and one-shot agree).
+fn speculative_title_midstream_stays_pending() {
+    // `[a](url "ti` — the dest ended cleanly and the TITLE is still streaming
+    // to EOF: the pending anchor holds (this used to flash literal until `)`).
     assert_parity("[a](url \"ti");
     let html = streamed_open("[a](url \"ti");
-    assert!(!html.contains("<a"), "title mid-stream must be literal: {html}");
+    assert!(
+        html.contains("<a data-flux-pending=\"\" target=") && !html.contains("href="),
+        "mid-title must stay pending: {html}"
+    );
+    // A blank line inside the title breaks it forever → literal (settled).
+    assert_parity("[a](url \"ti\n\nx");
 }
 
 #[test]
 fn speculative_bracketed_dest_edges() {
-    // `<partial` (no closing `>`) → inert; `<url>` (closed, no `)`) → literal.
+    // `<partial` (no closing `>`) → inert; `<url>` (closed, no `)` yet) is
+    // still awaiting a title or the `)` → pending too; a broken bracketed dest
+    // (forbidden `<`) is malformed forever → literal.
     assert_parity("[a](<partial");
-    assert!(streamed_open("[a](<partial").contains("<a target="));
+    assert!(streamed_open("[a](<partial").contains("<a data-flux-pending=\"\" target="));
     assert_parity("[a](<url>");
-    assert!(!streamed_open("[a](<url>").contains("<a "), "closed <url> w/o ) is literal");
+    assert!(streamed_open("[a](<url>").contains("<a data-flux-pending=\"\" target="));
+    assert_parity("[a](<br<");
+    assert!(!streamed_open("[a](<br<").contains("<a "), "broken bracketed dest is literal");
 }
 
 #[test]
@@ -374,12 +400,13 @@ fn speculative_convergence_node_stability() {
     p.append(")");
     let s3 = collect(&p);
 
-    // First two states: identical inert <a> (no href).
+    // First two states: identical inert pending <a> (no href).
     assert_eq!(s1, s2, "inert <a> must be byte-stable while the URL streams");
-    assert!(s1.contains("<a target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link</a>"));
+    assert!(s1.contains("<a data-flux-pending=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link</a>"));
     assert!(!s1.contains("href="));
 
-    // Final state: only `href` was inserted; the target/rel/label tail is intact.
+    // Final state: `href` replaced the pending marker in place; the
+    // target/rel/label tail is intact (attribute swap on the same node).
     assert!(s3.contains("<a href=\"https://x\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link</a>"));
     // The inert prefix (everything after the would-be href) is reused verbatim.
     assert!(s3.contains("target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link</a>"));
@@ -394,7 +421,7 @@ fn speculative_cache_commit_safety_long_prefix() {
     assert_parity(&md);
     let streamed = streamed_open(&md);
     // Inert <a> present mid-stream, no raw URL leak, no href.
-    assert!(streamed.contains("<a target="), "inert <a> present: ...{}", &streamed[streamed.len().saturating_sub(120)..]);
+    assert!(streamed.contains("<a data-flux-pending=\"\" target="), "inert pending <a> present: ...{}", &streamed[streamed.len().saturating_sub(120)..]);
     assert!(!streamed.contains("href="));
     // Finalize collapses to literal (the frozen prefix never captured an <a>).
     let fin = finalized(&md);

@@ -467,8 +467,40 @@ export default function Doc({ md }: { md: string }) {
 | Where parse runs | Web Worker (off main thread) | Main thread |
 | Block identity across chunks | Stable monotonic IDs | New keys on every render |
 | Mid-stream unclosed `` ``` `` / `*` / `**` | Speculatively closed in render, replaced cleanly | Often renders raw or breaks |
+| Half-streamed link `[label](https://…` | Label-only inert anchor (`data-flux-pending`), URL never leaks | Raw brackets + partial URL flash |
 | Heavy renderers (syntax, math, mermaid) | Deferred until block close | Re-run per chunk |
 | XSS sanitization | Allowlist in Rust + URL scheme check | Downstream sanitizer pass on the JS thread |
+
+### Streaming links
+
+A link's destination is the last thing a model emits — `[Earnings Call](https://…`
+often spans many tokens. While a link is still streaming, flux-md renders it as
+an **inert, label-only anchor**: the label text inside an `<a>` with no `href`
+(the half-typed URL never flashes on screen), marked so you can style it:
+
+```html
+<a data-flux-pending="" target="_blank" rel="noopener noreferrer nofollow">Earnings Call</a>
+```
+
+An anchor without an `href` gets **no default link styling** from the browser, so
+without a rule for the marker the link would "pop" blue only when the URL
+completes. The bundled theme (`import "flux-md/styles.css"`) already styles it;
+if you bring your own CSS, copy this:
+
+```css
+.flux-md a[data-flux-pending] {
+  color: var(--flux-accent, #0969da); /* match your settled link's resting style */
+  cursor: default;                    /* not clickable yet */
+}
+```
+
+The moment the closing `)` arrives, the `href` appears and `data-flux-pending`
+is dropped — committed and finalized output never carry the marker, and the
+finished block is byte-identical to a one-shot parse. Two composition notes:
+`urlTransform` runs only on a real `href`, so it never sees a half-streamed URL
+prefix — only the complete one (it may run again on re-renders while the
+surrounding block is still open); `decorators` skip text
+inside `<a>` by default (`skipInside`), pending or not.
 
 ## Styling
 
