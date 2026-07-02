@@ -148,4 +148,20 @@ proptest! {
         let streamed = streamed_final(&doc, &[1]);
         prop_assert_eq!(&streamed, &one, "char-by-char finalize diverged for {:?}", doc);
     }
+
+    /// CRLF twin of every construct doc: line endings are normalized at ingest,
+    /// so the CRLF document must finalize byte-identical to its LF twin — one-
+    /// shot, under random chunk splits, and char-by-char (which cuts every
+    /// `\r|\n` pair across two appends, the pending-`\r` hold-back path).
+    #[test]
+    fn finalize_crlf_chunk_independent(doc in doc_strategy(), sizes in chunk_sizes()) {
+        let crlf = doc.replace('\n', "\r\n");
+        let one_lf = one_shot_final(&doc);
+        let one_crlf = one_shot_final(&crlf);
+        prop_assert_eq!(&one_crlf, &one_lf, "one-shot CRLF != LF for {:?}", doc);
+        let streamed = streamed_final(&crlf, &sizes);
+        prop_assert_eq!(&streamed, &one_lf, "chunk-split CRLF finalize diverged for {:?} (sizes {:?})", doc, sizes);
+        let char_by_char = streamed_final(&crlf, &[1]);
+        prop_assert_eq!(&char_by_char, &one_lf, "char-by-char CRLF finalize diverged for {:?}", doc);
+    }
 }

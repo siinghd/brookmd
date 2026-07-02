@@ -123,6 +123,56 @@ fn open_code_fence_matches() {
 }
 
 // ---------------------------------------------------------------------------
+// CRLF ingest normalization: `\r\n` / lone `\r` become `\n` in `append`, with a
+// chunk-final `\r` held pending until the next chunk decides. The streamed view
+// (char-by-char = every `\r|\n` pair cut across two appends) must match the
+// one-shot view of the same prefix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crlf_open_blocks_match_one_shot() {
+    assert_parity("- one\r\n- two\r\n");
+    assert_parity("1. one\r\n2. two\r\n");
+    assert_parity("| a | b |\r\n| - | - |\r\n| 1 | 2 |\r\n");
+    assert_parity("```rust\r\nfn main() {}\r\nlet x = 1;\r\n");
+    assert_parity("> line one\r\n> line two\r\n");
+    assert_parity("> [!NOTE]\r\n> body\r\n");
+    assert_parity("para line one\r\npara line two\r\n");
+    // Lone `\r` line endings (old-Mac style) and a trailing undecided `\r`.
+    assert_parity("- one\r- two\r");
+    assert_parity("prefix ends in \r");
+}
+
+#[test]
+fn crlf_split_across_appends_is_chunk_independent() {
+    // Cut a CRLF document in two at EVERY byte boundary — including between
+    // `\r` and `\n` (the pending-`\r` hold-back) — and finalize: the output
+    // must equal the one-shot render, and equal the LF twin's.
+    let lf = "# Head\n\n- one\n- two\n\n> quote\n\n```\ncode\n```\n\n| a |\n| - |\n| 1 |\n";
+    let crlf = lf.replace('\n', "\r\n");
+    let one_shot = {
+        let mut p = StreamParser::new().with_gfm_alerts(true);
+        p.append(&crlf);
+        p.finalize();
+        collect(&p)
+    };
+    let lf_one_shot = {
+        let mut p = StreamParser::new().with_gfm_alerts(true);
+        p.append(lf);
+        p.finalize();
+        collect(&p)
+    };
+    assert_eq!(one_shot, lf_one_shot, "CRLF one-shot != LF one-shot");
+    for cut in 0..=crlf.len() {
+        let mut p = StreamParser::new().with_gfm_alerts(true);
+        p.append(&crlf[..cut]);
+        p.append(&crlf[cut..]);
+        p.finalize();
+        assert_eq!(collect(&p), one_shot, "split at byte {cut} diverged");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Speculative open-tail link rendering (kills the streaming link-URL flash).
 // While `[label](url…` streams, render an INERT `<a>label</a>` (no href, no raw
 // URL as text); once `)` lands the real `href` is added (node reuse).

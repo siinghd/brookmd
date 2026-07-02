@@ -277,6 +277,12 @@ pub struct StreamParser {
     indented_cache: Option<IndentedCodeCache>,
     /// Fast path for a long open raw-HTML block at the tail (see [`HtmlBlockCache`]).
     html_cache: Option<HtmlBlockCache>,
+    /// A chunk ended in a bare `\r` whose line ending is not yet decided: the
+    /// next appended byte tells whether it was `\r\n` (one `\n`) or a lone `\r`
+    /// (also one `\n`, per CommonMark). The `\r` is held OUT of `buffer` until
+    /// then so a `\r|\n` split across appends stays chunk-independent;
+    /// `finalize` flushes a still-pending `\r` as `\n`. See [`Self::ingest`].
+    pending_cr: bool,
 }
 
 #[derive(Default)]
@@ -752,6 +758,7 @@ impl StreamParser {
             list_cache: None,
             indented_cache: None,
             html_cache: None,
+            pending_cr: false,
         }
     }
 
@@ -905,11 +912,56 @@ impl StreamParser {
         if self.finalized {
             return Patch::default();
         }
-        self.buffer.push_str(chunk);
+        self.ingest(chunk);
         let patch = self.reparse_tail(false);
         #[cfg(feature = "perf_counters")]
         Self::count_emitted(&patch);
         patch
+    }
+
+    /// Normalize line endings at ingest: `\r\n` and lone `\r` become `\n`
+    /// before `buffer` (and therefore the scanner, every incremental cache and
+    /// the committed-prefix machinery) sees the bytes. CommonMark defines all
+    /// three as the same line ending, so output is conformant — and CRLF-origin
+    /// streams take the exact same O(n) incremental fast paths as LF streams
+    /// instead of tripping the caches' `\r` bails into a full-tail reparse per
+    /// append. A chunk-final `\r` is held pending (not pushed) until the next
+    /// chunk shows whether a `\n` follows, keeping a `\r|\n` split across
+    /// appends chunk-independent; `finalize` flushes a pending `\r` as `\n`.
+    fn ingest(&mut self, chunk: &str) {
+        let mut rest = chunk;
+        if self.pending_cr && !rest.is_empty() {
+            self.pending_cr = false;
+            self.buffer.push('\n');
+            if rest.as_bytes()[0] == b'\n' {
+                rest = &rest[1..]; // the held `\r` + this `\n` = one line ending
+            }
+        }
+        // Fast path: no `\r` in the chunk (the overwhelmingly common case).
+        let Some(mut cr) = rest.find('\r') else {
+            self.buffer.push_str(rest);
+            return;
+        };
+        self.buffer.reserve(rest.len());
+        loop {
+            self.buffer.push_str(&rest[..cr]);
+            rest = &rest[cr + 1..];
+            if rest.is_empty() {
+                self.pending_cr = true; // chunk-final `\r`: next append decides
+                return;
+            }
+            self.buffer.push('\n');
+            if rest.as_bytes()[0] == b'\n' {
+                rest = &rest[1..];
+            }
+            match rest.find('\r') {
+                Some(i) => cr = i,
+                None => {
+                    self.buffer.push_str(rest);
+                    return;
+                }
+            }
+        }
     }
 
     pub fn finalize(&mut self) -> Patch {
@@ -917,6 +969,10 @@ impl StreamParser {
             return Patch::default();
         }
         self.finalized = true;
+        if self.pending_cr {
+            self.pending_cr = false;
+            self.buffer.push('\n');
+        }
         let patch = self.reparse_tail(true);
         #[cfg(feature = "perf_counters")]
         Self::count_emitted(&patch);
@@ -934,6 +990,8 @@ impl StreamParser {
         crate::perf::add_emit(n);
     }
 
+    /// The retained source, with line endings normalized to `\n` (see
+    /// [`Self::ingest`]); block `start`/`end` offsets index into this.
     pub fn buffer(&self) -> &str {
         &self.buffer
     }

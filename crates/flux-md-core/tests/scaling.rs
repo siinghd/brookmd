@@ -396,10 +396,36 @@ fn em_pairs_one_para(target: usize) -> String {
     repeat_to("*em* ", target)
 }
 
-/// crlf-cache-bail: CRLF line endings bail every incremental cache, so an
-/// ordinary list full-rescans each append.
+/// crlf-cache-bail (FIXED): CRLF line endings used to bail every incremental
+/// cache, so ordinary CRLF streams full-rescanned each append; ingest
+/// normalization (`\r\n`/lone `\r` -> `\n` before the buffer) makes them take
+/// the exact same fast paths as LF. One twin per confirmed member family.
 fn crlf_big_list(target: usize) -> String {
     big_list(target).replace('\n', "\r\n")
+}
+
+fn crlf_mixed(target: usize) -> String {
+    mixed(target).replace('\n', "\r\n")
+}
+
+fn crlf_big_code(target: usize) -> String {
+    big_code(target).replace('\n', "\r\n")
+}
+
+fn crlf_big_table(target: usize) -> String {
+    big_table(target).replace('\n', "\r\n")
+}
+
+fn crlf_nested_loose_list(target: usize) -> String {
+    nested_loose_list(target).replace('\n', "\r\n")
+}
+
+fn crlf_blockquote_with_list(target: usize) -> String {
+    blockquote_with_list(target).replace('\n', "\r\n")
+}
+
+fn crlf_alert_with_list(target: usize) -> String {
+    big_alert(target).replace('\n', "\r\n")
 }
 
 /// blockdata-disables-container-cache: same shape as `big_alert`, but
@@ -533,6 +559,15 @@ fn shapes() -> Vec<Shape> {
         // never re-armed whenever an append ended exactly at `\n`.
         lin("html_type6_aligned", html_type6_aligned, Linear),
         lin("html_type7_aligned", html_type7_aligned, Linear),
+        // CRLF twins (hunt group crlf-cache-bail, FIXED via ingest
+        // normalization) — must cost the same as their LF originals.
+        lin("crlf_big_list", crlf_big_list, Linear),
+        lin("crlf_mixed", crlf_mixed, Linear),
+        lin("crlf_big_code", crlf_big_code, Linear),
+        lin("crlf_big_table", crlf_big_table, Linear),
+        lin("crlf_nested_loose_list", crlf_nested_loose_list, Linear),
+        lin("crlf_blockquote_with_list", crlf_blockquote_with_list, Linear),
+        lin("crlf_alert_with_list", crlf_alert_with_list, Linear),
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
@@ -547,7 +582,7 @@ fn shapes() -> Vec<Shape> {
         quad("table-partial-row-rerender", growing_last_cell, base, Linear, KnownQuadratic),
         quad("resolve-delimiters-replace-range", strikethrough_one_para, base, Linear, Linear), // wall-only (replace_range memmove)
         quad("compute-cut-pair-overlap-scan", em_pairs_one_para, base, Linear, Linear), // wall-only (pair-overlap scan)
-        quad("crlf-cache-bail", crlf_big_list, base, KnownQuadratic, KnownQuadratic),
+        // crlf-cache-bail: FIXED — promoted to the seven crlf_* linear twins above.
         quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
         quad("list-interior-blank-loose-bail", indented_code_blanks, base, KnownQuadratic, Linear),
     ];
