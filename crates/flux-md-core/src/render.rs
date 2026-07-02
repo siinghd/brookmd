@@ -1393,7 +1393,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
 /// whether any blank line sits in the gap between two consecutive blocks.
 /// Blanks inside a single block (fenced code, a nested list) are part of that
 /// child block and are invisible to this top-level scan, so they don't count.
-fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
+pub(crate) fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
     let body = match item_body(item) {
         Some(b) => b,
         None => return false,

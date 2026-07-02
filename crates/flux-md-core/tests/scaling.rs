@@ -329,14 +329,83 @@ fn quote_ref_defs(target: usize) -> String {
     s
 }
 
-/// open-list-item-body-rerender: a quoted list item whose body is a growing
-/// table — the open item never folds, so `fold_item_body` re-renders it whole
-/// every append (scan-counter-blind; `rendered` sees it).
+/// open-list-item-body-rerender (FIXED): a quoted list item whose body is a
+/// growing table — the open item never folds, and `fold_item_body` used to
+/// re-render it whole every append (scan-counter-blind). The OpenItemStream
+/// (nested parser) makes an armed item body stream in O(new bytes), and the
+/// speculative fold is now counted, so both metrics pin this class:
+/// ContainerBlockCache recursing into a nested ListCache recursing into an
+/// OpenItemStream + TableCache.
 fn quoted_list_table(target: usize) -> String {
     let mut s = String::from("> - intro\n>   | a | b |\n>   | --- | --- |\n");
     let mut i = 0usize;
     while s.len() < target {
         s.push_str(&format!(">   | cell {i} | value {i} |\n"));
+        i += 1;
+    }
+    s
+}
+
+/// ONE list item with an ever-growing plain-prose multi-line body — the
+/// wall-only half of the open-item cliff.
+fn list_item_plain_body(target: usize) -> String {
+    let mut s = String::from("- intro line for the single item\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!(
+            "  plain continuation prose line {i} with several ordinary words here\n"
+        ));
+        i += 1;
+    }
+    s
+}
+
+/// ONE list item whose body is an ever-growing table (the nested stream's own
+/// TableCache makes the per-append work O(new bytes)).
+fn list_growing_table(target: usize) -> String {
+    let mut s = String::from("- intro\n  | a | b |\n  | --- | --- |\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("  | cell {i} | value {i} |\n"));
+        i += 1;
+    }
+    s
+}
+
+/// ONE list item holding an ever-growing open fence. Pins the open-item
+/// stream's kind-aware `open_tail` sensitivity: the fence opener's backticks
+/// must NOT poison the settled-append fast path (code bodies never
+/// inline-render, so they are exempt from the trigger-byte scan).
+fn list_open_fence(target: usize) -> String {
+    let mut s = String::from("- item with a growing fence\n  ```rust\n");
+    while s.len() < target {
+        s.push_str("  let x = compute(alpha, beta); // fence line\n");
+    }
+    s
+}
+
+/// ONE ever-growing directly-loose item (§5.3): blank-separated sub-paragraphs
+/// inside a single item. The blank used to hard-bail the list cache.
+fn loose_subs_one_item(target: usize) -> String {
+    let mut s = String::from("- topic intro\n");
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!("\n  sub paragraph {i} with a few words of detail\n"));
+        i += 1;
+    }
+    s
+}
+
+/// Every item directly loose (§5.3): an interior blank between the item's two
+/// paragraphs used to hard-bail the list cache — and the re-armed cache
+/// re-bailed every append (counter ~247x).
+fn staircase_blank_flap(target: usize) -> String {
+    let mut s = String::with_capacity(target + 64);
+    let mut i = 0usize;
+    while s.len() < target {
+        s.push_str(&format!(
+            "- step {i} heading text\n\n  step {i} detail paragraph with words\n"
+        ));
         i += 1;
     }
     s
@@ -493,8 +562,11 @@ fn blockdata_math(target: usize) -> String {
     big_math(target)
 }
 
-/// list-interior-blank-loose-bail: indented code with periodic interior blank
-/// lines — the blank flips looseness speculation and bails the cache.
+/// list-interior-blank-loose-bail (FIXED): indented code with a legal interior
+/// blank every 20 lines used to permanently disarm the IndentedCodeCache
+/// (bail + re-arm walk died on the same blank), so the never-committing
+/// region re-scanned every append (counter ~248x). Blanks now fold as body
+/// lines, at arm time too.
 fn indented_code_blanks(target: usize) -> String {
     let mut s = String::with_capacity(target + 64);
     let mut i = 0usize;
@@ -644,6 +716,20 @@ fn shapes() -> Vec<Shape> {
         // into `scanned`, so both metrics now pin this class.
         lin("growing_last_cell", growing_last_cell, Linear),
         lin("wide_one_row", wide_one_row, Linear),
+        // Open list ITEM with an ever-growing body -> ListCache + OpenItemStream
+        // (nested parser, incremental; hunt group open-list-item-body-rerender,
+        // FIXED). The speculative fold is now counted (perf::add_scan).
+        lin("list_item_plain_body", list_item_plain_body, Linear),
+        lin("list_growing_table", list_growing_table, Linear),
+        lin("list_open_fence", list_open_fence, Linear),
+        lin("quoted_list_table", quoted_list_table, Linear),
+        // Legal interior blank lines no longer disarm the caches (hunt group
+        // list-interior-blank-loose-bail, FIXED): a list item's interior blank
+        // stays in-item (§5.3 looseness via item_directly_loose through the
+        // one-time rebuild_loose), and indented-code blanks fold as body lines.
+        lin("loose_subs_one_item", loose_subs_one_item, Linear),
+        lin("staircase_blank_flap", staircase_blank_flap, Linear),
+        lin("indented_code_with_interior_blanks", indented_code_blanks, Linear),
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
@@ -658,7 +744,8 @@ fn shapes() -> Vec<Shape> {
         quad("footnote-global-state", fn_def_run_noblank, footnotes, KnownQuadratic, KnownQuadratic),
         // rendered measured sub-linear (defs emit no HTML) — gate it Linear.
         quad("global-defs-inside-container", quote_ref_defs, base, KnownQuadratic, Linear),
-        quad("open-list-item-body-rerender", quoted_list_table, base, Linear, KnownQuadratic),
+        // open-list-item-body-rerender: FIXED — quoted_list_table and the
+        // list_* shapes promoted to linear below.
         // table-partial-row-rerender: FIXED — growing_last_cell + wide_one_row
         // promoted to linear shapes below.
         // resolve-delimiters-replace-range: FIXED — strikethrough_para promoted
@@ -666,7 +753,8 @@ fn shapes() -> Vec<Shape> {
         // compute-cut-pair-overlap-scan: FIXED — em_pairs_para promoted above.
         // crlf-cache-bail: FIXED — promoted to the seven crlf_* linear twins above.
         quad("blockdata-per-append-rebuild", blockdata_math, block_data, Linear, Linear), // wall-only (data-channel rebuild)
-        quad("list-interior-blank-loose-bail", indented_code_blanks, base, KnownQuadratic, Linear),
+        // list-interior-blank-loose-bail: FIXED — indented_code_with_interior_
+        // blanks + loose_subs_one_item + staircase_blank_flap promoted above.
     ];
     // Shapes too expensive per byte for the 8 KB → 64 KB span (super-quadratic
     // wall); same 8x span at smaller sizes.

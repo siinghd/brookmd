@@ -234,3 +234,208 @@ fn tight_to_loose_mid_stream_rewrites_prior_items() {
     let one_shot = render("- one\n- two\n\n- three\n");
     assert_eq!(streamed, one_shot, "mid-stream tight→loose flip must converge");
 }
+
+// ---------------------------------------------------------------------------
+// OpenItemStream coverage — ONE open item whose multi-line body outgrows the
+// per-append fold (>1 KB) and streams through the nested parser. Mid-stream
+// prefix parity is the contract: after EVERY append the streamed view must
+// byte-match the one-shot view of the same prefix (no finalize) — the armed
+// stream, the settled-tail (buffer-ends-blank) appends, the tight→loose flip
+// and the fold fallback for open_tail-speculation trigger bytes all included.
+// ---------------------------------------------------------------------------
+
+fn make_gfm() -> StreamParser {
+    StreamParser::new()
+        .with_gfm_autolinks(true)
+        .with_gfm_alerts(true)
+        .with_gfm_math(true)
+}
+
+fn open_item_docs() -> Vec<(&'static str, String)> {
+    let mut docs = Vec::new();
+
+    // Tight single item, plain multi-line prose body (list_item_plain_body).
+    let mut s = String::from("- intro line for the single item\n");
+    for i in 0..60 {
+        s.push_str(&format!("  plain continuation prose line {i} with several words\n"));
+    }
+    docs.push(("plain_body", s));
+
+    // Directly-loose item: blank-separated sub-paragraphs (loose_subs_one_item).
+    let mut s = String::from("- topic intro\n");
+    for i in 0..40 {
+        s.push_str(&format!("\n  sub paragraph {i} with a few words of detail\n"));
+    }
+    docs.push(("loose_subs", s));
+
+    // Structured bodies: growing table / fence / nested sub-list.
+    let mut s = String::from("- intro\n  | a | b |\n  | --- | --- |\n");
+    for i in 0..50 {
+        s.push_str(&format!("  | cell {i} | value {i} |\n"));
+    }
+    docs.push(("table_body", s));
+    let mut s = String::from("- item with a growing fence\n  ```rust\n");
+    for i in 0..40 {
+        s.push_str(&format!("  let x{i} = compute(alpha, beta);\n"));
+    }
+    docs.push(("fence_body", s));
+    let mut s = String::from("- outer item heading line\n");
+    for i in 0..50 {
+        s.push_str(&format!("  - nested sub bullet {i} with words\n"));
+    }
+    docs.push(("sublist_body", s));
+
+    // Trigger bytes (` $ [ \) — `ot_sensitive` routes settled-tail appends
+    // through the fold; unterminated constructs flip renders between the
+    // open_tail variants, so parity here pins the fallback.
+    let mut s = String::from("- intro with `code` and [links](http://x.example)\n");
+    for i in 0..40 {
+        s.push_str(&format!(
+            "  line {i} has `span {i}`, a [ref {i}](http://y.example), $m_{i}$ and \\(k\\)\n"
+        ));
+    }
+    docs.push(("trigger_bytes", s));
+    let mut s = String::from("- intro\n");
+    for i in 0..40 {
+        s.push_str(&format!("\n  paragraph {i} ends with an unterminated `code span {i}\n"));
+    }
+    docs.push(("unterminated_span", s));
+
+    // Trigger bytes ONLY inside inline-free bodies (fence opener + code
+    // content) — exempt from `open_item_ot_sensitive`, so the stream keeps
+    // serving the settled (blank-aligned) appends; parity pins the exemption.
+    let mut s = String::from("- fence of soup\n  ```rust\n");
+    for i in 0..40 {
+        s.push_str(&format!("  let s{i} = [`tick {i}`, \"$$\", b'\\\\'];\n"));
+    }
+    docs.push(("fence_trigger_soup", s));
+    let mut s = String::from("- item with indented code\n\n");
+    for i in 0..40 {
+        s.push_str(&format!("      let v{i} = map[`key {i}`] + $cost; // \\ soup\n"));
+        if i % 10 == 9 {
+            s.push('\n');
+        }
+    }
+    docs.push(("indented_trigger_soup", s));
+
+    // Task-list item with a long tight body (label/checkbox assembly).
+    let mut s = String::from("- [x] task heading line for the item\n");
+    for i in 0..50 {
+        s.push_str(&format!("  task continuation line {i} with words\n"));
+    }
+    docs.push(("task_body", s));
+
+    docs
+}
+
+/// Chunkers: fixed byte sizes, plus line- and blank-line-aligned appends
+/// (the blank-aligned one lands every boundary on `\n\n` — the settled-tail
+/// append the stream now serves when the body has no trigger byte).
+fn chunk_boundaries(md: &str) -> Vec<Vec<usize>> {
+    let b = md.as_bytes();
+    let mut plans = Vec::new();
+    for n in [7usize, 64, 256] {
+        let mut cuts = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let mut e = (i + n).min(b.len());
+            while e < b.len() && (b[e] & 0xC0) == 0x80 {
+                e += 1;
+            }
+            cuts.push(e);
+            i = e;
+        }
+        plans.push(cuts);
+    }
+    let mut line_cuts = Vec::new();
+    for (i, &byte) in b.iter().enumerate() {
+        if byte == b'\n' {
+            line_cuts.push(i + 1);
+        }
+    }
+    if *line_cuts.last().unwrap_or(&0) != b.len() {
+        line_cuts.push(b.len());
+    }
+    plans.push(line_cuts);
+    let mut blank_cuts = Vec::new();
+    let mut i = 0;
+    while i + 1 < b.len() {
+        if b[i] == b'\n' && b[i + 1] == b'\n' {
+            blank_cuts.push(i + 2);
+        }
+        i += 1;
+    }
+    if *blank_cuts.last().unwrap_or(&0) != b.len() {
+        blank_cuts.push(b.len());
+    }
+    plans.push(blank_cuts);
+    plans
+}
+
+#[test]
+fn open_item_stream_midstream_prefix_parity() {
+    for (name, md) in open_item_docs() {
+        for cuts in chunk_boundaries(&md) {
+            let mut p = make_gfm();
+            let mut prev = 0usize;
+            for &cut in &cuts {
+                p.append(&md[prev..cut]);
+                prev = cut;
+                let mut one = make_gfm();
+                one.append(&md[..cut]);
+                assert_eq!(
+                    collect(&p),
+                    collect(&one),
+                    "mid-stream != one-shot for {name} at prefix {cut}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn open_item_stream_finalize_parity() {
+    for (name, md) in open_item_docs() {
+        let mut one = make_gfm();
+        one.append(&md);
+        one.finalize();
+        let expect = collect(&one);
+        for cuts in chunk_boundaries(&md) {
+            let mut p = make_gfm();
+            let mut prev = 0usize;
+            for &cut in &cuts {
+                p.append(&md[prev..cut]);
+                prev = cut;
+            }
+            p.finalize();
+            assert_eq!(collect(&p), expect, "finalize diverged for {name}");
+        }
+    }
+}
+
+#[test]
+fn open_item_stream_a11y_dir_task_parity() {
+    // a11y label-wrap + dir=auto exercise the assembly's `<li dir>` /
+    // `<label>` branches with the stream armed.
+    let mut md = String::from("- [ ] task item heading line\n");
+    for i in 0..60 {
+        md.push_str(&format!("  continuation line {i} with words\n"));
+    }
+    let mk = || {
+        StreamParser::new()
+            .with_gfm_autolinks(true)
+            .with_dir_auto(true)
+            .with_a11y(true)
+    };
+    for cuts in chunk_boundaries(&md) {
+        let mut p = mk();
+        let mut prev = 0usize;
+        for &cut in &cuts {
+            p.append(&md[prev..cut]);
+            prev = cut;
+            let mut one = mk();
+            one.append(&md[..cut]);
+            assert_eq!(collect(&p), collect(&one), "a11y/dir parity at prefix {cut}");
+        }
+    }
+}

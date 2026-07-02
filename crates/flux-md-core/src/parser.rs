@@ -6,8 +6,9 @@ use std::rc::Rc;
 use crate::blocks::Block;
 use crate::render::{
     blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
-    is_fence_close_line, is_footnote_def_block, item_body, normalize_label,
-    parse_alignments, push_code_fence_open, push_table_cell, push_table_cell_open, render_block,
+    is_fence_close_line, is_footnote_def_block, item_body, item_directly_loose,
+    normalize_label, parse_alignments, push_code_fence_open, push_table_cell,
+    push_table_cell_open, render_block,
     render_footnote_section, render_item_body, resolve_footnote_ids, split_table_cells,
     trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
 };
@@ -740,9 +741,33 @@ struct ListCache {
     open_item_start: usize,
     /// `true` when the last classified complete line was blank. A following
     /// sibling marker then makes the list loose (§5.3, "blank between siblings");
-    /// a following non-sibling line is an interior blank (the item is directly
-    /// loose) — the cache bails there and the full reparse owns the accounting.
+    /// a following nested line is an INTERIOR blank — the item stays in the
+    /// cache (see `item_blank`), and §5.3 "directly loose" is settled by the
+    /// precise inter-block gap test before the append renders.
     prev_blank: bool,
+    /// `true` once the OPEN item has an interior blank line followed by more
+    /// in-item content. While the list is still tight this triggers the §5.3
+    /// "directly contains two blocks separated by a blank" test each append
+    /// (via the nested stream's block gaps, or `item_directly_loose` on the
+    /// span) — a confirmed gap flips the whole list loose via `rebuild_loose`,
+    /// exactly when the full path's per-append recompute would. Reset per item.
+    item_blank: bool,
+    /// `true` while the OPEN item is still EMPTY (its marker line had no
+    /// content). Mirrors `scan_list`'s `cur_empty`: an empty item cannot gain
+    /// content across a blank line (§5.2) — the list ENDS there, so the cache
+    /// bails to the full reparse for that shape.
+    item_empty: bool,
+    /// Incremental renderer for the OPEN item's multi-line body (see
+    /// [`OpenItemStream`]). Armed lazily once the body exceeds
+    /// [`OPEN_ITEM_STREAM_MIN`]; `None` for short items (the per-append
+    /// `fold_item_body` is cheap there). Reset whenever a sibling closes the
+    /// item.
+    open_stream: Option<Box<OpenItemStream>>,
+    /// `true` when the open item's body cannot stream through a nested parser
+    /// (a lazy continuation line needs `item_body`'s space-glue, or the arm
+    /// failed) — the per-append fold owns the item until it closes. Reset per
+    /// item.
+    stream_disabled: bool,
     /// `true` once any two siblings are separated by a blank line (§5.3).
     /// Sticky — never flips back; new items render with the loose `<p>` wrap.
     loose: bool,
@@ -769,17 +794,111 @@ struct ListCache {
     fn_occ_base: HashMap<String, usize>,
 }
 
+/// Body-size threshold (bytes) past which the OPEN list item's multi-line body
+/// streams through a nested parser ([`OpenItemStream`]). Below it the per-append
+/// `fold_item_body` re-render is cheap; arming per tiny item would just churn
+/// allocations (a flat list opens a new item every line).
+const OPEN_ITEM_STREAM_MIN: usize = 1024;
+
+/// Incremental renderer for the OPEN (last) list item's multi-line body — the
+/// missing recursion level of the [`ListCache`]: closed items fold once, but the
+/// open item (a growing table / fence / sub-list / plain multi-line paragraph)
+/// was re-rendered whole by `fold_item_body` on EVERY append, i.e. O(item body)
+/// per append = O(n²/chunk) for a single ever-growing item.
+///
+/// The [`ContainerBlockCache`] pattern one level down: the item's body is
+/// de-indented incrementally — byte-identical to [`item_body`]'s output (the
+/// marker line's content byte, then `strip_cols(line, content_indent)` per
+/// deeper/blank line) — and fed to a recursive nested [`StreamParser`]. The
+/// `<li>` inner is assembled from the nested blocks exactly as
+/// `render_item_body` would render them:
+///   - loose item, or a non-paragraph block: the nested block's `.html`
+///     verbatim (same `render_block` engine, `force_open_tail` matching the
+///     open list's whole-list `open_tail`),
+///   - tight paragraph: `render_inline(trim_trailing_newlines(slice))` from the
+///     nested SOURCE (never the `<p>`-wrapped html — its trailing-whitespace
+///     trim differs). The trailing (growing) paragraph keeps a settled-prefix
+///     cut (`render_inline_boundary`, the `ParagraphCache` pattern) so plain
+///     prose bodies are O(new bytes); settled interior paragraphs render once
+///     (memoized).
+///
+/// Byte-parity guards:
+///   - trailing whitespace (blank lines / a content line's final spaces) is
+///     HELD BACK from the feed — `render_item_body` truncates it before
+///     scanning, so the nested buffer must end at the last non-whitespace byte,
+///   - a lazy continuation line (shallow, non-blank) needs `item_body`'s
+///     space-glue, which can't be re-fed — the stream is dropped for this item
+///     (`stream_disabled`) and the per-append fold takes over (today's cost),
+///   - the checkbox prefix `[x] ` is stripped from the feed and re-emitted by
+///     the assembly (mirroring `render_item_body`),
+///   - CRLF / `[^` (footnotes on) / `]:` already bail the whole list cache
+///     before any line is fed,
+///   - the item's CLOSE (a sibling marker) still folds the full span through
+///     `fold_item_body` — the committed prefix bytes are produced by the same
+///     code as before, the stream only serves the speculative open view.
+///
+/// The nested blocks also drive the §5.3 "directly loose" test: a blank line
+/// sitting in a gap BETWEEN two nested top-level blocks makes the item (and so
+/// the list) loose; a blank inside one block (a fence body) does not. Gaps
+/// between committed nested blocks are frozen — checked once.
+struct OpenItemStream {
+    /// The recursive parser rendering the item's de-indented body.
+    inner: Box<StreamParser>,
+    /// Absolute outer-buffer offset of the item's marker line (identity: the
+    /// stream belongs to exactly one open item).
+    item_start: usize,
+    /// The item's `content_indent` — the `strip_cols` width for body lines.
+    ci: usize,
+    /// GFM task-list state parsed from the body's first 4 bytes (stripped from
+    /// the feed; the assembly re-emits the checkbox).
+    task: Option<bool>,
+    /// Absolute outer offset consumed so far (fed or held).
+    fed_outer: usize,
+    /// De-indented trailing whitespace not yet fed (see the hold-back rule).
+    held_ws: String,
+    /// True when mid source line: the line's leading indent was consumed and
+    /// some content fed; continuation bytes feed raw.
+    mid_line: bool,
+    /// Settled-prefix cut state for the trailing tight paragraph: inner-buffer
+    /// offsets + the rendered settled prefix (`ParagraphCache` pattern, minus
+    /// the `<p>` wrapper and its output trim).
+    para_start: usize,
+    para_cut: usize,
+    para_settled: String,
+    /// Once-rendered interior tight paragraphs, keyed by their (frozen)
+    /// inner-buffer span.
+    tight_memo: HashMap<(usize, usize), String>,
+    /// Consecutive committed nested-block pairs whose gap was already checked
+    /// for a §5.3 blank (frozen — never re-checked).
+    gap_pairs_done: usize,
+    /// Sticky half of the `open_tail`-sensitivity test (see
+    /// [`open_item_ot_sensitive`]): a COMMITTED nested block whose html the
+    /// assembly serves frozen carries a byte that can open an
+    /// `open_tail`-speculative inline construct. Once true, settled
+    /// (buffer-ends-blank) appends fall back to the one-shot fold — the frozen
+    /// renders are open-tail variants only.
+    sens_committed: bool,
+    /// Committed nested blocks already trigger-scanned (frozen kind + span —
+    /// scanned once, amortized O(n)).
+    sens_scanned: usize,
+}
+
 /// Incremental render state for a single open *indented-code* block at the tail —
-/// the streaming shape where every line is ≥4-column-indented content with no
-/// interior blank line. Streaming such a block is otherwise O(n²): every append
-/// re-strips and re-escapes the whole growing body (`render_indented_code`).
+/// the streaming shape where every line is ≥4-column-indented content. Streaming
+/// such a block is otherwise O(n²): every append re-strips and re-escapes the
+/// whole growing body (`render_indented_code`).
 /// With this cache an append only strips+escapes the newly-arrived complete
 /// lines and re-renders the (short) trailing partial line.
 ///
+/// Interior blank lines fold like content lines (strip ≤4 columns, keep the
+/// remainder — exactly `render_indented_code`'s per-line strip): a blank between
+/// two chunks is part of the block (§4.4), while blanks at the tail are trimmed
+/// by the assembly's trailing-whitespace trim, matching the full path whose
+/// block range stops at the last content line.
+///
 /// The cache bails (full path takes over) the instant the simple pattern breaks:
-///   - a newly-complete line that dedents (indent < 4) — it ends the block,
-///   - a blank line — the full path owns interior-blank accounting (the block
-///     range stops at the last content line, blanks may or may not be absorbed),
+///   - a newly-complete NON-BLANK line that dedents (indent < 4) — it ends the
+///     block,
 ///   - a `\r` byte (CRLF) in any processed line.
 /// The mirror of `render_indented_code`: each line strips up to 4 columns of
 /// leading indent (one tab counts as enough and is consumed whole), the body is
@@ -1839,10 +1958,11 @@ impl StreamParser {
     }
 
     /// O(new bytes) extension of a long open indented-code block at the tail.
-    /// Folds each newly-complete ≥4-indent line into the cached body and
-    /// re-renders only the trailing partial. Returns `None` (dropping the cache)
-    /// the moment the block ends or is no longer the sole open tail — a dedent,
-    /// a blank line, or a `\r` — and the full reparse takes over.
+    /// Folds each newly-complete ≥4-indent line (or interior blank line) into
+    /// the cached body and re-renders only the trailing partial. Returns `None`
+    /// (dropping the cache) the moment the block ends or is no longer the sole
+    /// open tail — a dedented content line, or a `\r` — and the full reparse
+    /// takes over.
     fn try_incremental_indented(&mut self) -> Option<Patch> {
         let mut cache = self.indented_cache.take()?;
         // The block must still be the tail: only whitespace may sit between the
@@ -1864,17 +1984,19 @@ impl StreamParser {
                 Some(r) => {
                     let content_end = pos + r;
                     let next = pos + r + 1;
-                    // A dedent / blank / CRLF line: defer to the full renderer,
-                    // which owns interior-blank accounting and the exact block end.
-                    if bytes[pos..content_end].contains(&b'\r')
-                        || !indented_code_line(&bytes[pos..content_end])
-                    {
+                    let line = &bytes[pos..content_end];
+                    // A dedented CONTENT line ends the block; a CRLF line routes
+                    // through the full renderer. A blank (whitespace-only) line
+                    // folds like content — interior blanks are part of the block
+                    // (§4.4) and trailing ones vanish in the assembly trim below.
+                    let blank = line.iter().all(|&b| matches!(b, b' ' | b'\t'));
+                    if line.contains(&b'\r') || (!blank && !indented_code_line(line)) {
                         return None;
                     }
                     if !cache.escaped_lines.is_empty() {
                         cache.escaped_lines.push('\n');
                     }
-                    push_indented_content(&bytes[pos..content_end], &mut cache.escaped_lines);
+                    push_indented_content(line, &mut cache.escaped_lines);
                     cache.lines_upto = next;
                     pos = next;
                 }
@@ -2846,6 +2968,36 @@ impl StreamParser {
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
 
+    /// A recursive nested parser configured to reproduce THIS parser's rendering
+    /// of stripped inner content (a container's `>`-stripped body, an open list
+    /// item's de-indented body): SAME feature flags as the outer EXCEPT
+    /// gfm_footnotes (document-global numbering — kept off; a `[^` inner marker
+    /// bails the caller). The committed link-ref table is DEEP-cloned (not
+    /// Rc-shared) so the nested parser's own `Rc::make_mut` commit-fold keeps
+    /// strong_count == 1; it's frozen anyway while the open outer block stalls
+    /// `committed_offset`. `force_open_tail` matches the full path, which
+    /// propagates the open outer block's `open_tail` to ALL inner sub-blocks.
+    fn make_nested_parser(&self) -> Box<StreamParser> {
+        let mut inner = Box::new(StreamParser::new());
+        inner.unsafe_html = self.unsafe_html;
+        inner.gfm_autolinks = self.gfm_autolinks;
+        inner.gfm_alerts = self.gfm_alerts;
+        inner.gfm_footnotes = false;
+        inner.gfm_math = self.gfm_math;
+        inner.dir_auto = self.dir_auto;
+        inner.a11y = self.a11y;
+        inner.block_data = false;
+        inner.component_tags = self.component_tags.clone();
+        inner.inline_component_tags = self.inline_component_tags.clone();
+        inner.html_sanitize = self.html_sanitize;
+        inner.html_allowlist = self.html_allowlist.clone();
+        inner.html_drop = self.html_drop.clone();
+        inner.committed_refs = Rc::new((*self.committed_refs).clone());
+        inner.force_open_tail = true;
+        inner.container_depth = self.container_depth + 1;
+        inner
+    }
+
     /// Arm the structured-container cache for an open blockquote / alert at
     /// `start`. Returns `None` (no cache → full reparse) when the nested parser
     /// could not reproduce the inner byte-for-byte: an incomplete first line (the
@@ -2912,28 +3064,7 @@ impl StreamParser {
             _ => return None,
         };
 
-        // Recursive nested parser: SAME feature flags as the outer EXCEPT
-        // gfm_footnotes (document-global numbering — kept off; a `[^` inner marker
-        // bails). committed link-ref table is DEEP-cloned (not Rc-shared) so the
-        // nested parser's own `Rc::make_mut` commit-fold keeps strong_count == 1;
-        // it's frozen anyway while the open container stalls `committed_offset`.
-        let mut inner = Box::new(StreamParser::new());
-        inner.unsafe_html = self.unsafe_html;
-        inner.gfm_autolinks = self.gfm_autolinks;
-        inner.gfm_alerts = self.gfm_alerts;
-        inner.gfm_footnotes = false;
-        inner.gfm_math = self.gfm_math;
-        inner.dir_auto = self.dir_auto;
-        inner.a11y = self.a11y;
-        inner.block_data = false;
-        inner.component_tags = self.component_tags.clone();
-        inner.inline_component_tags = self.inline_component_tags.clone();
-        inner.html_sanitize = self.html_sanitize;
-        inner.html_allowlist = self.html_allowlist.clone();
-        inner.html_drop = self.html_drop.clone();
-        inner.committed_refs = Rc::new((*self.committed_refs).clone());
-        inner.force_open_tail = true;
-        inner.container_depth = self.container_depth + 1;
+        let mut inner = self.make_nested_parser();
 
         let mut mid_line = false;
         let mut last_fed = None;
@@ -2988,12 +3119,30 @@ impl StreamParser {
 
         // `open_tail` mirrors the full path's per-block gate for the (final,
         // abuts-EOF) open list: force it on inside a nested container-block
-        // parser; otherwise speculate the open tail unless a trailing blank line
-        // has settled the list. A wrong value would mis-render an incomplete
+        // parser; otherwise speculate the open tail unless the buffer's LAST
+        // LINE is whitespace-only — a trailing blank line (complete, spaces/tabs
+        // included) settles the list, and a whitespace-only dangling partial
+        // means the list's raw range stops at the previous line and no longer
+        // abuts EOF (`raw.range.end == buffer.len()` fails), which the full path
+        // also renders settled. A wrong value would mis-render an incomplete
         // `[x](` / `` `code `` / `$math` at the very end of the open item.
-        let buffer_ends_blank =
-            self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n");
-        let open_tail = self.force_open_tail || !buffer_ends_blank;
+        let open_tail = self.force_open_tail || {
+            let last_line_start =
+                bytes[..end].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+            // The dangling partial when there is one, else the last complete
+            // line (its `\n` included; the cache always holds the marker line,
+            // so the probe is never empty).
+            let probe = if last_line_start < end {
+                &bytes[last_line_start..end]
+            } else {
+                let prev = bytes[..last_line_start.saturating_sub(1)]
+                    .iter()
+                    .rposition(|&b| b == b'\n')
+                    .map_or(0, |p| p + 1);
+                &bytes[prev..last_line_start]
+            };
+            probe.iter().any(|&b| !matches!(b, b' ' | b'\t' | b'\n'))
+        };
         let footnotes = self.gfm_footnotes;
         let block_data = self.block_data;
 
@@ -3046,18 +3195,36 @@ impl StreamParser {
             let ind = indent_cols(line);
             if ind >= cache.cur_ci {
                 // Nested content of the open item — `scan` keeps it; `item_body` +
-                // `render_item_body` render it recursively. A preceding blank is an
-                // interior blank (the item is directly loose) → bail.
+                // `render_item_body` render it recursively. A preceding blank is
+                // an INTERIOR blank: an EMPTY item cannot gain content across a
+                // blank (§5.2, `scan_list`'s `cur_empty` — the list ends there,
+                // bail); otherwise the item may now be "directly loose" (§5.3) —
+                // mark it for the precise inter-block gap test that runs before
+                // this append renders.
                 if cache.prev_blank {
-                    return None;
+                    if cache.item_empty {
+                        return None;
+                    }
+                    cache.item_blank = true;
+                    cache.prev_blank = false;
                 }
+                cache.item_empty = false;
             } else if let Some(m) = scan_marker(line) {
                 if ind <= c_edge + 3 && same_family(&m) {
                     // SIBLING: the current open item [open_item_start..pos] is now
-                    // complete. A blank between them makes the whole list loose —
-                    // rebuild the already-closed items once, then fold this one.
+                    // complete. A blank between siblings — or a §5.3 "directly
+                    // loose" interior gap in the item that just closed — makes the
+                    // whole list loose: rebuild the already-closed items once,
+                    // then fold this one.
                     if pos > cache.open_item_start {
-                        if cache.prev_blank && !cache.loose {
+                        if !cache.loose
+                            && (cache.prev_blank
+                                || (cache.item_blank
+                                    && item_directly_loose(
+                                        &bytes[cache.open_item_start..pos],
+                                        opts.scan_ctx(),
+                                    )))
+                        {
                             rebuild_loose(&mut cache, bytes, &opts)?;
                         }
                         let s = cache.open_item_start;
@@ -3071,9 +3238,14 @@ impl StreamParser {
                         )?;
                         cache.items.push((s, pos));
                         cache.open_item_start = pos;
+                        cache.item_blank = false;
+                        cache.open_stream = None;
+                        cache.stream_disabled = false;
                     }
                     // else: the first item's own marker line — nothing to close.
                     cache.cur_ci = m.content_indent;
+                    cache.item_empty =
+                        line.get(m.content_byte).map_or(true, |&b| matches!(b, b'\n' | b'\r'));
                     cache.prev_blank = false;
                 } else {
                     // A different-family marker (a NEW list `scan` splits) or one
@@ -3090,9 +3262,11 @@ impl StreamParser {
                 // A shallow plain-text line after a blank is a NEW paragraph
                 // outside the list (a blank breaks lazy continuation) — bail.
                 return None;
+            } else {
+                // A shallow plain-text lazy continuation of the open item's
+                // paragraph (no preceding blank) — absorbed into its body.
+                cache.item_empty = false;
             }
-            // else: a shallow plain-text lazy continuation of the open item's
-            // paragraph (no preceding blank) — absorbed into its body.
             cache.lines_upto = next;
             pos = next;
         }
@@ -3111,9 +3285,16 @@ impl StreamParser {
         if partial_nonblank {
             let p_ind = indent_cols(partial);
             if p_ind >= cache.cur_ci {
-                // Nested partial → part of the open item's body (interior blank → bail).
+                // Nested partial → part of the open item's body. After a blank:
+                // an empty item can't resume (§5.2 — bail); otherwise mark the
+                // interior blank for the §5.3 gap test. `prev_blank`/`item_empty`
+                // stay untouched — the walk re-classifies this line when it
+                // completes.
                 if cache.prev_blank {
-                    return None;
+                    if cache.item_empty {
+                        return None;
+                    }
+                    cache.item_blank = true;
                 }
             } else if let Some(m) = scan_marker(partial) {
                 if p_ind <= c_edge + 3 && same_family(&m) {
@@ -3133,11 +3314,23 @@ impl StreamParser {
         let mut partial_item: Vec<ListItemData> = Vec::new();
         if partial_is_sibling {
             // The open item [open_item_start..lines_upto] is complete; the partial
-            // starts a new sibling. A preceding blank settles the list loose
-            // (matching `scan`, which already classifies the partial as a bullet).
-            if cache.prev_blank && !cache.loose {
+            // starts a new sibling. A preceding blank — or a §5.3 interior gap in
+            // the item being closed — settles the list loose (matching `scan`,
+            // which already classifies the partial as a bullet).
+            if !cache.loose
+                && (cache.prev_blank
+                    || (cache.item_blank
+                        && item_directly_loose(
+                            &bytes[cache.open_item_start..cache.lines_upto],
+                            opts.scan_ctx(),
+                        )))
+            {
                 rebuild_loose(&mut cache, bytes, &opts)?;
             }
+            // Feature-gated work accounting: this speculative re-render bypasses
+            // the slow-path scan counter, so count it for the scaling gate.
+            #[cfg(feature = "perf_counters")]
+            crate::perf::add_scan(end - cache.open_item_start);
             let mut partial_occ = cache.fn_occ.clone();
             fold_item_body(
                 &bytes[cache.open_item_start..cache.lines_upto],
@@ -3157,17 +3350,60 @@ impl StreamParser {
             )?;
         } else {
             // The partial (continuation, nested marker, trailing blanks, or
-            // nothing) belongs to the open item; render the whole open region from
-            // a CLONE of the frozen-prefix occurrence map (does NOT advance it).
-            let mut partial_occ = cache.fn_occ.clone();
-            fold_item_body(
-                &bytes[cache.open_item_start..end],
-                cache.loose,
-                &opts,
-                &mut partial_html,
-                Some(&mut partial_item),
-                &mut partial_occ,
-            )?;
+            // nothing) belongs to the open item. Keep the item's nested stream
+            // fed (armed once the body outgrows the fold), settle the item's own
+            // §5.3 looseness, then render the open region — via the stream in
+            // O(new bytes) when armed, else the one-shot fold.
+            self.update_open_item_stream(&mut cache, end);
+            if !cache.loose && cache.item_blank {
+                let directly = match cache.open_stream.as_mut() {
+                    Some(st) => open_item_gap_blank(st),
+                    None => item_directly_loose(
+                        &bytes[cache.open_item_start..end],
+                        opts.scan_ctx(),
+                    ),
+                };
+                if directly {
+                    rebuild_loose(&mut cache, bytes, &opts)?;
+                }
+            }
+            // The stream serves the speculative open-tail view (its committed
+            // inner renders froze with `force_open_tail`) — and the settled
+            // (`open_tail == false`, trailing blank) view too while the body is
+            // not `open_tail`-sensitive: with no construct that could
+            // speculate, both variants render byte-identically. Otherwise a
+            // settled append folds with the settled opts — same as before.
+            let can_stream = open_tail
+                || cache
+                    .open_stream
+                    .as_mut()
+                    .is_some_and(|st| !open_item_ot_sensitive(st, cache.loose));
+            let assembled = can_stream
+                && match cache.open_stream.as_mut() {
+                    Some(st) => {
+                        assemble_open_item(st, cache.loose, &opts, &mut partial_html);
+                        true
+                    }
+                    None => false,
+                };
+            if !assembled {
+                // Speculative one-shot fold of the whole open region — O(open
+                // item) for this append. Feature-gated work accounting so the
+                // scaling gate can see this class of re-render work (it bypasses
+                // the slow-path scan counter — the wall-only half of the
+                // open-item cliff).
+                #[cfg(feature = "perf_counters")]
+                crate::perf::add_scan(end - cache.open_item_start);
+                let mut partial_occ = cache.fn_occ.clone();
+                fold_item_body(
+                    &bytes[cache.open_item_start..end],
+                    cache.loose,
+                    &opts,
+                    &mut partial_html,
+                    Some(&mut partial_item),
+                    &mut partial_occ,
+                )?;
+            }
         }
 
         let close = if cache.ordered { "</ol>" } else { "</ul>" };
@@ -3208,6 +3444,95 @@ impl StreamParser {
         self.active_blocks = vec![block.clone()];
         self.list_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// Keep the [`OpenItemStream`] in sync with the cache's OPEN item: drop a
+    /// stream that belongs to a closed item, arm one lazily when the body has
+    /// outgrown the per-append fold, and feed the newly-arrived body delta.
+    /// Any condition the stream can't reproduce byte-for-byte (lazy line, arm
+    /// failure) disables it for the rest of this item — the fold owns it then.
+    fn update_open_item_stream(&self, cache: &mut ListCache, end: usize) {
+        // The nested `ListItemData`/`items` channel isn't fed by the stream —
+        // let the fold own block_data lists (correct, just not O(new bytes)).
+        if cache.stream_disabled || self.block_data {
+            return;
+        }
+        if let Some(st) = &cache.open_stream {
+            if st.item_start != cache.open_item_start {
+                cache.open_stream = None;
+            }
+        }
+        if let Some(st) = cache.open_stream.as_mut() {
+            if feed_open_item(st, self.buffer.as_bytes(), end).is_none() {
+                cache.open_stream = None;
+                cache.stream_disabled = true;
+            }
+            return;
+        }
+        if end - cache.open_item_start < OPEN_ITEM_STREAM_MIN {
+            return;
+        }
+        if self.container_depth >= MAX_CONTAINER_DEPTH {
+            cache.stream_disabled = true;
+            return;
+        }
+        match self.arm_open_item_stream(cache, end) {
+            Some(st) => cache.open_stream = Some(st),
+            None => cache.stream_disabled = true,
+        }
+    }
+
+    /// Build the open item's nested stream and feed the body already present.
+    /// `None` ⇒ the item can't stream (incomplete first line, lazy body line …)
+    /// — the caller disables the stream for this item.
+    fn arm_open_item_stream(
+        &self,
+        cache: &ListCache,
+        end: usize,
+    ) -> Option<Box<OpenItemStream>> {
+        let bytes = self.buffer.as_bytes();
+        let start = cache.open_item_start;
+        // A complete first line settles the marker + content byte.
+        let nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
+        let first_line_end = start + nl + 1;
+        let m = scan_marker(&bytes[start..first_line_end])?;
+        if m.content_indent != cache.cur_ci {
+            return None;
+        }
+        // GFM task-list prefix on the body's first 4 bytes — `render_item_body`
+        // strips it before scanning, so the feed skips it and the assembly
+        // re-emits the checkbox. (Any `\n` inside the window disqualifies it,
+        // so the complete first line always decides.)
+        let content = &bytes[start + m.content_byte..first_line_end];
+        let mut task = None;
+        if content.len() >= 4 && content[0] == b'[' && content[2] == b']' && content[3] == b' ' {
+            match content[1] {
+                b' ' => task = Some(false),
+                b'x' | b'X' => task = Some(true),
+                _ => {}
+            }
+        }
+        let mut st = Box::new(OpenItemStream {
+            inner: self.make_nested_parser(),
+            item_start: start,
+            ci: cache.cur_ci,
+            task,
+            // The marker line's remainder feeds as a MID-LINE continuation (its
+            // "indent" is the marker itself — already consumed), exactly
+            // `item_body`'s first-line handling.
+            fed_outer: start + m.content_byte + if task.is_some() { 4 } else { 0 },
+            held_ws: String::new(),
+            mid_line: true,
+            para_start: usize::MAX,
+            para_cut: 0,
+            para_settled: String::new(),
+            tight_memo: HashMap::new(),
+            gap_pairs_done: 0,
+            sens_committed: false,
+            sens_scanned: 0,
+        });
+        feed_open_item(&mut st, bytes, end)?;
+        Some(st)
     }
 }
 
@@ -3837,6 +4162,10 @@ fn build_list_cache(
         lines_upto: start,
         open_item_start: start,
         prev_blank: false,
+        item_blank: false,
+        item_empty: false,
+        open_stream: None,
+        stream_disabled: false,
         loose: false,
         items: Vec::new(),
         item_html: Vec::new(),
@@ -3880,6 +4209,293 @@ fn fold_item_body(
     }
     out.push('\n');
     Some(())
+}
+
+/// Feed the open item's newly-arrived body bytes `[st.fed_outer..end)` to the
+/// nested parser, de-indented exactly like [`item_body`]: every deeper / blank
+/// line is `strip_cols(line, ci)` (spaces and boundary-crossing tabs included),
+/// a mid-line continuation feeds raw. Trailing whitespace is HELD BACK (see
+/// [`OpenItemStream`]): the de-indented text is split at its last
+/// non-whitespace byte; the whitespace suffix waits in `held_ws` until content
+/// proves it interior. An undecided leading indent at EOF (fewer than `ci`
+/// whitespace columns and no content byte yet) simply waits.
+///
+/// Returns `None` on a shallow non-blank line — `item_body`'s lazy space-glue,
+/// which an append-only feed can't reproduce — the caller then disables the
+/// stream for this item.
+fn feed_open_item(st: &mut OpenItemStream, bytes: &[u8], end: usize) -> Option<()> {
+    let mut pos = st.fed_outer;
+    // Only the bytes newly arrived THIS call; the already-held whitespace run
+    // stays in `held_ws` (it moves — once — when content proves it interior,
+    // so a long blank run isn't re-copied per append).
+    let mut pending = String::new();
+    while pos < end {
+        if st.mid_line {
+            match bytes[pos..end].iter().position(|&b| b == b'\n') {
+                Some(r) => {
+                    pending.push_str(std::str::from_utf8(&bytes[pos..pos + r + 1]).ok()?);
+                    pos += r + 1;
+                    st.mid_line = false;
+                }
+                None => {
+                    pending.push_str(std::str::from_utf8(&bytes[pos..end]).ok()?);
+                    pos = end;
+                }
+            }
+            continue;
+        }
+        // At a source line start: replicate `strip_cols(line, ci)` — consume up
+        // to `ci` columns; a tab crossing the boundary re-emits its overflow.
+        let mut i = pos;
+        let mut col = 0usize;
+        let mut overflow = 0usize;
+        while i < end && col < st.ci {
+            match bytes[i] {
+                b' ' => {
+                    col += 1;
+                    i += 1;
+                }
+                b'\t' => {
+                    let w = 4 - (col % 4);
+                    i += 1;
+                    if col + w <= st.ci {
+                        col += w;
+                    } else {
+                        overflow = (col + w) - st.ci;
+                        col = st.ci;
+                    }
+                }
+                _ => break,
+            }
+        }
+        if i >= end && col < st.ci {
+            break; // undecided leading whitespace at EOF — wait for more bytes
+        }
+        if col < st.ci && bytes[i] != b'\n' {
+            // Shallow non-blank line: `item_body` glues it with a space (lazy
+            // continuation) — not reproducible append-only. Disable the stream.
+            return None;
+        }
+        for _ in 0..overflow {
+            pending.push(' ');
+        }
+        match bytes[i..end].iter().position(|&b| b == b'\n') {
+            Some(r) => {
+                pending.push_str(std::str::from_utf8(&bytes[i..i + r + 1]).ok()?);
+                pos = i + r + 1;
+            }
+            None => {
+                pending.push_str(std::str::from_utf8(&bytes[i..end]).ok()?);
+                pos = end;
+                st.mid_line = true;
+            }
+        }
+    }
+    st.fed_outer = pos;
+    // Hold back the trailing whitespace run; feed everything before it (the
+    // previously-held run first — its content byte just arrived).
+    match pending.rfind(|c: char| !matches!(c, ' ' | '\t' | '\n' | '\r')) {
+        Some(k) => {
+            let split = k + pending[k..].chars().next().map_or(1, char::len_utf8);
+            let tail = pending.split_off(split);
+            if !st.held_ws.is_empty() {
+                st.inner.append(&st.held_ws);
+                st.held_ws.clear();
+            }
+            st.inner.append(&pending);
+            st.held_ws = tail;
+        }
+        None => st.held_ws.push_str(&pending),
+    }
+    Some(())
+}
+
+/// Can this open item's render differ between the two `open_tail` variants?
+/// Every `opts.open_tail` branch in inline.rs needs a trigger byte to fire
+/// (`` ` `` code span, `$` math, `\(`/`\[` math, `[` link), and only blocks the
+/// assembly serves from a FROZEN open-variant render matter — pieces re-rendered
+/// from source with the append's own opts (tight paragraphs, the settled-prefix
+/// cut) are variant-correct by construction. So the item is sensitive iff a
+/// trigger byte sits in an inline-BEARING block that is `.html`/memo-served:
+///   - CodeBlock / MathBlock / Mermaid never inline-render; with a COMPLETE
+///     opener line (a `\n` inside the span) their kind is frozen, so their
+///     bytes (fence openers with backticks, code bodies) are exempt — a
+///     partial single-line span could still reclassify to a paragraph, so it
+///     stays scanned (conservative),
+///   - the tight active paragraphs are source-rendered fresh — exempt,
+///   - everything else is scanned: committed blocks once (sticky watermark),
+///     active blocks per settled append (bounded by the non-code active tail).
+/// `false` ⇒ both variants render byte-identically and the stream can serve a
+/// settled (buffer-ends-blank) append too.
+fn open_item_ot_sensitive(st: &mut OpenItemStream, loose: bool) -> bool {
+    if st.sens_committed {
+        return true;
+    }
+    let has_trigger =
+        |s: &[u8]| s.iter().any(|&b| matches!(b, b'`' | b'$' | b'[' | b'\\'));
+    let inline_free = |b: &Block, buf: &[u8]| {
+        matches!(
+            b.kind,
+            BlockKind::CodeBlock { .. } | BlockKind::MathBlock(_) | BlockKind::Mermaid
+        ) && buf[b.start..b.end].contains(&b'\n')
+    };
+    let buf = st.inner.buffer().as_bytes();
+    let committed = st.inner.committed_blocks.len();
+    let blocks: Vec<&Block> = st.inner.all_blocks().collect();
+    while st.sens_scanned < committed {
+        let b = blocks[st.sens_scanned];
+        if !inline_free(b, buf) && has_trigger(&buf[b.start..b.end]) {
+            st.sens_committed = true;
+            return true;
+        }
+        st.sens_scanned += 1;
+    }
+    for b in blocks.iter().skip(committed) {
+        if (!loose && matches!(b.kind, BlockKind::Paragraph)) || inline_free(b, buf) {
+            continue;
+        }
+        if has_trigger(&buf[b.start..b.end]) {
+            return true;
+        }
+    }
+    false
+}
+
+/// §5.3 "directly loose" test for the streamed open item: does a blank line sit
+/// in a gap BETWEEN two of the nested body's top-level blocks? Mirrors
+/// [`item_directly_loose`] exactly (a blank inside one block — a fence body, a
+/// sub-list's own interior — is invisible to the top-level gap walk), but reads
+/// the nested parser's live block list instead of re-scanning the whole body.
+/// Gaps between COMMITTED nested blocks are frozen — checked once
+/// (`gap_pairs_done`); gaps touching the active tail re-check each append
+/// (cheap: at most a couple of blocks, and a gap is only ever a short blank
+/// run). Once this returns `true` the caller flips the list loose (sticky), so
+/// the walk stops running entirely.
+fn open_item_gap_blank(st: &mut OpenItemStream) -> bool {
+    let buf = st.inner.buffer().as_bytes();
+    let committed = st.inner.committed_blocks.len();
+    let spans: Vec<(usize, usize)> = st.inner.all_blocks().map(|b| (b.start, b.end)).collect();
+    let mut i = st.gap_pairs_done;
+    while i + 1 < spans.len() {
+        let (gap_start, gap_end) = (spans[i].1, spans[i + 1].0);
+        let mut p = gap_start;
+        while p < gap_end {
+            if is_blank_line(buf, p) {
+                return true;
+            }
+            p = line_end(buf, p);
+        }
+        if i + 1 < committed {
+            st.gap_pairs_done = i + 1;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Assemble the OPEN item's `<li>…</li>\n` from its nested stream — mirroring
+/// [`render_item_body`] branch by branch so the bytes match `fold_item_body`
+/// over the same span (the mid-stream parity contract):
+///   - `<li dir?>` wrapper, optional `<label>` (a11y + task + tight single
+///     paragraph) and task checkbox,
+///   - empty body ⇒ nothing,
+///   - tight single paragraph ⇒ its inline render, no `<p>` (settled-prefix cut
+///     for the growing tail),
+///   - otherwise `\n` before every sub-block; tight paragraphs render inline
+///     from SOURCE (memoized once committed; the trailing one via the cut),
+///     everything else is the nested block's `render_block` html verbatim.
+fn assemble_open_item(
+    st: &mut OpenItemStream,
+    loose: bool,
+    opts: &RenderOpts,
+    out: &mut String,
+) {
+    let OpenItemStream {
+        inner,
+        task,
+        para_start,
+        para_cut,
+        para_settled,
+        tight_memo,
+        ..
+    } = st;
+    let inner: &StreamParser = inner;
+    let buf = inner.buffer();
+    let committed = inner.committed_blocks.len();
+    let blocks: Vec<&Block> = inner.all_blocks().collect();
+
+    // The trailing (growing) tight paragraph: rendered via a settled-prefix cut
+    // (`render_inline_boundary`), so a plain prose body is O(new bytes).
+    let mut push_tail_para = |b: &Block, out: &mut String| {
+        if *para_start != b.start {
+            *para_start = b.start;
+            *para_cut = b.start;
+            para_settled.clear();
+        }
+        let content_end = buf.len(); // feed holds trailing whitespace back
+        let mut active = String::new();
+        let boundary =
+            render_inline_boundary(&buf[*para_cut..content_end], opts, &mut active);
+        if boundary > 0 {
+            render_inline(&buf[*para_cut..*para_cut + boundary], opts, para_settled);
+            *para_cut += boundary;
+            active.clear();
+            render_inline(&buf[*para_cut..content_end], opts, &mut active);
+        }
+        out.push_str(para_settled);
+        out.push_str(&active);
+    };
+
+    out.push_str("<li");
+    out.push_str(opts.dir());
+    out.push('>');
+    let single_tight_para =
+        !loose && blocks.len() == 1 && matches!(blocks[0].kind, BlockKind::Paragraph);
+    let wrap_label = opts.a11y && task.is_some() && single_tight_para;
+    if wrap_label {
+        out.push_str("<label>");
+    }
+    if let Some(checked) = *task {
+        out.push_str(if checked {
+            "<input type=\"checkbox\" checked disabled> "
+        } else {
+            "<input type=\"checkbox\" disabled> "
+        });
+    }
+    if blocks.is_empty() {
+        // Empty item.
+    } else if single_tight_para {
+        push_tail_para(blocks[0], out);
+    } else {
+        let last = blocks.len() - 1;
+        for (bi, b) in blocks.iter().enumerate() {
+            out.push('\n');
+            if !loose && matches!(b.kind, BlockKind::Paragraph) {
+                if bi == last {
+                    push_tail_para(b, out);
+                } else if bi < committed {
+                    // Settled interior paragraph — rendered once.
+                    let html = tight_memo.entry((b.start, b.end)).or_insert_with(|| {
+                        let mut s = String::new();
+                        render_inline(trim_trailing_newlines(&buf[b.start..b.end]), opts, &mut s);
+                        s
+                    });
+                    out.push_str(html);
+                } else {
+                    // A held-back (still-active, non-last) paragraph — transient
+                    // and line-bounded; re-render fresh.
+                    render_inline(trim_trailing_newlines(&buf[b.start..b.end]), opts, out);
+                }
+            } else {
+                out.push_str(&b.html);
+            }
+        }
+    }
+    if wrap_label {
+        out.push_str("</label>");
+    }
+    out.push_str("</li>");
+    out.push('\n');
 }
 
 /// Arm the paragraph cache for the open paragraph at `start`, rendering its
@@ -3988,9 +4604,10 @@ fn fold_html_line(line: &[u8], pass_through: bool, out: &mut String) {
 }
 
 /// Arm the indented-code cache for the open block at `start`, walking its body
-/// lines once. Returns `None` (no caching) if a line dedents, is blank, or
-/// contains a `\r` — those keep going through the full renderer, which gets the
-/// interior-blank accounting and exact block end right.
+/// lines once (interior blank lines fold like content — the same accounting as
+/// `try_incremental_indented`, so the cache can arm on a region that already
+/// contains blanks). Returns `None` (no caching) if a non-blank line dedents or
+/// any line contains a `\r` — those keep going through the full renderer.
 fn build_indented_cache(buffer: &str, start: usize, id: u64) -> Option<IndentedCodeCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
@@ -4003,15 +4620,15 @@ fn build_indented_cache(buffer: &str, start: usize, id: u64) -> Option<IndentedC
             Some(r) => {
                 let content_end = pos + r;
                 let next = pos + r + 1;
-                if bytes[pos..content_end].contains(&b'\r')
-                    || !indented_code_line(&bytes[pos..content_end])
-                {
+                let line = &bytes[pos..content_end];
+                let blank = line.iter().all(|&b| matches!(b, b' ' | b'\t'));
+                if line.contains(&b'\r') || (!blank && !indented_code_line(line)) {
                     return None;
                 }
                 if !escaped_lines.is_empty() {
                     escaped_lines.push('\n');
                 }
-                push_indented_content(&bytes[pos..content_end], &mut escaped_lines);
+                push_indented_content(line, &mut escaped_lines);
                 lines_upto = next;
                 pos = next;
             }
