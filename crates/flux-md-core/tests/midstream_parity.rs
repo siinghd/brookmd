@@ -295,16 +295,20 @@ fn speculative_finalize_byte_parity_literal() {
         assert!(!fin.contains("<a"), "finalized incomplete link must be literal (no <a>): {md:?} -> {fin}");
         assert!(fin.contains("<p>["), "finalized incomplete link must be literal text: {md:?} -> {fin}");
     }
-    // Pinned PRE-EXISTING quirk (unchanged by this feature): an EMPTY-dest open
-    // paren `[a](` is treated as an empty-dest link by the committing path
-    // (try_link succeeds for an empty destination), so finalize yields
-    // `<a href="">`. The speculative path renders the SAME label as inert <a>
-    // mid-stream, and finalize matches the historical one-shot output exactly.
+    // An EMPTY-dest open paren `[a](` at EOF is literal too. This used to be
+    // pinned as the opposite ("historical empty-href link"): try_link's
+    // empty-bare-dest early return claimed a complete link with no closing `)`,
+    // which both violated CommonMark and CONTRADICTED dest_streams_to_eof's
+    // scanner-parity debug_assert (the nightly fuzz target caught the conflict,
+    // red since 2026-07-13 — the two invariants could never hold at once).
+    // read_link_destination now returns None there, so finalize is literal,
+    // still byte-identical to the one-shot oracle. Speculation mid-stream is
+    // unchanged (the destination genuinely still streams to EOF).
     let fin = finalized("[Link text Here](");
     assert_eq!(fin, one_shot_complete_literal("[Link text Here]("));
     assert!(
-        fin.contains("<a href=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">Link text Here</a>"),
-        "empty-dest finalize is the historical empty-href link: {fin}"
+        !fin.contains("<a") && fin.contains("<p>[Link text Here](</p>"),
+        "empty-dest at EOF finalizes to literal text: {fin}"
     );
 }
 
