@@ -790,8 +790,11 @@ export class FluxClient {
    *   - identical committed block (html + kind + open + speculative) → the OLD
    *     block object, so its id and reference survive the swap and the block
    *     never re-renders (blocksEqual / the DOM keyed reconcile hold);
-   *   - changed committed block → the new block, its id offset into this
-   *     generation's namespace (adopted old ids and raw new ids could collide);
+   *   - changed committed block → the new block CARRYING THE OLD BLOCK'S id, so
+   *     the same keyed component re-renders in place and its state (pagination,
+   *     expansion…) survives the swap; only a NET-NEW position (past the old
+   *     document's end) takes a namespace-offset id, where a raw parser id
+   *     could genuinely collide with a retained old id;
    *   - still-open block over old content → the old block (never a shrinking
    *     partial where complete content was already on screen); past the old
    *     document's end the live tail streams in as-is;
@@ -834,6 +837,15 @@ export class FluxClient {
           view[i] = ob;
           continue;
         }
+        // CHANGED block replacing an old one positionally: adopt the OLD id.
+        // The id is the React key / DOM node key, so this re-renders the same
+        // component instance in place — a stateful override (a paginated table,
+        // an expanded <details>) keeps its state when a reprocess swap edits
+        // its content. Uniqueness holds: each old id is reused at exactly its
+        // own position. The namespace stride below is only for NET-NEW
+        // positions, where a raw parser id could genuinely collide.
+        view[i] = { ...nb, id: ob.id };
+        continue;
       }
       view[i] = { ...nb, id: this.idNamespace + nb.id };
     }

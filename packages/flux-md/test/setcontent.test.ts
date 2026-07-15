@@ -180,7 +180,8 @@ test("divergence swap: view never blanks, unchanged blocks keep identity, only t
   expect(merged[0]).toBe(gen0[0]); // identical html → OLD object, same id → memo-skips
   expect(merged[2]).toBe(gen0[2]);
   expect(merged[1].html).toBe("<p>beta CHANGED</p>"); // the one real change
-  expect(merged[1].id).not.toBe(gen0[1].id); // re-keys (namespaced, no collision)
+  expect(merged[1]).not.toBe(gen0[1]); // fresh object (new content)…
+  expect(merged[1].id).toBe(gen0[1].id); // …but the OLD id: same React key → in-place re-render, state survives
   expectUniqueIds(merged);
 
   firePatch(w, { newly_committed: [], active: [] }, { final: true });
