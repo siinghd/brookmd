@@ -197,6 +197,36 @@ test("two streams buffered before ready each create their own parser and keep th
   expect(patches(h.posted).length).toBe(2);
 });
 
+test("finalize with input still buffered emits the drain's commits AND the terminal patch (no wire loss)", () => {
+  // A deferred schedule models real message timing where the flush microtask
+  // hasn't run when the finalize message lands: doFinalize drains the buffer
+  // itself. The drain's append() returns committed blocks the wire never
+  // re-sends — discarding that patch would lose them from the store forever.
+  const deferred: Array<() => void> = [];
+  const posted: FromWorker[] = [];
+  const created: FakeParser[] = [];
+  const core = new WorkerCore({
+    makeParser: () => {
+      const p = new FakeParser();
+      created.push(p);
+      return p;
+    },
+    post: (m) => posted.push(m),
+    memBytes: () => 0,
+    schedule: (fn) => deferred.push(fn), // flush never runs before finalize
+  });
+  core.markReady();
+  core.handle({ type: "append", streamId: 1, chunk: "# doc", epoch: 1 });
+  core.handle({ type: "finalize", streamId: 1, epoch: 1 }); // buffer still pending
+  const ps = patches(posted) as Array<{ final?: boolean }>;
+  expect(created[0].calls).toEqual(["append:# doc", "finalize"]);
+  expect(ps.length).toBe(2); // drain patch + terminal patch — nothing discarded
+  expect(ps[0].final).toBe(false);
+  expect(ps[1].final).toBe(true);
+  for (const fn of deferred) fn(); // late flush is a no-op (buffer already drained)
+  expect(patches(posted).length).toBe(2);
+});
+
 test("emitted patches tag the terminal one with final:true and echo the stream epoch", () => {
   const h = harness();
   h.core.markReady();

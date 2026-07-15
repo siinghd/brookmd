@@ -156,7 +156,12 @@ use it from any binding.
 > append-only so parsing stays incremental. Re-transforming the *whole* string
 > each token (so earlier bytes change) forces `setContent` to reparse every tick
 > (O(n²)); that's what render-time overrides avoid. `setContent`'s reset path is
-> for the **once**-at-the-end reprocess swap, not per-token rewrites.
+> for the **once**-at-the-end reprocess swap, not per-token rewrites. That swap
+> is seamless: the current view stays on screen while the new string reparses —
+> the document never blanks, scroll never moves, and blocks whose rendered
+> content is unchanged keep their identity (and React keys), so only genuinely
+> changed blocks re-render. (`setContent("")` is an explicit clear and resets
+> immediately.)
 
 <details>
 <summary>Full manual control (caller-owned client)</summary>
@@ -552,9 +557,9 @@ class FluxClient {
   ): Promise<void>;
   finalize(): void;                                 // mark stream complete
   setContent(                                       // drive from a controlled full string
-    full: string,                                   // diffs vs last: prefix → append delta; else reset+reparse
-    opts?: { done?: boolean },                      // done:true → finalize
-  ): void;
+    full: string,                                   // diffs vs last: prefix → append delta; else seamless
+    opts?: { done?: boolean },                      //   reset+reparse (view held, unchanged blocks keep identity)
+  ): void;                                          // done:true → finalize
   reset(): void;                                    // wipe and reuse
   destroy(): void;                                  // free this stream's parser
   whenReady(): Promise<void>;                       // resolves once WASM loaded; rejects on init failure

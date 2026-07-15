@@ -196,8 +196,13 @@ export class WorkerCore {
     try {
       const parser = this.getOrCreate(streamId);
       if (buffered && buffered.length > 0) {
-        parser.append(buffered);
+        // The drain's patch MUST be emitted, not discarded: append() returns the
+        // blocks it committed and the wire never re-sends them, so dropping this
+        // patch loses those blocks from the store forever (the final patch below
+        // only carries what finalize itself commits).
+        const drained = parser.append(buffered);
         this.totalAppended.set(streamId, (this.totalAppended.get(streamId) ?? 0) + buffered.length);
+        this.emitPatch(streamId, drained, parser, 0, false);
       }
       const patch = parser.finalize();
       this.emitPatch(streamId, patch, parser, 0, true);

@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { FluxClient, FluxPool } from "../src/client";
-import type { FromWorker, ToWorker, WorkerLike } from "../src/types";
+import type { Block, FromWorker, ToWorker, WorkerLike } from "../src/types";
 
 // setContent is the controlled-string bridge: feed it the whole document each
 // time and it diffs against the last value — prefix-extension → append the
@@ -103,4 +103,221 @@ test("reattach() clears the baseline (StrictMode dev double-mount re-feeds)", ()
   client.reattach(); // remount the SAME instance
   client.setContent("hello"); // baseline cleared → re-append
   expect(appendedChunks(created[0])).toEqual(["hello", "hello"]);
+});
+
+// --------------------------------------------------------------------------
+// PRESERVED-VIEW DIVERGENCE SWAP — the once-at-the-end reprocess path must be
+// seamless: no empty frame, unchanged blocks keep object identity (and id →
+// React key / DOM node key), only genuinely changed blocks re-key.
+// --------------------------------------------------------------------------
+
+function blk(id: number, html: string, open = false): Block {
+  return { id, kind: { type: "Paragraph" }, start: 0, end: html.length, html, open, speculative: false };
+}
+
+// Fire a worker patch into the live client, stamped with the client's CURRENT
+// generation (read from the last epoch-carrying message it sent) so the
+// straggler guard doesn't drop it.
+function firePatch(
+  w: FakeWorker,
+  patch: { newly_committed: Block[]; active: Block[] },
+  opts: { final?: boolean } = {},
+) {
+  const sid = (w.sent[0] as { streamId: number }).streamId;
+  const epochs = w.sent
+    .map((m) => (m as { epoch?: number }).epoch)
+    .filter((e): e is number => e !== undefined);
+  w.fire({
+    type: "patch",
+    streamId: sid,
+    patch: JSON.stringify(patch),
+    appendedBytes: 0,
+    parseMicros: 0,
+    retainedBytes: 0,
+    wasmMemoryBytes: 0,
+    final: opts.final ?? false,
+    epoch: epochs.length ? Math.max(...epochs) : 0,
+  });
+}
+
+function expectUniqueIds(snap: Block[]) {
+  const ids = snap.map((b) => b.id);
+  expect(new Set(ids).size).toBe(ids.length);
+}
+
+// Drive a client to a committed 3-block finalized view (ids with streaming-style
+// holes: tail reparses burn ids, so a later one-shot reparse WILL renumber).
+function committedGen0(client: FluxClient, w: FakeWorker) {
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(2, "<p>beta</p>"), blk(5, "<p>gamma</p>")],
+    active: [],
+  });
+  firePatch(w, { newly_committed: [], active: [] }, { final: true });
+  return client.getSnapshot();
+}
+
+test("divergence swap: view never blanks, unchanged blocks keep identity, only the changed block re-keys", () => {
+  const { client, created } = setup();
+  const seen: Block[][] = [];
+  client.subscribe(() => seen.push(client.getSnapshot()));
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w);
+  expect(gen0.map((b) => b.id)).toEqual([0, 2, 5]);
+
+  // Post-processed final: middle block changed, ids renumber densely (0,1,2).
+  client.setContent("v1 processed", { done: true });
+  // Before any reparse patch lands, the displayed view is the EXACT same array.
+  expect(client.getSnapshot()).toBe(gen0);
+  expect(client.getSnapshot()).toBe(client.getSnapshot()); // ref-stable between notifies
+
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>beta CHANGED</p>"), blk(2, "<p>gamma</p>")],
+    active: [],
+  });
+  const merged = client.getSnapshot();
+  expect(merged.length).toBe(3);
+  expect(merged[0]).toBe(gen0[0]); // identical html → OLD object, same id → memo-skips
+  expect(merged[2]).toBe(gen0[2]);
+  expect(merged[1].html).toBe("<p>beta CHANGED</p>"); // the one real change
+  expect(merged[1].id).not.toBe(gen0[1].id); // re-keys (namespaced, no collision)
+  expectUniqueIds(merged);
+
+  firePatch(w, { newly_committed: [], active: [] }, { final: true });
+  const final = client.getSnapshot();
+  expect(final[0]).toBe(gen0[0]); // adopted identity survives the terminal patch
+  expect(final[2]).toBe(gen0[2]);
+  expectUniqueIds(final);
+  expect(client.getSnapshot()).toBe(final); // post-swap reads are ref-stable
+
+  // No subscriber ever saw an empty document.
+  expect(seen.length).toBeGreaterThan(0);
+  for (const snap of seen) expect(snap.length).toBeGreaterThan(0);
+});
+
+test("shorter replacement: old tail stays visible until the terminal patch, then trims", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w); // 3 blocks
+
+  client.setContent("v2 shorter", { done: true }); // reparses to only 2 blocks
+  // Mid-reparse: first block committed, second still open → old blocks hold at
+  // both positions (never a shrinking partial), old tail padded beyond.
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>")],
+    active: [blk(1, "<p>be", true)],
+  });
+  const mid = client.getSnapshot();
+  expect(mid.length).toBe(3); // old length held pre-trim
+  expect(mid[0]).toBe(gen0[0]);
+  expect(mid[1]).toBe(gen0[1]); // open tail over old content → old block shown
+  expect(mid[2]).toBe(gen0[2]);
+
+  firePatch(w, { newly_committed: [blk(1, "<p>beta2</p>")], active: [] }, { final: true });
+  const final = client.getSnapshot();
+  expect(final.length).toBe(2); // trimmed to the new document's length
+  expect(final[0]).toBe(gen0[0]);
+  expect(final[1].html).toBe("<p>beta2</p>");
+  expectUniqueIds(final);
+});
+
+test("setContent('') is an explicit clear and hard-resets immediately", () => {
+  const { client, created } = setup();
+  let notifies = 0;
+  client.subscribe(() => notifies++);
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  committedGen0(client, w);
+  const before = notifies;
+  client.setContent("");
+  expect(notifies).toBe(before + 1); // synchronous clear notify
+  expect(client.getSnapshot()).toEqual([]);
+});
+
+test("chained divergence mid-reparse: the merged view carries over, original objects flow through", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w);
+
+  client.setContent("v2 diverged", { done: true });
+  // Reparse only reaches block 0 before the NEXT divergence hits.
+  firePatch(w, { newly_committed: [blk(0, "<p>alpha</p>")], active: [] });
+  const merged1 = client.getSnapshot();
+  expect(merged1[0]).toBe(gen0[0]);
+  expect(merged1[2]).toBe(gen0[2]); // padding: reparse never reached it
+
+  client.setContent("v3 diverged again", { done: true });
+  expect(client.getSnapshot()).toBe(merged1); // captured merged view holds, same ref
+
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>beta</p>"), blk(2, "<p>gamma</p>")],
+    active: [],
+  }, { final: true });
+  const final = client.getSnapshot();
+  expect(final.length).toBe(3);
+  expect(final[0]).toBe(gen0[0]); // survived TWO swaps by identity
+  expect(final[2]).toBe(gen0[2]);
+  expectUniqueIds(final);
+});
+
+test("incremental merge: unchanged positions reuse the previous view's objects across patches (linear, no re-compare churn)", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w);
+
+  // Diverge WITHOUT done: the new answer streams in over many patches.
+  client.setContent("restart: ");
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>NEW two</p>")],
+    active: [blk(2, "<p>grow", true)],
+  });
+  const v1 = client.getSnapshot();
+  expect(v1[0]).toBe(gen0[0]);
+  const remapped = v1[1];
+  expect(remapped.html).toBe("<p>NEW two</p>");
+
+  // Next patch: same committed refs, only the tail advanced. The merged view
+  // must reuse the SAME objects for untouched positions — including the
+  // remapped changed block (stable identity ⇒ no re-render, no re-compare).
+  firePatch(w, { newly_committed: [], active: [blk(2, "<p>grow more", true)] });
+  const v2 = client.getSnapshot();
+  expect(v2[0]).toBe(gen0[0]);
+  expect(v2[1]).toBe(remapped);
+  expectUniqueIds(v2);
+});
+
+test("outline() reflects the displayed (merged) view during a swap", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const heading: Block = {
+    id: 0, kind: { type: "Heading", data: 2 }, start: 0, end: 14, html: "<h2>Title</h2>", open: false, speculative: false,
+  };
+  firePatch(w, { newly_committed: [heading, blk(3, "<p>body</p>")], active: [] }, { final: true });
+  const before = client.outline();
+  expect(before).toEqual([{ level: 2, text: "Title", id: 0 }]);
+
+  client.setContent("v2 diverged", { done: true });
+  // Mid-reparse, before any patch: outline must still describe what's rendered.
+  expect(client.outline()).toEqual(before);
+  firePatch(w, { newly_committed: [heading, blk(1, "<p>body CHANGED</p>")], active: [] }, { final: true });
+  // Identical heading adopted → same id; a ToC built from it won't re-key.
+  expect(client.outline()).toEqual([{ level: 2, text: "Title", id: 0 }]);
+});
+
+test("public reset() still hard-clears even while a preserved view is live", () => {
+  const { client, created } = setup();
+  let notifies = 0;
+  client.subscribe(() => notifies++);
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  committedGen0(client, w);
+  client.setContent("v2 diverged", { done: true }); // preserved view live, raw store empty
+  const before = notifies;
+  client.reset();
+  expect(notifies).toBe(before + 1); // displayed view counted as content → clear notify
+  expect(client.getSnapshot()).toEqual([]);
 });

@@ -266,6 +266,11 @@ export class FluxPool {
   }
 }
 
+/** Per-generation id offset for merged divergence views (see FluxClient's
+ *  `idNamespace`). 2^32 sits far above any real per-generation block id while
+ *  leaving room for 2^21 divergences inside Number.MAX_SAFE_INTEGER. */
+const ID_NAMESPACE_STRIDE = 0x1_0000_0000;
+
 function poolCap(): number {
   const hc = typeof navigator !== "undefined" ? navigator.hardwareConcurrency : 0;
   return Math.min(hc || 4, 8);
@@ -347,6 +352,30 @@ export class FluxClient {
   // echoed back on each patch; a patch whose epoch is older than this is a
   // pre-reset straggler and is dropped before it can repopulate the cleared store.
   private epoch = 0;
+
+  // --- Preserved-view divergence swap (setContent's reset+reparse path) ---
+  // The displayed snapshot captured by softReset(). While set, getSnapshot()
+  // returns a positional merge of this view over the rebuilding store, so the
+  // document never blanks out during a divergence reparse and unchanged blocks
+  // keep their object identity AND id (React key / DOM node key) across the
+  // swap. It persists after the reparse completes — dropping it would revert
+  // the adopted ids and remount every block one notify later.
+  private staleSnapshot: Block[] | null = null;
+  // Set when the reparse's terminal (final) patch lands: the merge stops
+  // padding with the old document's tail, so a shorter replacement trims to the
+  // new length on that very notify.
+  private staleTrimmed = false;
+  // Id offset applied to non-adopted new blocks in a merged view. A divergence
+  // reparse restarts core block ids at 0 (fresh parser), and streamed ids are
+  // chunk-dependent (tail reparses burn ids) — so a changed block's new id can
+  // collide with a retained old block's id in the same merged snapshot.
+  // Bumped by ID_NAMESPACE_STRIDE per generation, which keeps every merged id
+  // provably unique: adopted ids are all below the current namespace.
+  private idNamespace = 0;
+  // getSnapshot() cache: (store.snapshot ref, trimmed) → merged array. Repeated
+  // reads between notifies must return the SAME reference — the
+  // useSyncExternalStore cached-snapshot contract.
+  private mergeCache: { base: Block[]; trimmed: boolean; view: Block[] } | null = null;
 
   // Perf
   private appendedBytes = 0;
@@ -537,7 +566,12 @@ export class FluxClient {
    *   - **prefix-extension** (the streaming-growth case) → append only the new
    *     suffix, so committed blocks stay put and only the active tail re-parses;
    *   - **any other change** (e.g. a finished stream swapped for a re-processed
-   *     final string) → `reset()` + reparse the whole new string.
+   *     final string) → reset + reparse the whole new string, keeping the
+   *     current view on screen until the reparse lands: the document never
+   *     blanks, scroll never moves, and blocks whose rendered content is
+   *     unchanged keep their identity (and React keys) so only genuinely
+   *     changed blocks re-render. An empty new string is an explicit clear and
+   *     hard-resets immediately.
    *
    * This is the first-class bridge for UIs that hold a streaming message as a
    * single growing string prop (the common React shape) — no hand-rolled diff,
@@ -565,7 +599,15 @@ export class FluxClient {
       if (!this.contentDone && content.startsWith(this.lastContent)) {
         this.append(content.slice(this.lastContent.length));
       } else {
-        this.reset(); // diverged, or reopening a finalized stream — rebuild
+        // Diverged, or reopening a finalized stream — rebuild. When both the new
+        // content and the displayed view are non-empty this is the documented
+        // once-at-the-end reprocess swap: keep the current view on screen while
+        // the new string reparses (softReset), so the document never blanks and
+        // unchanged blocks keep their identity. An explicit clear (empty new
+        // content) stays a hard, immediate reset.
+        const displayed = this.getSnapshot();
+        if (content.length > 0 && displayed.length > 0) this.softReset(displayed);
+        else this.reset();
         this.append(content);
       }
       this.lastContent = content;
@@ -581,8 +623,65 @@ export class FluxClient {
     // Only notify subscribers if there was content to clear: resetting an
     // already-empty store leaves the view empty either way, so skip the no-op
     // emit (which would otherwise drive every subscriber through a wasted,
-    // output-identical render pass).
-    const hadContent = this.store.snapshot.length > 0;
+    // output-identical render pass). "Content" is the DISPLAYED view — a
+    // preserved divergence merge counts even when the raw store is empty.
+    const hadContent = this.getSnapshot().length > 0;
+    this.staleSnapshot = null;
+    this.staleTrimmed = false;
+    this.mergeCache = null;
+    this.resetParser();
+    if (hadContent) this.emit(true); // clear-the-view notify is synchronous
+  }
+
+  /**
+   * setContent's divergence reset: rebuild the parser exactly like {@link reset},
+   * but keep `preserve` (the currently displayed view) on screen while the new
+   * content reparses. No notify fires here — subscribers keep reading the same
+   * snapshot reference until the first new-generation patch merges over it, so
+   * the swap is seamless: no empty frame, no container collapse, no scroll
+   * clamp, and blocks whose content survives the reprocess never re-render.
+   */
+  private softReset(preserve: Block[]) {
+    this.staleSnapshot = preserve;
+    this.staleTrimmed = false;
+    this.idNamespace += ID_NAMESPACE_STRIDE;
+    this.resetParser();
+    // Seed the merge cache with the captured view keyed to the fresh (empty)
+    // store: getSnapshot() keeps returning the exact pre-reset reference, so a
+    // render between now and the first patch is a pure no-op.
+    this.mergeCache = { base: this.store.snapshot, trimmed: false, view: preserve };
+  }
+
+  /**
+   * Finish a preserved-view divergence swap by making the merged view THE
+   * store: adopted ids become the committed keys, the merged array becomes the
+   * snapshot, and every scrap of merge state drops. From here getSnapshot() is
+   * a plain field read again (zero steady-state overhead) and the superseded
+   * generation's blocks are garbage — only one document stays in memory.
+   * Runs on the terminal (final) patch, which commits everything — if anything
+   * is somehow still open, the lazy merge simply stays live instead (the
+   * incremental reuse keeps it linear).
+   */
+  private collapseStale() {
+    if (this.store.active.length > 0) return;
+    const view = this.getSnapshot(); // final merged view (staleTrimmed is set)
+    const committed = new Map<number, Block>();
+    const committedOrder: number[] = new Array(view.length);
+    for (let i = 0; i < view.length; i++) {
+      committedOrder[i] = view[i].id;
+      committed.set(view[i].id, view[i]);
+    }
+    this.store = { committed, committedOrder, active: [], snapshot: view };
+    this.staleSnapshot = null;
+    this.staleTrimmed = false;
+    this.mergeCache = null;
+  }
+
+  // Shared generation teardown: swap in an empty store, zero the metrics and
+  // the setContent baseline, invalidate any coalesced frame, bump the epoch,
+  // and tell the worker to drop the parser. View concerns (stale preservation,
+  // subscriber notify) belong to the callers — reset() and softReset().
+  private resetParser() {
     this.store = emptyBlockStore();
     this.appendedBytes = 0;
     this.patchCount = 0;
@@ -604,7 +703,6 @@ export class FluxClient {
     // Same streamId + worker — the worker frees and lazily recreates the parser.
     const pw = this.ensureAcquired();
     this.pool.send(pw, { type: "reset", streamId: this.streamId, epoch: this.epoch });
-    if (hadContent) this.emit(true); // clear-the-view notify is synchronous
   }
 
   destroy() {
@@ -656,7 +754,73 @@ export class FluxClient {
     return () => this.listeners.delete(fn);
   };
 
-  getSnapshot = (): Block[] => this.store.snapshot;
+  getSnapshot = (): Block[] => {
+    const base = this.store.snapshot;
+    if (!this.staleSnapshot) return base;
+    const cache = this.mergeCache;
+    if (cache && cache.base === base && cache.trimmed === this.staleTrimmed) return cache.view;
+    // Reuse the previous merge's decisions only within the same trim phase —
+    // a trim changes the rules, so it clears the cache and recomputes once.
+    const view = this.mergeStale(base, cache && cache.trimmed === this.staleTrimmed ? cache : null);
+    this.mergeCache = { base, trimmed: this.staleTrimmed, view };
+    return view;
+  };
+
+  /**
+   * Positional merge of the preserved pre-divergence view over the rebuilding
+   * store (see {@link softReset}). Per position:
+   *   - identical committed block (html + kind + open + speculative) → the OLD
+   *     block object, so its id and reference survive the swap and the block
+   *     never re-renders (blocksEqual / the DOM keyed reconcile hold);
+   *   - changed committed block → the new block, its id offset into this
+   *     generation's namespace (adopted old ids and raw new ids could collide);
+   *   - still-open block over old content → the old block (never a shrinking
+   *     partial where complete content was already on screen); past the old
+   *     document's end the live tail streams in as-is;
+   *   - position the reparse hasn't reached → the old block, until the terminal
+   *     patch sets `staleTrimmed` and the view clamps to the new length.
+   *
+   * LINEARITY: committed blocks are reference-stable across patches (the store
+   * contract), so a base entry pointer-equal to the previous merge's reproduces
+   * its previous decision without re-running the O(html) equality compare. Each
+   * block is string-compared exactly once — when it first commits — keeping a
+   * long post-divergence stream linear instead of quadratic. Only the active
+   * tail (fresh references each patch, small by design) re-compares per patch.
+   */
+  private mergeStale(base: Block[], prev: { base: Block[]; view: Block[] } | null): Block[] {
+    const stale = this.staleSnapshot!;
+    const len = this.staleTrimmed ? base.length : Math.max(base.length, stale.length);
+    const view: Block[] = new Array(len);
+    for (let i = 0; i < len; i++) {
+      const nb = i < base.length ? base[i] : undefined;
+      if (nb !== undefined && prev !== null && i < prev.base.length && prev.base[i] === nb) {
+        view[i] = prev.view[i]; // same inputs (nb ref, fixed stale, same phase) → same decision
+        continue;
+      }
+      const ob = i < stale.length ? stale[i] : undefined;
+      if (!nb) {
+        view[i] = ob!;
+        continue;
+      }
+      if (ob) {
+        if (nb.open && !this.staleTrimmed) {
+          view[i] = ob;
+          continue;
+        }
+        if (
+          nb.html === ob.html &&
+          nb.kind.type === ob.kind.type &&
+          nb.open === ob.open &&
+          nb.speculative === ob.speculative
+        ) {
+          view[i] = ob;
+          continue;
+        }
+      }
+      view[i] = { ...nb, id: this.idNamespace + nb.id };
+    }
+    return view;
+  }
 
   /**
    * Internal: a renderer with an `onRenderMetrics` hook calls this once per
@@ -708,7 +872,10 @@ export class FluxClient {
    */
   outline(): OutlineEntry[] {
     const out: OutlineEntry[] = [];
-    for (const b of this.store.snapshot) {
+    // Read the DISPLAYED view (getSnapshot), not the raw store: during/after a
+    // divergence swap the merged view is what's rendered, and outline ids are
+    // documented as scroll targets / React keys — they must match those blocks.
+    for (const b of this.getSnapshot()) {
       if (b.kind.type === "Heading") {
         // `kind.data` is the bare level `number` when `blockData` is off, or the
         // `{ level, text, id }` object when on — accept both. `OutlineEntry.id`
@@ -731,7 +898,7 @@ export class FluxClient {
    */
   toPlaintext(): string {
     const parts: string[] = [];
-    for (const b of this.store.snapshot) {
+    for (const b of this.getSnapshot()) {
       const t = htmlToText(b.html);
       if (t) parts.push(t);
     }
@@ -760,6 +927,16 @@ export class FluxClient {
           break;
         }
         applyPatch(this.store, patch);
+        // The reparse behind a preserved divergence view is complete: stop
+        // padding with the old document's tail, so a shorter replacement trims
+        // to the new length on this very notify. Keyed on msg.final ONLY —
+        // finalizePending can be consumed by an earlier in-flight append patch
+        // (see below), and trimming there would chop the old tail mid-reparse.
+        if (msg.final === true && this.staleSnapshot) {
+          this.staleTrimmed = true;
+          this.mergeCache = null;
+          this.collapseStale();
+        }
         this.appendedBytes = msg.appendedBytes;
         this.totalParseMicros += msg.parseMicros;
         this.retainedBytes = msg.retainedBytes;
