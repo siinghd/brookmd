@@ -345,6 +345,28 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                         InlineComp::NotComponent => {
                             if let Some(consumed) = try_inline_html(bytes, pos, opts, out) {
                                 pos = consumed;
+                            } else if opts.open_tail
+                                && (opts.html_sanitize || opts.unsafe_html)
+                                && inline_html_streams_to_eof(bytes, pos)
+                            {
+                                // A raw-HTML token / autolink still streaming to
+                                // EOF (`<a href="https://…` with no `>` yet, a
+                                // partial `<https://…` autolink, `</ta`, `<!--`
+                                // without its terminator): emit NOTHING. Its
+                                // visible content is markup internals — flashing
+                                // them (URL included) is the raw-HTML twin of
+                                // the link-URL flash the speculative label path
+                                // kills. Finalize (open_tail=false) renders it
+                                // literally, byte-par with the one-shot oracle.
+                                // GATED on raw HTML being engaged (sanitize or
+                                // unsafe): in escape mode the completed token IS
+                                // visible literal text, so hiding it mid-stream
+                                // would pop-in real content, not prevent a leak.
+                                // Unstable: the next byte settles or extends it.
+                                if track && pos < unstable {
+                                    unstable = pos;
+                                }
+                                pos = bytes.len();
                             } else {
                                 // Unstable: a later `>` could form an autolink / inline HTML.
                                 if track && pos < unstable {
@@ -1391,6 +1413,202 @@ fn match_inline_html(bytes: &[u8], start: usize) -> Option<usize> {
         return None;
     }
     Some(i + 1)
+}
+
+/// Is the `<` at `start` the head of a raw-HTML token or autolink that is
+/// genuinely STILL STREAMING to EOF — could a later byte still complete it?
+/// `true` ⇒ the open-tail render SUPPRESSES it entirely (same pending-invisible
+/// contract as a streaming markdown link's URL): a partially-arrived
+/// `<a href="https://…` must never flash its URL as literal text while the
+/// stream is open. `false` ⇒ the token is settled — either complete right here
+/// (match_inline_html/try_autolink take it) or broken forever (renders literal,
+/// e.g. `a < b`, `1<2`, `<a:x`).
+///
+/// MUST mirror [`match_inline_html`] (and the autolink scheme walk) exactly:
+/// every arm below is that scanner's walk with "EOF reached mid-walk → true"
+/// in place of its terminal accept/reject. Email autolinks (`<user@…>`) are
+/// deliberately NOT mirrored: their local part admits digits and common
+/// punctuation, so suppressing them would momentarily hide everyday
+/// comparisons like `x<2` — a worse trade than a short-lived visible address.
+fn inline_html_streams_to_eof(bytes: &[u8], start: usize) -> bool {
+    let rest = &bytes[start..];
+    if rest.first() != Some(&b'<') {
+        return false;
+    }
+    let streaming = match rest.get(1) {
+        None => true, // bare `<` abutting EOF: any form could follow
+        Some(b'!') => bang_streams_to_eof(rest),
+        // PI `<?…?>`: streaming iff the terminator hasn't arrived.
+        Some(b'?') => !rest.windows(2).any(|w| w == b"?>"),
+        Some(b'/') => close_tag_streams_to_eof(rest),
+        Some(c) if c.is_ascii_alphabetic() => open_tag_or_autolink_streams_to_eof(rest),
+        _ => false, // `<3`, `< b`, `<=` … can never become a tag/autolink
+    };
+    // Scanner-drift guard (same discipline as dest_streams_to_eof): a token
+    // match_inline_html accepts as COMPLETE right here must never be reported
+    // as still-streaming.
+    debug_assert!(
+        !(streaming && match_inline_html(bytes, start).is_some()),
+        "inline_html_streams_to_eof returned true but match_inline_html found a complete \
+         token at start={start}: {:?}",
+        std::str::from_utf8(&bytes[start..]).unwrap_or("<non-utf8>")
+    );
+    streaming
+}
+
+/// `<!…` arm of [`inline_html_streams_to_eof`]: comment / CDATA / declaration.
+fn bang_streams_to_eof(rest: &[u8]) -> bool {
+    if rest.starts_with(b"<!--") {
+        return !rest.windows(3).any(|w| w == b"-->"); // comment streaming
+    }
+    if b"<!--".starts_with(rest) {
+        return true; // `<!`, `<!-` abutting EOF — only a comment can follow
+    }
+    if rest.starts_with(b"<![CDATA[") {
+        return !rest.windows(3).any(|w| w == b"]]>"); // CDATA streaming
+    }
+    if b"<![CDATA[".starts_with(rest) {
+        return true; // `<![`, `<![C`, … abutting EOF
+    }
+    if rest.len() > 2 && rest[2].is_ascii_alphabetic() {
+        return !rest.contains(&b'>'); // declaration streaming
+    }
+    false
+}
+
+/// `</…` arm of [`inline_html_streams_to_eof`]: a closing tag streaming to EOF.
+fn close_tag_streams_to_eof(rest: &[u8]) -> bool {
+    let mut i = 2;
+    if i == rest.len() {
+        return true; // `</` abutting EOF
+    }
+    if !rest[i].is_ascii_alphabetic() {
+        return false;
+    }
+    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || rest[i] == b'-') {
+        i += 1;
+    }
+    while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+        i += 1;
+    }
+    // EOF mid-name/ws → streaming; a present byte must be `>` (complete → the
+    // real scanner takes it) or junk (broken forever) — both settled.
+    i == rest.len()
+}
+
+/// `<name…` arm of [`inline_html_streams_to_eof`]: an open tag OR an autolink
+/// (`<scheme:…>`) streaming to EOF. Both grammars start `<` + ASCII letter, so
+/// they are probed together; either still being completable suppresses.
+fn open_tag_or_autolink_streams_to_eof(rest: &[u8]) -> bool {
+    // Autolink arm: scheme = letter + 1..=31 [A-Za-z0-9+.-], then `:`, then a
+    // body free of whitespace/`<`/`>`, then `>`. Streaming iff EOF lands inside
+    // a still-valid prefix. (`<https://secret…` with no `>` yet is THE case.)
+    {
+        let mut i = 1;
+        while i < rest.len() && i <= 32 && (rest[i].is_ascii_alphanumeric() || matches!(rest[i], b'+' | b'.' | b'-')) {
+            i += 1;
+        }
+        if i == rest.len() {
+            return true; // scheme prefix abuts EOF (also covers a tag-name prefix)
+        }
+        if rest[i] == b':' && i >= 3 {
+            // scheme complete (≥2 chars): walk the body.
+            let mut j = i + 1;
+            while j < rest.len() && !matches!(rest[j], b' ' | b'\t' | b'\n' | b'<' | b'>') {
+                j += 1;
+            }
+            if j == rest.len() {
+                return true; // body abuts EOF, `>` still to come
+            }
+        }
+    }
+    // Open-tag arm: mirror match_inline_html's open-tag walk, EOF ⇒ streaming.
+    let mut i = 1;
+    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || rest[i] == b'-') {
+        i += 1;
+    }
+    if i == rest.len() {
+        return true; // tag name abuts EOF
+    }
+    loop {
+        let prev = i;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+            i += 1;
+        }
+        if i == rest.len() {
+            return true; // ws abuts EOF — an attr or `>` could still come
+        }
+        if rest[i] == b'/' {
+            return i + 1 == rest.len(); // awaiting `>`; anything else is settled
+        }
+        if rest[i] == b'>' {
+            return false; // complete — the real scanner takes it
+        }
+        if i == prev {
+            return false; // attrs must be ws-separated — broken forever
+        }
+        if !(rest[i].is_ascii_alphabetic() || rest[i] == b'_' || rest[i] == b':') {
+            return false; // invalid attr-name start — broken forever
+        }
+        while i < rest.len() && (rest[i].is_ascii_alphanumeric() || matches!(rest[i], b'_' | b':' | b'.' | b'-')) {
+            i += 1;
+        }
+        if i == rest.len() {
+            return true; // attr name abuts EOF
+        }
+        let save = i;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+            i += 1;
+        }
+        if i == rest.len() {
+            return true; // ws after an attr name abuts EOF (`=` could come)
+        }
+        if rest[i] == b'=' {
+            i += 1;
+            while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+                i += 1;
+            }
+            if i == rest.len() {
+                return true; // awaiting the value
+            }
+            match rest[i] {
+                b'"' => {
+                    i += 1;
+                    while i < rest.len() && rest[i] != b'"' {
+                        i += 1;
+                    }
+                    if i == rest.len() {
+                        return true; // unclosed quoted value — `<a href="https://…`
+                    }
+                    i += 1;
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < rest.len() && rest[i] != b'\'' {
+                        i += 1;
+                    }
+                    if i == rest.len() {
+                        return true;
+                    }
+                    i += 1;
+                }
+                _ => {
+                    let vstart = i;
+                    while i < rest.len() && !matches!(rest[i], b' ' | b'\t' | b'\n' | b'>' | b'<' | b'\'' | b'"' | b'=' | b'`') {
+                        i += 1;
+                    }
+                    if i == vstart {
+                        return false; // invalid first value byte — broken forever
+                    }
+                    if i == rest.len() {
+                        return true; // unquoted value abuts EOF
+                    }
+                }
+            }
+        } else {
+            i = save;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------

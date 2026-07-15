@@ -697,3 +697,142 @@ fn quote_hosted_ref_defs_stream_with_parity() {
     // `[^…]:` with footnotes off is a plain link-ref def
     assert_parity("> [^f]: https://example.com/n\n");
 }
+
+/// Strip tags and decode entities → the text a user actually SEES.
+fn visible_text(html: &str) -> String {
+    let mut out = String::new();
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            c if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&amp;", "&")
+}
+
+/// Parser configured like the JS default (safe raw-HTML sanitizer, allow-all):
+/// raw tags render as markup, so a streaming one must be SUPPRESSED, not shown.
+fn sanitized() -> StreamParser {
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    p.set_html_sanitize(true, vec![], vec![]);
+    p
+}
+
+fn streamed_open_sanitized(md: &str) -> String {
+    let mut p = sanitized();
+    let mut buf = [0u8; 4];
+    for ch in md.chars() {
+        p.append(ch.encode_utf8(&mut buf));
+    }
+    p.append("");
+    collect(&p)
+}
+
+fn one_shot_open_sanitized(md: &str) -> String {
+    let mut p = sanitized();
+    p.append(md);
+    collect(&p)
+}
+
+fn finalized_sanitized(md: &str) -> String {
+    let mut p = sanitized();
+    p.append(md);
+    p.finalize();
+    collect(&p)
+}
+
+/// A raw-HTML anchor arriving over a stream must NEVER flash its URL (or any
+/// tag internals) as visible text while the block is open — the raw-HTML twin
+/// of the speculative markdown-link contract. Albany-reported: backends that
+/// emit `<a href="…">label</a>` instead of markdown links leaked the href for
+/// the whole window in which the opening tag was partially streamed. Applies
+/// under the sanitizer (the flux-md JS default) and `unsafe_html` — in plain
+/// escape mode a tag is literal visible text, so nothing is suppressed there.
+#[test]
+fn streaming_raw_html_tag_never_leaks_url() {
+    let secret = "platform.example.com/company/91576/transcript";
+    let docs = [
+        format!("Revenue was reported <a href=\"https://{secret}\">here</a> today."),
+        // table cell (the structured/blockData channel shares render_cell_inner)
+        format!("| co | src |\n| -- | --- |\n| acme | <a href=\"https://{secret}\">link</a> |"),
+    ];
+    // Autolink: once the closing `>` lands the URL IS the visible link label —
+    // the contract here is only that no PARTIAL URL shows while it streams.
+    {
+        let doc = format!("See <https://{secret}> for details.");
+        let done_at = doc.find('>').unwrap() + 1;
+        for cut in 1..done_at {
+            let vis = visible_text(&streamed_open_sanitized(&doc[..cut]));
+            assert!(
+                !vis.contains("platform.example"),
+                "partial autolink URL visible while streaming at cut {cut}: {vis:?}"
+            );
+        }
+        let done = finalized_sanitized(&doc);
+        assert!(done.contains("<a href="), "completed autolink missing: {done}");
+    }
+    for doc in &docs {
+        for cut in 1..doc.len() {
+            if !doc.is_char_boundary(cut) {
+                continue;
+            }
+            let prefix = &doc[..cut];
+            let open = streamed_open_sanitized(prefix);
+            let vis = visible_text(&open);
+            assert!(
+                !vis.contains("platform.example") && !vis.contains("href"),
+                "URL/tag internals visible while open at cut {cut}: {vis:?} (doc {doc:?})"
+            );
+            // and the mid-stream view must stay chunk-independent. Skipped for
+            // cuts inside a table's header/delimiter prelude: the streamed
+            // paragraph-cache classifies the block as a table one line later
+            // than the one-shot path does mid-delimiter — a PRE-EXISTING,
+            // transient divergence (verified on the untouched tree; resolves at
+            // the delimiter's newline; finalize output is chunk-independent).
+            let table_prelude = doc.starts_with('|')
+                && doc.match_indices('\n').nth(1).map_or(true, |(i, _)| cut <= i + 1);
+            if !table_prelude {
+                assert_eq!(open, one_shot_open_sanitized(prefix), "mid-stream != one-shot at cut {cut} (doc {doc:?})");
+            }
+        }
+        // Once complete, the anchor renders (URL only inside the attribute).
+        let done = finalized_sanitized(doc);
+        assert!(done.contains("<a href="), "completed anchor missing: {done}");
+    }
+}
+
+/// The suppression must not hide everyday comparisons — `<` followed by
+/// space/digit/punct can never become a tag or autolink and stays visible
+/// mid-stream; and a PERMANENTLY partial tag still finalizes to literal text
+/// (spec: unterminated `<` is just text).
+#[test]
+fn streaming_tag_suppression_spares_comparisons_and_finalize_is_literal() {
+    for md in ["price a < b holds", "x<2 and y<3", "5 <= 6"] {
+        let open = streamed_open_sanitized(md);
+        let vis = visible_text(&open);
+        assert!(vis.contains('<'), "comparison hidden mid-stream: {md:?} -> {vis:?}");
+        assert_eq!(streamed_open_sanitized(md), one_shot_open_sanitized(md), "parity for {md:?}");
+    }
+    // Unterminated tag at finalize: escaped literal, byte-par with one-shot.
+    let fin = finalized_sanitized("cut <a href=\"https://u.example/x");
+    let fin_one_shot = {
+        let mut p = sanitized();
+        p.append("cut <a href=\"https://u.example/x");
+        p.finalize();
+        collect(&p)
+    };
+    assert_eq!(fin, fin_one_shot);
+    assert!(visible_text(&fin).contains("<a href="), "finalize must render the partial tag literally: {fin}");
+    // A completed opening tag with the label still streaming keeps the URL in
+    // the attribute — visible text is just the label so far.
+    let open = streamed_open_sanitized("see <a href=\"https://u.example/x\">Earnings Ca");
+    let vis = visible_text(&open);
+    assert!(vis.contains("Earnings Ca") && !vis.contains("u.example"), "label streams, URL stays hidden: {vis:?}");
+    // Escape mode (no sanitizer, no unsafe_html): a tag is literal visible
+    // text — nothing is suppressed, the raw prefix stays visible mid-stream.
+    let open = streamed_open("cut <a href=\"https://u.example/x");
+    assert!(visible_text(&open).contains("<a href="), "escape mode must not suppress: {open}");
+}

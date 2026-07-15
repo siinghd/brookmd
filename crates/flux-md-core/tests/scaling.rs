@@ -769,6 +769,38 @@ fn quad_limit(span: f64) -> f64 {
     span * span * 2.5
 }
 
+
+/// Complete raw-HTML anchors in prose and table rows — the streaming shape a
+/// backend emitting `<a href="…">label</a>` (instead of markdown links)
+/// produces. Each tag completes quickly, so the open-tail suppression scan
+/// settles in O(1) per tag and blocks commit normally: must stay linear.
+fn raw_html_anchors(target: usize) -> String {
+    let mut s = String::new();
+    let mut i = 0;
+    while s.len() < target {
+        s.push_str("Result reported <a href=\"https://platform.example.com/company/");
+        s.push_str(&i.to_string());
+        s.push_str("/transcript\">source</a> today.\n\n| co | src |\n| -- | --- |\n| acme | <a href=\"https://data.example.com/row/");
+        s.push_str(&i.to_string());
+        s.push_str("\">row</a> |\n\n");
+        i += 1;
+    }
+    s
+}
+
+/// ONE never-closing raw tag with an unboundedly growing quoted attribute —
+/// the raw-HTML twin of the `[link](growing-url…` tail pin. The failed-`<`
+/// unstable mark (which PRE-DATES the open-tail tag suppression) pins the
+/// paragraph cut at the `<`, so the growing suffix re-renders per append.
+/// Bounded by attribute length in practice; documented pin.
+fn raw_tag_growing_attr(target: usize) -> String {
+    let mut s = String::from("<a href=\"https://example.com/");
+    while s.len() < target {
+        s.push_str("aaaaaaaa");
+    }
+    s
+}
+
 fn shapes() -> Vec<Shape> {
     let base = Opts::default();
     let lin = |name: &'static str, gen: fn(usize) -> String, rendered: Expect| Shape {
@@ -839,6 +871,18 @@ fn shapes() -> Vec<Shape> {
         // vacuously passed the blank-line close test, so the cache dropped and
         // never re-armed whenever an append ended exactly at `\n`.
         lin("html_type6_aligned", html_type6_aligned, Linear),
+        // Raw anchors under unsafe_html: engages the open-tail incomplete-tag
+        // suppression scan on every tail — must stay linear (albany shape).
+        Shape {
+            name: "raw_html_anchors",
+            gen: raw_html_anchors,
+            opts: Opts { unsafe_html: true, ..Opts::default() },
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Expect::Linear,
+            rendered: Expect::Linear,
+        },
         lin("html_type7_aligned", html_type7_aligned, Linear),
         // CRLF twins (hunt group crlf-cache-bail, FIXED via ingest
         // normalization) — must cost the same as their LF originals.
@@ -967,6 +1011,15 @@ fn shapes() -> Vec<Shape> {
         // run, so the cut cannot advance. Inert-run flavors (entity_soup,
         // punctuated_giant_word, autolinks-off) are FIXED and linear above.
         quad("giant-word-autolinks-pin", one_giant_word, base, KnownQuadratic, KnownQuadratic),
+        // Pre-existing tail pin (failed-`<` unstable mark): a single unbounded
+        // never-closing raw tag re-renders its growing suffix per append.
+        quad(
+            "raw-tag-tail-pin",
+            raw_tag_growing_attr,
+            Opts { unsafe_html: true, ..Opts::default() },
+            KnownQuadratic,
+            KnownQuadratic,
+        ),
         // uncached-open-block-kinds: FIXED — the five member shapes are pinned
         // linear here; the two first-line-incomplete container flavors remain
         // known-quadratic below.

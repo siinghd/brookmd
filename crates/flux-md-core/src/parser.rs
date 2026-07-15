@@ -5553,7 +5553,8 @@ fn feed_open_item(st: &mut OpenItemStream, bytes: &[u8], end: usize) -> Option<(
 
 /// Can this open item's render differ between the two `open_tail` variants?
 /// Every `opts.open_tail` branch in inline.rs needs a trigger byte to fire
-/// (`` ` `` code span, `$` math, `\(`/`\[` math, `[` link), and only blocks the
+/// (`` ` `` code span, `$` math, `\(`/`\[` math, `[` link, `<` raw-HTML/autolink
+/// tail suppression), and only blocks the
 /// assembly serves from a FROZEN open-variant render matter — pieces re-rendered
 /// from source with the append's own opts (tight paragraphs, the settled-prefix
 /// cut) are variant-correct by construction. So the item is sensitive iff a
@@ -5573,7 +5574,7 @@ fn open_item_ot_sensitive(st: &mut OpenItemStream, loose: bool) -> bool {
         return true;
     }
     let has_trigger =
-        |s: &[u8]| s.iter().any(|&b| matches!(b, b'`' | b'$' | b'[' | b'\\'));
+        |s: &[u8]| s.iter().any(|&b| matches!(b, b'`' | b'$' | b'[' | b'\\' | b'<'));
     let inline_free = |b: &Block, buf: &[u8]| {
         matches!(
             b.kind,
