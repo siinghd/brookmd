@@ -403,6 +403,10 @@ export class FluxClient {
    *   order, after the store updates) — for side effects like lazily
    *   highlighting a finished code block or analytics. A committed block never
    *   re-fires; the streaming tail does not (subscribe for live tail updates).
+   *   NOTE: this is a PARSER-commit hook — the block carries the parser's raw
+   *   id. During a setContent divergence swap the rendered view may show that
+   *   block under a different id (an adopted old id, or a namespaced one), so
+   *   correlate with rendered blocks via subscribe()+getSnapshot(), not this id.
    * @param options.coalesce opt-in (default `false`): collapse multiple
    *   intra-frame patch notifications into ONE `requestAnimationFrame`-scheduled
    *   flush to subscribers, so a React `useSyncExternalStore` consumer renders at
@@ -597,6 +601,20 @@ export class FluxClient {
       // finalized stream (or any divergence) falls through to reset()+reparse,
       // which frees the dead parser and rebuilds a fresh one.
       if (!this.contentDone && content.startsWith(this.lastContent)) {
+        if (this.lastContent === "" && content.length > 0 && this.getSnapshot().length > 0) {
+          // Whole-document re-feed into a POPULATED store — only reachable when
+          // reattach() cleared the baseline while blocks were on screen (e.g. a
+          // StrictMode-style destroy()→reattach() on a client that had content).
+          // The worker's parser was dropped, so a plain append would restart raw
+          // ids at 0 — and those cannot be trusted to line up with the store's
+          // committed keys (streamed ids carry chunk-dependent holes, and a
+          // completed divergence swap re-keys the store by displayed ids), so
+          // applyPatch would duplicate blocks instead of replacing them. This IS
+          // a divergence swap in disguise: preserve the displayed view and let
+          // the merge adopt identical blocks (an unchanged re-feed re-renders
+          // nothing at all).
+          this.softReset(this.getSnapshot());
+        }
         this.append(content.slice(this.lastContent.length));
       } else {
         // Diverged, or reopening a finalized stream — rebuild. When both the new

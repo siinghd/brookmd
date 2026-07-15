@@ -308,6 +308,88 @@ test("outline() reflects the displayed (merged) view during a swap", () => {
   expect(client.outline()).toEqual([{ level: 2, text: "Title", id: 0 }]);
 });
 
+test("reattach re-feed after a completed divergence swap: no duplicate/ghost blocks (re-feed IS a swap)", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w); // ids [0,2,5]
+
+  // Divergence swap completes → the store is re-keyed by DISPLAYED ids.
+  client.setContent("v1 processed", { done: true });
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>beta CHANGED</p>"), blk(2, "<p>gamma</p>")],
+    active: [],
+  }, { final: true });
+  const collapsed = client.getSnapshot();
+  expect(collapsed.length).toBe(3);
+
+  // destroy() → reattach() (public API reuse across mount cycles) → re-feed.
+  client.destroy();
+  client.reattach();
+  client.setContent("v1 processed", { done: true });
+  // The re-feed preserved the displayed view (no blank), and the fresh parser's
+  // raw ids must NOT be trusted against the re-keyed store.
+  expect(client.getSnapshot()).toBe(collapsed);
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>beta CHANGED</p>"), blk(2, "<p>gamma</p>")],
+    active: [],
+  }, { final: true });
+  const refed = client.getSnapshot();
+  expect(refed.length).toBe(3); // NOT 5 — no duplicated tail
+  expect(refed[0]).toBe(gen0[0]); // identical content: identity flows through
+  expectUniqueIds(refed);
+  expect(refed.map((b) => b.html)).toEqual(["<p>alpha</p>", "<p>beta CHANGED</p>", "<p>gamma</p>"]);
+});
+
+test("reattach re-feed MID-merge: the interrupted swap's stale padding never ghosts into the new document", () => {
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  committedGen0(client, w); // 3 blocks
+
+  // Divergence to a 2-block doc; reparse only reaches block 0, then unmount.
+  client.setContent("v2 short", { done: true });
+  firePatch(w, { newly_committed: [blk(0, "<p>alpha</p>")], active: [] });
+  client.destroy();
+  client.reattach();
+
+  // Re-feed the same 2-block doc; after its terminal patch the view must be
+  // exactly 2 blocks — the old gen0 tail (gamma) must not survive as a ghost.
+  client.setContent("v2 short", { done: true });
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>two</p>")],
+    active: [],
+  }, { final: true });
+  const final = client.getSnapshot();
+  expect(final.length).toBe(2);
+  expect(final.map((b) => b.html)).toEqual(["<p>alpha</p>", "<p>two</p>"]);
+  expectUniqueIds(final);
+});
+
+test("reattach re-feed with NO divergence ever: hole-y streamed ids don't duplicate against dense reparse ids", () => {
+  // Pre-existing latent bug (independent of the swap work): a streamed store
+  // keyed [0,2,5] re-fed by a fresh parser emitting dense [0,1,2] used to
+  // interleave into 4+ mangled blocks via applyPatch's has(id) dedupe.
+  const { client, created } = setup();
+  client.setContent("v1", { done: true });
+  const w = created[0];
+  const gen0 = committedGen0(client, w); // ids [0,2,5]
+
+  client.destroy();
+  client.reattach();
+  client.setContent("v1", { done: true }); // same doc — StrictMode-style re-feed
+  firePatch(w, {
+    newly_committed: [blk(0, "<p>alpha</p>"), blk(1, "<p>beta</p>"), blk(2, "<p>gamma</p>")],
+    active: [],
+  }, { final: true });
+  const refed = client.getSnapshot();
+  expect(refed.length).toBe(3); // NOT 4
+  // Identical content re-fed → every block adopted by identity, zero re-renders.
+  expect(refed[0]).toBe(gen0[0]);
+  expect(refed[1]).toBe(gen0[1]);
+  expect(refed[2]).toBe(gen0[2]);
+});
+
 test("public reset() still hard-clears even while a preserved view is live", () => {
   const { client, created } = setup();
   let notifies = 0;
