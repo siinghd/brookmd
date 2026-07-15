@@ -277,3 +277,24 @@ fn malformed_and_partial_input_never_panics() {
     // Unclosed strong emphasis renders as literal text, not a dangling tag.
     assert_eq!(render("**unclosed bold\n"), "<p>**unclosed bold</p>");
 }
+
+/// A paragraph ending exactly at `[text](` (EOF or blank line right after the
+/// opening paren, optionally after destination whitespace) is NOT a link —
+/// CommonMark requires the closing `)`. read_link_destination's empty-bare-dest
+/// early return used to claim a complete empty-href link here, mis-rendering
+/// committed content AND tripping the dest_streams_to_eof parity debug_assert
+/// mid-stream (nightly fuzz catch, 2026-07-13).
+#[test]
+fn dangling_open_paren_link_is_literal() {
+    assert_eq!(render("[link]("), "<p>[link](</p>");
+    assert_eq!(render("![img]("), "<p>![img](</p>");
+    assert_eq!(render("before [link](\n\nnext"), "<p>before [link](</p><p>next</p>");
+    assert_eq!(render("text [a]( \n\nx"), "<p>text [a](</p><p>x</p>");
+    // Streamed char-by-char must agree (the parity the fuzzer enforces).
+    assert_eq!(render_streamed("[link]("), "<p>[link](</p>");
+    assert_eq!(render_streamed("before [link](\n\nnext"), "<p>before [link](</p><p>next</p>");
+    // Genuinely-empty destinations stay valid links.
+    assert_eq!(render("[a]()"), "<p><a href=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">a</a></p>");
+    assert_eq!(render("[a]( )"), "<p><a href=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">a</a></p>");
+    assert_eq!(render("[a](<>)"), "<p><a href=\"\" target=\"_blank\" rel=\"noopener noreferrer nofollow\">a</a></p>");
+}

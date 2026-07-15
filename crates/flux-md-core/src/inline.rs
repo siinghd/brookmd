@@ -2462,8 +2462,16 @@ fn read_link_destination(
             j += 1;
         }
         if j == i {
-            // Bare empty destination is only valid via bracketed form.
-            return Some((String::new(), None, j));
+            // The bare walk consumed nothing. Leading whitespace is already
+            // skipped and an immediate `)` was handled above, so this is
+            // reachable only at EOF — `[text](` cut off before any destination.
+            // That is NOT a complete link (an empty destination is only valid
+            // via `()` or the bracketed `<>` form, both handled above): the
+            // closing-`)` check below is what the early Some used to bypass,
+            // mis-rendering a paragraph ending in `[text](` as an empty-href
+            // link instead of literal text (and tripping the
+            // dest_streams_to_eof parity assert mid-stream).
+            return None;
         }
         let u = std::str::from_utf8(&bytes[i..j]).ok()?.to_string();
         (u, j)
