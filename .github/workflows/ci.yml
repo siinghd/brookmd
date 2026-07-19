@@ -19,7 +19,7 @@ jobs:
         working-directory: crates/flux-md-core
         env:
           CMARK_MIN_PASS: "652"
-          GFM_MIN_PASS: "23"
+          GFM_MIN_PASS: "24"
         run: cargo test --release
       - name: Complexity-scaling gate (deterministic work-counter, not wall-clock)
         # Asserts streaming stays sub-quadratic on the committing/cached shapes,

@@ -82,7 +82,7 @@ jobs:
       - name: Rust core (CommonMark + GFM floors)
         env:
           CMARK_MIN_PASS: "652"
-          GFM_MIN_PASS: "23"
+          GFM_MIN_PASS: "24"
         run: bun run test:rust
       - name: Complexity-scaling gate (streaming stays sub-quadratic)
         working-directory: crates/flux-md-core

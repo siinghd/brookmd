@@ -10,11 +10,13 @@
 //! These goldens are the exact strings the prior `#[serde(tag="type",
 //! content="data")]` derive produced (captured from the un-refactored code), and
 //! they are asserted here so a hand-typo cannot silently drift the wire for any
-//! kind. The `kind` value crosses the WASM boundary via
-//! `serde_wasm_bindgen::to_value`; because the impl uses `serialize_struct` (not
-//! `serialize_map`), each value serializes to a plain JS object there too — the
-//! same plain-object shape the derive produced — so these `serde_json` goldens
-//! also pin the wire contract `props.table = block.kind.data` depends on.
+//! kind. The `kind` value crosses the WASM boundary serialized to a JSON string
+//! via `serde_json::to_string` (see the `FluxParser` methods in `lib.rs`) — the
+//! same serializer the `j()` helper below uses — so these goldens pin the exact
+//! wire the live boundary produces, the contract `props.table = block.kind.data`
+//! depends on. (The impl uses `serialize_struct`, not `serialize_map`, so the
+//! envelope stays a plain object even under a `serde_wasm_bindgen::to_value`
+//! boundary.)
 
 use flux_md_core::blocks::{
     AlertKind, BlockKind, ContainerData, HeadingData, ListItemData, MathBlockData, NestedBlock,

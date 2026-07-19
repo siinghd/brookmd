@@ -35,8 +35,9 @@ pub struct Block {
 ///
 /// Serialization is HAND-WRITTEN (see `impl Serialize for BlockKind` below)
 /// rather than derived. That impl is the *one* place the `{ "type", "data" }`
-/// envelope is produced, and it crosses the WASM boundary via
-/// `serde_wasm_bindgen::to_value` as well as `serde_json` in tests. Hand-writing
+/// envelope is produced, and its output crosses the WASM boundary serialized to
+/// a JSON string via `serde_json::to_string` (see the `FluxParser` methods in
+/// `lib.rs`); the same `serde_json` path is exercised by the golden tests. Hand-writing
 /// it lets a single variant emit either `{"type":"X"}` (no `data` key) or
 /// `{"type":"X","data":…}` depending on an `Option`, which the derive cannot do
 /// (adjacent tagging emits `data: null` for a `None` newtype, breaking the
@@ -181,14 +182,14 @@ struct ComponentData<'a> {
 
 impl Serialize for BlockKind {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        // `serialize_struct` (NOT `serialize_map`) is load-bearing: under
-        // `serde_wasm_bindgen` with the default config (serialize_maps_as_objects
-        // = false, as used at lib.rs `to_value`), a map serializes to a JS `Map`
-        // whose `.type` / `.data` property reads return `undefined`, silently
-        // breaking the TS `props.table = block.kind.data` contract. A struct
-        // always serializes to a plain JS object regardless of that config, and
-        // matches the plain-object shape the prior `#[serde(tag, content)]`
-        // derive produced.
+        // `serialize_struct` (NOT `serialize_map`) is load-bearing as a
+        // defensive choice: the live boundary is `serde_json::to_string`
+        // (lib.rs), where both work — but under `serde_wasm_bindgen`'s default
+        // config a map serializes to a JS `Map` whose `.type` / `.data` reads
+        // return `undefined`, silently breaking the TS
+        // `props.table = block.kind.data` contract. A struct always serializes
+        // to a plain object under either serializer, and matches the shape the
+        // prior `#[serde(tag, content)]` derive produced.
 
         // {"type": tag} — no `data` key (1-field struct).
         fn no_data<S: Serializer>(s: S, tag: &'static str) -> Result<S::Ok, S::Error> {

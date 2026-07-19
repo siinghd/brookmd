@@ -16,9 +16,11 @@ mod render;
 mod scanner;
 mod sort;
 mod url;
+pub mod wire;
 
 pub use blocks::{Block, BlockKind};
 pub use parser::{Patch, StreamParser};
+pub use wire::WirePatch;
 
 /// Deterministic perf instrumentation — feature `perf_counters`, off by default
 /// and never compiled into the WASM build (no `[features]` flag is set there).
@@ -97,26 +99,16 @@ pub mod perf {
     }
 }
 
-use serde::Serialize;
+#[cfg(feature = "wasm")]
 use wasm_bindgen::prelude::*;
 
-#[derive(Serialize)]
-struct PatchJs {
-    newly_committed: Vec<Block>,
-    active: Vec<Block>,
-}
-
-impl From<Patch> for PatchJs {
-    fn from(p: Patch) -> Self {
-        Self { newly_committed: p.newly_committed, active: p.active }
-    }
-}
-
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 pub struct FluxParser {
     inner: StreamParser,
 }
 
+#[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl FluxParser {
     #[wasm_bindgen(constructor)]
@@ -132,14 +124,18 @@ impl FluxParser {
     #[wasm_bindgen]
     pub fn append(&mut self, chunk: &str) -> Result<String, JsValue> {
         let patch = self.inner.append(chunk);
-        serde_json::to_string(&PatchJs::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
+        // Mirrors `wire::patch_to_json`, but keeps the Result-propagating shape
+        // the JS boundary expects (and that keeps the shipped WASM byte-stable).
+        serde_json::to_string(&WirePatch::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     /// JSON-string patch — see [`FluxParser::append`].
     #[wasm_bindgen]
     pub fn finalize(&mut self) -> Result<String, JsValue> {
         let patch = self.inner.finalize();
-        serde_json::to_string(&PatchJs::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
+        // Mirrors `wire::patch_to_json`, but keeps the Result-propagating shape
+        // the JS boundary expects (and that keeps the shipped WASM byte-stable).
+        serde_json::to_string(&WirePatch::from(patch)).map_err(|e| JsValue::from_str(&e.to_string()))
     }
 
     #[wasm_bindgen(js_name = bufferLen)]
@@ -271,6 +267,7 @@ impl FluxParser {
     }
 }
 
+#[cfg(feature = "wasm")]
 impl Default for FluxParser {
     fn default() -> Self {
         Self::new()
