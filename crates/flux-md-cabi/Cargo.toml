@@ -1,0 +1,47 @@
+[package]
+name = "flux-md-cabi"
+version = "0.1.0"
+edition = "2021"
+description = "Plain C-ABI wrapper over flux-md-core, for Flutter/Dart (dart:ffi) and any C consumer"
+license = "MIT"
+repository = "https://github.com/siinghd/flux-md"
+# Ships as prebuilt native libraries inside the flux_md Flutter package (built for
+# iOS/Android/desktop by CI), not to crates.io. Revisit if we ever publish the
+# native layer as a crate.
+publish = false
+
+[lib]
+name = "flux_md_cabi"
+# staticlib → iOS (linked into the app), cdylib → Android/desktop (.so/.dylib/.dll
+# loaded at runtime via dart:ffi DynamicLibrary), rlib → `cargo test` here on the
+# host. Unlike the ubrn/uniffi ffi crate, this crate exposes a hand-written,
+# stable `extern "C"` surface (see include/flux_md.h) with no bindgen dependency.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# Pure native API only — NO wasm-bindgen. `default-features = false` drops the
+# `wasm` feature so this crate builds for device targets and links `StreamParser`,
+# `Patch`, `Block`, and the `wire::*` JSON helpers directly.
+flux-md-core = { path = "../flux-md-core", default-features = false }
+
+# Config is passed across the C boundary as a JSON object (FluxConfig's snake_case
+# keys); parse it with serde_json. `serde`'s derive builds the FluxConfig decoder.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# This crate is its own workspace root, so core's tuned profile does NOT apply
+# here — without this section every device build (cargo-ndk .so, iOS staticlib,
+# desktop dylib) ships cargo's default release: opt=3/no-lto/cu16/unstripped.
+# Copied from crates/flux-md-ffi/Cargo.toml (measured there: this profile →
+# 856KB .so, -29.5%, at unchanged parse throughput). opt-level stays 3, NOT "z":
+# z costs 1.15-1.9x parse speed for only ~131KB more.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Keep "unwind" (do NOT copy core's WASM abort posture): every export below wraps
+# its body in `std::panic::catch_unwind` and returns NULL/0 on panic — a panic
+# unwinding across the `extern "C"` boundary is UB. With `panic = "abort"` a
+# parser panic would SIGABRT the host app before catch_unwind could stop it.
+panic = "unwind"

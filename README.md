@@ -50,8 +50,24 @@ per-stream config, framework bindings, security model, and scaling helpers
 | Path | What |
 |------|------|
 | [`packages/flux-md`](packages/flux-md) | The published npm package — TS client + renderers, and the full docs. |
-| [`crates/flux-md-core`](crates/flux-md-core) | The Rust parser/renderer compiled to WASM (built on demand; not committed). |
+| [`crates/flux-md-core`](crates/flux-md-core) | The Rust parser/renderer, published to [crates.io](https://crates.io/crates/flux-md-core); compiled to WASM for the npm package. Emits the versioned JSON [wire contract](crates/flux-md-core/WIRE.md). |
+| [`crates/flux-md-ffi`](crates/flux-md-ffi) | uniffi wrapper over the core for native targets (React Native, Swift, Kotlin). |
+| [`crates/flux-md-cabi`](crates/flux-md-cabi) | Plain C-ABI wrapper (Dart/Flutter and any C FFI consumer). |
+| [`packages/flux-md-react-native`](packages/flux-md-react-native) | React Native renderer over the native core (experimental — not yet on npm). |
+| [`packages/flux-md-flutter`](packages/flux-md-flutter) | Flutter/Dart scaffold over the C ABI (experimental). |
+| [`bindings/kotlin`](bindings/kotlin) | Kotlin/Android bindings (experimental). |
+| [`bindings/swift`](bindings/swift) | Swift package (iOS + macOS) bindings (experimental). |
 | [`web`](web) | The live demo / playground ([md.hsingh.app](https://md.hsingh.app/)). |
+
+## Beyond JavaScript
+
+The same Rust core streams the same versioned JSON wire
+([WIRE.md](crates/flux-md-core/WIRE.md)) across every boundary — WASM for
+browsers/Node, [uniffi](crates/flux-md-ffi) for React Native/Swift/Kotlin, and a
+[C ABI](crates/flux-md-cabi) for Flutter or any language with a C FFI. Golden
+tests pin all three boundaries to byte-identical output. The native paths are
+**experimental**: CI cross-compiles and host-tests them, but they are not yet
+published or device-validated.
 
 ## Development
 

@@ -1,0 +1,5 @@
+# SwiftPM build output.
+.build/
+# The XCFramework is a build artifact (native binaries) assembled by
+# scripts/build-xcframework.sh — never committed. The dir is kept via .gitkeep.
+Frameworks/*.xcframework

@@ -30,6 +30,28 @@ flux-md-core = { path = "../flux-md-core", default-features = false }
 # this version is locked to ubrn's. Upgrade ubrn and this pin together.
 uniffi = "=0.31.0"
 
+# The in-crate bindgen bins (below) need uniffi's `cli` feature, but device
+# builds must NOT: it pulls clap/camino and is host-only tooling. Keep it
+# opt-in — plain `cargo build --release` (the .so/.a device artifacts) never
+# enables it, so those builds are byte-for-byte unchanged. Only the generate
+# scripts pass `--features cli`.
+[features]
+cli = ["uniffi/cli"]
+
+# Generate the foreign-language bindings from THIS crate's pinned uniffi
+# (=0.31.0) via library mode, so the emitted Kotlin/Swift matches the linked
+# runtime's method checksums exactly. Gated on `cli` so they don't build (and
+# don't pull clap) for device targets. See src/bin/*.rs for invocation.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "uniffi-bindgen-swift"
+path = "src/bin/uniffi-bindgen-swift.rs"
+required-features = ["cli"]
+
 # This crate is its own workspace root, so core's tuned profile does NOT apply
 # here — without this section every device build (cargo-ndk .so, iOS staticlib)
 # ships cargo's default release: opt=3/no-lto/cu16/unstripped, a 1.22MB .so.

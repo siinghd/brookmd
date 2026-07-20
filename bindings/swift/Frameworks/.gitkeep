@@ -1,0 +1,3 @@
+# Placeholder so the Frameworks/ dir exists in git.
+# scripts/build-xcframework.sh assembles flux_md_ffi.xcframework here (macOS + Xcode);
+# the XCFramework itself is a native binary artifact and is never committed.

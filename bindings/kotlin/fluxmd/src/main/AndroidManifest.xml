@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Empty manifest: the package/namespace is declared in build.gradle.kts
+     (`android.namespace`). AGP merges consumers' manifests; this library adds
+     no components, permissions, or metadata of its own. -->
+<manifest />
