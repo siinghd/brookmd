@@ -641,12 +641,15 @@ fn strikethrough_one_para(target: usize) -> String {
     s
 }
 
-/// delimiter-stack-mod3-rescan (per-render FIXED via openers_bottom; streaming
-/// pin remains): a lone `**` opener permanently blocked by the mod-3 rule used
-/// to make every later `*` closer re-walk the whole delimiter stack (O(stack²)
-/// per render, so streaming went ~cubic in wall). The bounded scan makes one
-/// render linear; the paragraph cut stays semantically pinned (a future `**`
-/// closer could pair back), so streaming is counter-bounded quadratic.
+/// delimiter-stack-mod3-rescan (FIXED — per-render via openers_bottom AND
+/// streaming via the Mod3TailCache): a lone `**` opener permanently blocked by
+/// the mod-3 rule used to make every later `*` closer re-walk the whole
+/// delimiter stack (O(stack²) per render, so streaming went ~cubic in wall). The
+/// bounded scan makes one render linear; the paragraph cut stays semantically
+/// pinned (the unpaired can-open `**` is `earliest_open`) so no ParagraphCache
+/// can arm — but while the `**` is the sole opener the paragraph is all-literal,
+/// so the Mod3TailCache extends the escaped body by only the appended bytes and
+/// streaming is linear on both metrics.
 fn mod3_soup(target: usize) -> String {
     let mut s = String::from("a**b");
     while s.len() < target {
@@ -1097,6 +1100,24 @@ fn shapes() -> Vec<Shape> {
     ];
     // Shapes too expensive per byte for the 8 KB → 64 KB span (super-quadratic
     // wall); same 8x span at smaller sizes.
+    // delimiter-stack-mod3-rescan: FIXED on BOTH metrics via the Mod3TailCache.
+    // The `a**bc* c* …` soup is one open paragraph whose lone `**` (can-open AND
+    // can-close, so the mod-3 rule is live) every later single `*` is blocked
+    // from closing (`2 + 1 ≡ 0 (mod 3)`, neither length a multiple of 3). The
+    // `**` stays an unpaired can-open run, so `compute_cut`'s `earliest_open`
+    // pins the cut at 0 and no ParagraphCache can arm. But while the `**` is the
+    // sole opener no `*` in the body can pair, so the paragraph renders as
+    // literal escaped text — `<p>` + escape_html(body) + `</p>` — and escape_html
+    // is a context-free per-byte map, so the Mod3TailCache extends the settled
+    // body by only the appended bytes (O(new)); the slow-path tail rescan
+    // (scanned) and whole-paragraph re-render (rendered) are both gone. The guard
+    // drops to the byte-identical full path the moment a byte could restructure
+    // the render — a `*` run of length ≥ 2 (a `**` closer pairs the leading one,
+    // `2 + 2 ≢ 0` → `<strong>`), a single `*` a non-space follows (it could
+    // open), a newline, or any construct/entity/non-ASCII byte; a `*` on the
+    // chunk edge is held pending so the 3-byte-period soup never forces a drop.
+    // Small span retained from its former super-quadratic days; it now sits
+    // comfortably linear (~7x over the 8x span).
     v.push(Shape {
         name: "delimiter-stack-mod3-rescan",
         gen: mod3_soup,
@@ -1104,8 +1125,8 @@ fn shapes() -> Vec<Shape> {
         chunk: CHUNK,
         small: 1024,
         large: 8 * 1024,
-        scanned: KnownQuadratic,
-        rendered: KnownQuadratic,
+        scanned: Linear,
+        rendered: Linear,
     });
     // dollar-math-eof-rescan: FIXED on BOTH metrics. The `$x $x …` soup is one
     // open, unclosed single-`$` inline-math span from the paragraph start to EOF

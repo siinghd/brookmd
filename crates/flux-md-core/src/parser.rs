@@ -381,6 +381,12 @@ pub struct StreamParser {
     /// sanitize/unsafe HTML. The failed-`<` unstable mark pins the cut at the
     /// `<`, so no [`ParagraphCache`] can arm (see [`RawTagTailCache`]).
     raw_tag_tail_cache: Option<RawTagTailCache>,
+    /// Fast path for a paragraph opening `…**…` whose lone `**` run (can-open
+    /// AND can-close, so the mod-3 rule is live) is permanently unpaired — the
+    /// `a**bc* c* …` soup where every later single `*` is a mod-3-blocked
+    /// closer. The unpaired can-open `**` pins the commit cut at 0, so no
+    /// [`ParagraphCache`] can arm (see [`Mod3TailCache`]).
+    mod3_tail_cache: Option<Mod3TailCache>,
 }
 
 #[derive(Default)]
@@ -635,6 +641,50 @@ struct RawTagTailCache {
     /// The open attribute value's delimiter (`b'"'` or `b'\''`). A matching quote
     /// in the appended bytes closes the value and drops the cache.
     quote: u8,
+}
+
+/// Incremental render state for an open paragraph opening `X**Y…` whose single
+/// `**` run is permanently unpaired — the `a**bc* c* c* …` soup (a lone `**`
+/// followed by a growing run of mod-3-blocked single-`*` closers).
+///
+/// The leading `**` sits between two non-`*` non-space bytes, so it can both
+/// OPEN and CLOSE — which keeps the CommonMark mod-3 rule live: every later
+/// single `*` is right-flanking-only (a non-space to its left, a space to its
+/// right) and tries to close it, but `2 + 1 ≡ 0 (mod 3)` with neither length a
+/// multiple of 3 blocks the pairing. So the `**` stays on the delimiter stack
+/// as an unpaired can-open run; [`compute_cut`]'s `earliest_open` pins the
+/// commit cut at 0 and no [`ParagraphCache`] can arm — today every append
+/// re-scans + re-renders the whole growing paragraph (O(n²) on both counters).
+///
+/// But while the `**` stays the sole opener, no `*` in the body can pair (the
+/// closers are can-close-only, and the `**` is mod-3-blocked against every one
+/// of them), so the whole paragraph renders as literal escaped text — `<p>` +
+/// `escape_html(body)` (trailing whitespace stripped) + `</p>` — and
+/// `escape_html` is a context-free per-byte map, so the settled body extends by
+/// only the appended bytes. The guard (see [`mod3_body_scan`] /
+/// [`build_mod3_tail_cache`]) settles a byte only when it is provably literal —
+/// an ASCII-alnum/space/tab text byte, or a single `*` decidably closer-only
+/// (a non-`*` follows and it is whitespace) — and drops to the byte-identical
+/// full path the moment a byte could restructure the render: a `*` run of
+/// length ≥ 2 (a second `**` pairs the leading one, `2 + 2 ≢ 0 (mod 3)` →
+/// `<strong>`), a single `*` that could open (a non-space follows it), a
+/// newline, or any construct/entity/non-ASCII byte. A `*` run abutting the
+/// chunk edge is left PENDING (its length/flanking undecided until the next
+/// append) — held out of the settled body but rendered literally in the open
+/// view, exactly as the full path renders a trailing `*` at EOF.
+struct Mod3TailCache {
+    /// Absolute byte offset of the paragraph start (== `body`'s first byte).
+    start: usize,
+    /// Stable id of the paragraph block.
+    id: u64,
+    /// Absolute offset; `buffer[start .. settled]` is all provably-literal and
+    /// `body == escape_html(buffer[start .. settled])`. `buffer[settled .. len]`
+    /// is the PENDING trailing `*` run (0 or 1 byte — a run reaching length 2
+    /// drops). Advances by the newly-settled bytes each engagement.
+    settled: usize,
+    /// Escaped paragraph body settled so far (`escape_html(buffer[start..settled])`;
+    /// for the literal soup this equals the bytes themselves).
+    body: String,
 }
 
 /// Incremental render state for a single open GFM table at the tail. Streaming
@@ -1446,6 +1496,7 @@ impl StreamParser {
             dollar_tail_cache: None,
             alnum_tail_cache: None,
             raw_tag_tail_cache: None,
+            mod3_tail_cache: None,
         }
     }
 
@@ -1730,6 +1781,9 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_raw_tag_tail() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_mod3_tail() {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_table() {
@@ -2282,6 +2336,7 @@ impl StreamParser {
         self.dollar_tail_cache = None;
         self.alnum_tail_cache = None;
         self.raw_tag_tail_cache = None;
+        self.mod3_tail_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -2361,6 +2416,20 @@ impl StreamParser {
                         if self.para_cache.is_none() && (self.unsafe_html || self.html_sanitize) {
                             self.raw_tag_tail_cache =
                                 build_raw_tag_tail_cache(&self.buffer, start, new_active[0].id);
+                        }
+                        // And for the `a**bc* c* …` mod-3 soup: a lone can-open
+                        // AND can-close `**` that every later single `*` is
+                        // mod-3-blocked from closing stays an unpaired opener, so
+                        // `earliest_open` pins the cut at 0 and the cache can't
+                        // arm. While the `**` is the sole opener the paragraph is
+                        // all-literal, so the mod3-tail fast path extends the
+                        // escaped body in O(new bytes). Emphasis is always on, so
+                        // this needs no config gate; it is mutually exclusive with
+                        // the three caches above by the paragraph's shape (first
+                        // non-space byte `$` / all-alnum / `<` vs. a `**` run).
+                        if self.para_cache.is_none() {
+                            self.mod3_tail_cache =
+                                build_mod3_tail_cache(&self.buffer, start, new_active[0].id);
                         }
                     }
                     // Footnotes stay ARMED: the cache renders refs as
@@ -3162,6 +3231,77 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.raw_tag_tail_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of the open `a**bc* c* …` mod-3 soup at the tail
+    /// (see [`Mod3TailCache`]). While the lone `**` is the sole opener the
+    /// paragraph is all-literal, so its render is `<p>escape_html(body)</p>`
+    /// (trailing whitespace stripped) and the escaped body just grows by the
+    /// newly-settled bytes. Returns `None` (dropping the cache) the moment an
+    /// appended byte could restructure the render — a `*` run of decided length
+    /// ≥ 2, a single `*` that could open, a newline, or any construct/entity/
+    /// non-ASCII byte — so the full reparse handles it, byte-identically. A `*`
+    /// run abutting the chunk edge is held PENDING (rendered literally in the
+    /// open view but excluded from the settled body) until the next append
+    /// decides it, so a `*` landing on a chunk boundary never forces a drop.
+    fn try_incremental_mod3_tail(&mut self) -> Option<Patch> {
+        let mut cache = self.mod3_tail_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // The paragraph must still be the sole tail block (only whitespace before
+        // it, nothing committed past its start).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Fold only the bytes past the settled boundary. The re-scan starts at the
+        // pending `*` (0 or 1 byte), so it stays O(new bytes); `mod3_body_scan`
+        // returns `None` the instant a byte could restructure the all-literal
+        // render — the full path then re-renders that append.
+        if len > cache.settled {
+            let new_settled = mod3_body_scan(bytes, cache.settled, len)?;
+            escape_html(&self.buffer[cache.settled..new_settled], &mut cache.body);
+            cache.settled = new_settled;
+        }
+        // `<p>body</p>` — `render_paragraph`'s opener + the settled escaped body,
+        // plus any PENDING trailing `*` run (all `*`, rendered literally). The
+        // trailing-whitespace trim bites only when nothing is pending (a trailing
+        // `*` is never whitespace), mirroring `render_paragraph` exactly.
+        let pending = len - cache.settled;
+        let mut html = String::with_capacity(cache.body.len() + pending + 24);
+        html.push_str("<p");
+        // Mirrors `RenderOpts::dir()` (static — independent of content).
+        if self.dir_auto {
+            html.push_str(" dir=\"auto\"");
+        }
+        html.push('>');
+        if pending == 0 {
+            // CommonMark: trailing whitespace at end of the final line is stripped
+            // (mirrors `render_paragraph`'s in-place trim of the rendered inner).
+            let keep = cache.body.trim_end_matches([' ', '\t', '\n', '\r']).len();
+            html.push_str(&cache.body[..keep]);
+        } else {
+            html.push_str(&cache.body);
+            for _ in 0..pending {
+                html.push('*');
+            }
+        }
+        html.push_str("</p>");
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Paragraph,
+            start: cache.start,
+            end: len,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.mod3_tail_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
 
@@ -6239,6 +6379,95 @@ fn build_raw_tag_tail_cache(buffer: &str, start: usize, id: u64) -> Option<RawTa
     }
     let quote = open_tag_streaming_quote(bytes, start)?;
     Some(RawTagTailCache { start, id, scanned: bytes.len(), quote })
+}
+
+/// Scan `bytes[from..to]` — a slice of the mod-3 soup body (everything AFTER the
+/// leading `**`) — returning the new settled offset, or `None` to DROP to the
+/// byte-identical full path (see [`Mod3TailCache`]). A byte settles only when it
+/// is provably literal while the `**` is the sole opener:
+///
+/// * an ASCII-alnum / space / tab text byte (the catch-all text arm; deliberately
+///   narrow — `.:/@+-` etc. are EXCLUDED, so no extended autolink can form after
+///   the boundary bytes `*`/space, and every excluded byte only ever OVER-drops);
+/// * a single `*` that is DECIDABLY closer-only: a non-`*` byte follows it and
+///   that byte is whitespace, so it cannot left-flank (open) and can only
+///   right-flank (close) — and it is mod-3-blocked (`2 + 1 ≡ 0`) against the lone
+///   `**`, so it renders literally.
+///
+/// It drops on a `*` run of decided length ≥ 2 (a `**` closer pairs the leading
+/// `**`, `2 + 2 ≢ 0 (mod 3)` → `<strong>`), a single `*` a non-space follows
+/// (it could open and later pair), and any other byte (newline, construct/entity
+/// opener, non-ASCII). A `*` run abutting the slice end (`to`) is left PENDING:
+/// its length and flanking are undecided until the next append, so `to - settled`
+/// (0 or 1 byte) is the pending suffix the caller renders literally.
+fn mod3_body_scan(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
+    let mut i = from;
+    while i < to {
+        let b = bytes[i];
+        if b.is_ascii_alphanumeric() || b == b' ' || b == b'\t' {
+            i += 1;
+        } else if b == b'*' {
+            let mut j = i + 1;
+            while j < to && bytes[j] == b'*' {
+                j += 1;
+            }
+            if j == to {
+                // Trailing `*` run abutting the chunk edge. A run already at
+                // length ≥ 2 is a decided `**` closer waiting to pair (a drop);
+                // a single `*` is genuinely undecided — hold it pending.
+                return if j - i >= 2 { None } else { Some(i) };
+            }
+            // The run is followed by a decided byte. A `**`+ closer pairs the
+            // leading `**`; a single `*` renders literally only if it cannot open
+            // (the following byte is whitespace, so it is closer-only or inert).
+            if j - i >= 2 {
+                return None;
+            }
+            match bytes[j] {
+                b' ' | b'\t' => i = j,
+                _ => return None,
+            }
+        } else {
+            return None;
+        }
+    }
+    Some(to)
+}
+
+/// Arm the mod3-tail cache when the open paragraph at `start` is the `a**bc* …`
+/// soup (see [`Mod3TailCache`]). `None` unless the paragraph is a leading run of
+/// ASCII-alnum/space/tab text, then a `**` run of EXACTLY two `*` flanked by
+/// ASCII-alnum bytes on both sides (a sufficient condition for the `**` to both
+/// open and close, keeping the mod-3 rule live), then a body that
+/// [`mod3_body_scan`] settles. Callers gate this only on `ParagraphCache` having
+/// failed to arm (the pin condition); emphasis is always on, so no config gate.
+fn build_mod3_tail_cache(buffer: &str, start: usize, id: u64) -> Option<Mod3TailCache> {
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    // Leading inert text (no `*`), up to the first `*`.
+    let mut i = start;
+    while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    // The `**` opener must be flanked by ASCII-alnum on both sides: the left one
+    // (non-space, non-punct) gives can-close, the right one gives can-open, so the
+    // mod-3 rule blocks every single-`*` closer. This also forbids a `*` neighbor
+    // (so the run is exactly two) and a leading/space-preceded `**` (can-close
+    // would be false — a real streaming bold, which the full path owns).
+    if i == start || !bytes[i - 1].is_ascii_alphanumeric() {
+        return None;
+    }
+    if bytes.get(i) != Some(&b'*') || bytes.get(i + 1) != Some(&b'*') {
+        return None;
+    }
+    match bytes.get(i + 2) {
+        Some(&c) if c.is_ascii_alphanumeric() => {}
+        _ => return None,
+    }
+    let settled = mod3_body_scan(bytes, i + 2, len)?;
+    let mut body = String::with_capacity(settled - start);
+    escape_html(&buffer[start..settled], &mut body);
+    Some(Mod3TailCache { start, id, settled, body })
 }
 
 /// Arm the paragraph cache for the open paragraph at `start`, rendering its

@@ -1093,3 +1093,108 @@ fn raw_tag_tail_cache_mode_interaction() {
     e.append(md);
     assert!(visible_text(&collect(&e)).contains("<a href="), "escape mode must not suppress the tag");
 }
+
+// ---------------------------------------------------------------------------
+// Mod3TailCache (delimiter-stack-mod3-rescan) — the `a**bc* c* …` soup. A lone
+// `**` (can-open AND can-close) that every later single `*` is mod-3-blocked
+// from closing stays an unpaired opener, pinning the commit cut at 0. While the
+// `**` is the sole opener the paragraph is all-literal, so the cache carries the
+// open view; it must mirror the full path byte-for-byte at every chunk split and
+// DROP the instant a byte could restructure the render. `assert_sweep`
+// (char-by-char + a 2-chunk sweep at every boundary, open view AND finalize) is
+// the strongest mid-stream stress.
+// ---------------------------------------------------------------------------
+
+/// The mod3 cache is config-independent (emphasis is always on); the richest
+/// base config (autolinks + alerts + math) also exercises the autolink boundary
+/// probe after the soup's `*`/space bytes.
+fn make_mod3() -> StreamParser {
+    StreamParser::new()
+        .with_gfm_alerts(true)
+        .with_gfm_autolinks(true)
+        .with_gfm_math(true)
+}
+
+#[test]
+fn mod3_tail_cache_parity_and_drops() {
+    let make = make_mod3;
+    let cases = [
+        // Fast path engaged, never drops (every later `*` is a mod-3-blocked
+        // single closer followed by a space).
+        "a**bc* c* c* c* c* ",
+        "a**bc* c* c* c* c*",   // trailing `*` at EOF (pending, literal)
+        "a**bc* c* c",          // trailing inert byte
+        "a**b",                 // just the opener + one byte
+        "a**world giant word",  // words + spaces, no closers
+        // Retro-pair drops: a real `**`/`***`/`_`/`~`/entity/opener/newline
+        // arrives and the cache must drop to the full path (which re-renders the
+        // whole prefix byte-identically — a `<strong>`, an `<em>`, a `<del>`, …).
+        "a**bc**",              // `**` closer -> <strong>
+        "a**bc** and more c* ", // strong then trailing soup
+        "a**b***c",             // `***` run
+        "a**bc*x",              // single `*` a non-space follows -> could open
+        "a**bc* *word*",        // a real `*…*` emphasis pair later
+        "a**bc* _under_ c*",    // `_` emphasis mixed in
+        "a**bc* ~strike~ c*",   // `~` strikethrough mixed in
+        "a**bc* &amp; c*",      // an entity opener
+        "a**bc* `code` c*",     // a code span opener
+        "a**bc* [link](u) c*",  // a link opener
+        "a**bc* $x$ c*",        // inline math opener
+        "a**béc* c*",           // non-ASCII body byte -> drop
+        // Newline drops: soup then a blank line, and soup then a soft newline +
+        // more prose (the single-line paragraph splits / closes).
+        "a**bc* c*\n\nsecond para",
+        "a**bc* c*\nlazy continuation line with **b** and more",
+        "a**bc* c*  \nhard break tail",   // 2 trailing spaces before \n
+        // Not our shape (must never engage, but must still be parity-clean):
+        // a space before `**` makes it can-open-only (real streaming bold).
+        "hello **world**",
+        "a **b c* d",
+    ];
+    for md in cases {
+        assert_sweep(&make, md);
+    }
+}
+
+#[test]
+fn mod3_tail_cache_pending_star_phases_across_chunk_boundary() {
+    // The pending-suffix path: a `*` landing on a chunk boundary must be held
+    // (rendered literally in the open view), NOT force a drop — otherwise the
+    // soup's 3-byte period vs. large chunks would re-quadratic. Drive all three
+    // phases of "c* " (`c`, `*`, ` `) across an explicit 2-chunk boundary.
+    let one = |md: &str| {
+        let mut p = make_mod3();
+        p.append(md);
+        collect(&p)
+    };
+    let mut p = make_mod3();
+    p.append("a**bc*"); // trailing `*` pending (single, at edge)
+    assert_eq!(collect(&p), one("a**bc*"), "trailing `*` held pending, literal");
+    p.append(" "); // the space settles the pending `*` as a closer
+    assert_eq!(collect(&p), one("a**bc* "), "space settles the pending `*`");
+    p.append("c"); // more body
+    assert_eq!(collect(&p), one("a**bc* c"), "body byte after the settled `*`");
+    p.append("*"); // next `*` pending again
+    assert_eq!(collect(&p), one("a**bc* c*"), "next `*` held pending");
+    p.append("*"); // grows to `**` -> a decided closer pairs -> drop -> <strong>
+    assert_eq!(collect(&p), one("a**bc* c**"), "grown `**` retro-pairs to <strong>");
+}
+
+#[test]
+fn mod3_tail_cache_retro_strong_across_chunk_boundary() {
+    // Stream the open soup, then land a `**` closer in its own chunk: the fast
+    // path was engaged, the closer arrives, the cache drops, and the open view
+    // equals a one-shot append of the whole prefix (`a<strong>bc… </strong>`).
+    let one = |md: &str| {
+        let mut p = make_mod3();
+        p.append(md);
+        collect(&p)
+    };
+    let mut p = make_mod3();
+    p.append("a**bc* c* c");
+    assert_eq!(collect(&p), one("a**bc* c* c"), "open soup before the close");
+    p.append("**"); // valid `**` closer (non-space `c` to its left) — retro-pair
+    assert_eq!(collect(&p), one("a**bc* c* c**"), "closed <strong> after retro-pair");
+    p.append(" then *plain* text"); // trailing prose (with emphasis) after the close
+    assert_eq!(collect(&p), one("a**bc* c* c** then *plain* text"), "prose after close");
+}
