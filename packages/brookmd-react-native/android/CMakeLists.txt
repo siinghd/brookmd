@@ -8,13 +8,19 @@ project(brookmd-react-native)
 set(CMAKE_VERBOSE_MAKEFILE ON)
 set(CMAKE_CXX_STANDARD 17)
 
-# Locate the uniffi-bindgen-react-native runtime C++ headers.
+# Locate the uniffi-bindgen-react-native package root (its runtime C++ headers
+# live under cpp/includes). ubrn 0.31's package.json does NOT export the
+# "./package.json" subpath, so `require.resolve('.../package.json')` throws
+# ERR_PACKAGE_PATH_NOT_EXPORTED once Node enforces "exports" (Node >= 22),
+# yielding an empty path and a bogus `-I/cpp/includes`. Resolve the main entry
+# instead (always exported) and slice back to the package root — a single
+# expression (no ';', which CMake would treat as a list separator) that is
+# independent of the entry's directory depth.
 execute_process(
-  COMMAND node -p "require.resolve('uniffi-bindgen-react-native/package.json')"
+  COMMAND node -p "require.resolve('uniffi-bindgen-react-native').split(require('path').sep+'uniffi-bindgen-react-native'+require('path').sep)[0]+require('path').sep+'uniffi-bindgen-react-native'"
   OUTPUT_VARIABLE UNIFFI_BINDGEN_PATH
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-get_filename_component(UNIFFI_BINDGEN_PATH "${UNIFFI_BINDGEN_PATH}" DIRECTORY)
 
 include_directories(
   ../cpp

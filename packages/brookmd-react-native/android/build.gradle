@@ -47,8 +47,17 @@ android {
       }
     }
     // Ships jniLibs/<abi>/libbrook_md_ffi.so, built by scripts/build-android.sh.
+    // Honor RN's `reactNativeArchitectures` selector (so `-PreactNativeArchitectures=x86_64`
+    // builds a single ABI for CI / a single-target consumer) intersected with the
+    // ABIs we actually ship a .so for — the intersection drops e.g. `x86`, which the
+    // default property lists but we do not build. Defaults to all shipped ABIs when
+    // the property is unset.
     ndk {
-      abiFilters "arm64-v8a", "armeabi-v7a", "x86_64"
+      def shippedAbis = ["arm64-v8a", "armeabi-v7a", "x86_64"]
+      def requestedAbis = rootProject.hasProperty("reactNativeArchitectures")
+        ? rootProject.getProperty("reactNativeArchitectures").split(",").collect { it.trim() }
+        : shippedAbis
+      abiFilters(*shippedAbis.intersect(requestedAbis))
     }
   }
 
