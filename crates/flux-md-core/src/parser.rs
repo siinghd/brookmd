@@ -365,6 +365,11 @@ pub struct StreamParser {
     /// growing (see [`FenceInfoCache`] — output depends only on the settled
     /// first info word, so it is frozen).
     fence_info_cache: Option<FenceInfoCache>,
+    /// Fast path for a paragraph that is one open, unclosed inline-math span
+    /// opened by an unmatched single `$` at the paragraph start — the `$x $x …`
+    /// soup where the commit cut is pinned at 0 (a future closer could pair
+    /// back) so no [`ParagraphCache`] can arm (see [`DollarTailCache`]).
+    dollar_tail_cache: Option<DollarTailCache>,
 }
 
 #[derive(Default)]
@@ -520,6 +525,39 @@ struct ParagraphCache {
     /// Incremental footnote NUMBERING over the paragraph region (see
     /// [`RegionFnNums`]). Inert when footnotes are off.
     fn_nums: RegionFnNums,
+}
+
+/// Incremental render state for an open paragraph that is one speculative,
+/// still-unclosed single-`$` inline-math span running from the paragraph start
+/// to EOF — the `$x $x $x …` soup (a streaming LLM formula, currency-ish prose).
+///
+/// The commit cut is genuinely pinned at the opener: any `$` appended later with
+/// a non-space to its left is a valid closer, and the first `$` would then pair
+/// forward across the ENTIRE run, so nothing before EOF is ever final. No
+/// [`ParagraphCache`] can arm (its cut would be 0), so today every append
+/// re-scans + re-renders the whole growing paragraph — O(n²) on both counters.
+///
+/// But while the span stays open its rendered form is fixed: `<span class="math
+/// math-inline">` + `escape_html(body)` + `</span>`, where `body` is every byte
+/// after the opener. `escape_html` is a context-free per-byte map, so `body`
+/// extends by appending `escape_html(new bytes)` — O(new bytes) per append. The
+/// guard (see [`dollar_span_stays_open`] / [`build_dollar_tail_cache`])
+/// engages ONLY while the span is provably still open and the paragraph is still
+/// a single tail line; the moment a valid closer, a newline, or a `$$` run
+/// appears the cache drops and the full reparse takes over (byte-identical). At
+/// finalize (open_tail off) the fast paths are skipped, so the span resolves to
+/// literal `$`s exactly as the one-shot oracle does.
+struct DollarTailCache {
+    /// Absolute byte offset of the opening `$` (== the paragraph start).
+    start: usize,
+    /// Stable id of the paragraph block.
+    id: u64,
+    /// Absolute offset; `math == escape_html(buffer[start + 1 .. scanned])` and
+    /// `buffer[start .. scanned]` is newline-free with no valid closer. Advances
+    /// by the appended bytes each engagement.
+    scanned: usize,
+    /// Escaped inline-math body rendered so far (`escape_html(buffer[start+1..scanned])`).
+    math: String,
 }
 
 /// Incremental render state for a single open GFM table at the tail. Streaming
@@ -1328,6 +1366,7 @@ impl StreamParser {
             heading_cache: None,
             rule_cache: None,
             fence_info_cache: None,
+            dollar_tail_cache: None,
         }
     }
 
@@ -1603,6 +1642,9 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_paragraph() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_dollar_tail() {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_table() {
@@ -2152,6 +2194,7 @@ impl StreamParser {
         self.heading_cache = None;
         self.rule_cache = None;
         self.fence_info_cache = None;
+        self.dollar_tail_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -2200,6 +2243,17 @@ impl StreamParser {
                             &self.committed_footnote_occurrences,
                             self.next_footnote,
                         );
+                        // When the commit cut is pinned at the paragraph start by
+                        // an unmatched single `$` opener (the `$x $x …` soup — a
+                        // future closer could pair all the way back, so nothing
+                        // ever commits), the paragraph cache can't arm. Arm the
+                        // dollar-tail fast path instead: the whole open block is
+                        // one speculative inline-math span whose escaped body just
+                        // grows, so it extends in O(new bytes).
+                        if self.para_cache.is_none() && self.gfm_math {
+                            self.dollar_tail_cache =
+                                build_dollar_tail_cache(&self.buffer, start, new_active[0].id);
+                        }
                     }
                     // Footnotes stay ARMED: the cache renders refs as
                     // occurrence-INDEPENDENT placeholder tokens (see
@@ -2833,6 +2887,66 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.para_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of an open single-`$` inline-math span at the tail
+    /// (the `$x $x …` soup — see [`DollarTailCache`]). While the span stays open
+    /// its render is `<p><span class="math math-inline">escape_html(body)</span></p>`,
+    /// and `escape_html` is a context-free per-byte map, so the escaped body just
+    /// grows by the appended bytes. Returns `None` (dropping the cache) the moment
+    /// the span could have closed / split — a newline, a valid `$` closer, or the
+    /// block no longer being the sole tail — so the full reparse handles it,
+    /// byte-identically.
+    fn try_incremental_dollar_tail(&mut self) -> Option<Patch> {
+        let mut cache = self.dollar_tail_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // The paragraph must still be the sole tail block (only whitespace before
+        // it, nothing committed past its start).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Fold only the appended bytes. The span drops the moment they add a
+        // newline (the single line becomes multi-line — the full path handles
+        // the split) or a valid `$` closer (the opener pairs forward, so the
+        // span is no longer speculative-open). `cache.scanned >= cache.start + 2`
+        // (the opener plus a non-`$` body byte, guaranteed at arm), so the closer
+        // check's `i - 1` lookback stays strictly right of the opener.
+        if len > cache.scanned {
+            if !dollar_span_stays_open(bytes, cache.start, cache.scanned, len) {
+                return None;
+            }
+            escape_html(&self.buffer[cache.scanned..len], &mut cache.math);
+            cache.scanned = len;
+        }
+        // `<p><span class="math math-inline">body</span></p>` — `render_paragraph`'s
+        // opener + a single speculative-open math span; its trailing-whitespace
+        // trim is a no-op (the inner always ends in `</span>`).
+        let mut html = String::with_capacity(cache.math.len() + 48);
+        html.push_str("<p");
+        // Mirrors `RenderOpts::dir()` (static — independent of content).
+        if self.dir_auto {
+            html.push_str(" dir=\"auto\"");
+        }
+        html.push_str("><span class=\"math math-inline\">");
+        html.push_str(&cache.math);
+        html.push_str("</span></p>");
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Paragraph,
+            start: cache.start,
+            end: len,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.dollar_tail_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
 
@@ -5797,6 +5911,59 @@ fn assemble_open_item(
     }
     out.push_str("</li>");
     out.push('\n');
+}
+
+/// Scan `bytes[from..to]` — the body of an open single-`$` inline-math span
+/// whose opener sits at `opener` (`from > opener`) — for anything that would end
+/// the speculative-open span. Returns `true` while it provably stays open:
+///
+/// * a `\n`/`\r` ends the single-line paragraph (multi-line dollar runs are out
+///   of scope — the full path handles them), and
+/// * a `$` with a non-whitespace byte immediately to its left is a valid inline
+///   closer (the pandoc rule; the 2nd `$` of a `$$` run trips this too, so
+///   display-math runs also drop). Any such `$` pairs the opener forward, so the
+///   span is no longer open. The digit-after refinement in `build_dollar_index`
+///   is deliberately NOT applied here: treating every non-space-preceded `$` as a
+///   closer only ever OVER-drops (falling back to the byte-identical full path),
+///   never under-drops, and the `$x $x …` soup never trips it (every inner `$`
+///   is space-preceded).
+fn dollar_span_stays_open(bytes: &[u8], opener: usize, from: usize, to: usize) -> bool {
+    debug_assert!(from > opener);
+    let mut i = from;
+    while i < to {
+        match bytes[i] {
+            b'\n' | b'\r' => return false,
+            b'$' if !matches!(bytes[i - 1], b' ' | b'\t' | b'\n' | b'\r') => return false,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Arm the dollar-tail cache when the open paragraph at `start` is one still-open
+/// single-`$` inline-math span running to EOF (see [`DollarTailCache`]). `None`
+/// unless the first byte is a `$` opening a valid single-`$` span (a non-space,
+/// non-`$` byte to its right — `$$` is display math) whose newline-free body
+/// carries no valid closer yet. Callers gate this on `gfm_math`.
+fn build_dollar_tail_cache(buffer: &str, start: usize, id: u64) -> Option<DollarTailCache> {
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    if bytes.get(start) != Some(&b'$') {
+        return None;
+    }
+    // Single-`$` opener rule (pandoc): the next byte must exist and be a
+    // non-space; exclude `$$` (display math — the full path owns it).
+    match bytes.get(start + 1) {
+        None | Some(&(b'$' | b' ' | b'\t' | b'\n' | b'\r')) => return None,
+        _ => {}
+    }
+    if !dollar_span_stays_open(bytes, start, start + 1, len) {
+        return None;
+    }
+    let mut math = String::with_capacity(len - start);
+    escape_html(&buffer[start + 1..len], &mut math);
+    Some(DollarTailCache { start, id, scanned: len, math })
 }
 
 /// Arm the paragraph cache for the open paragraph at `start`, rendering its

@@ -655,12 +655,14 @@ fn mod3_soup(target: usize) -> String {
     s
 }
 
-/// dollar-math-eof-rescan (per-render FIXED via precomputed closer tables;
-/// streaming pin remains): every `$` is a valid opener whose candidate closers
-/// are all invalid, so each opener used to scan to EOF (O(n²) inside one
-/// render). Memoized next-valid-closer lookup makes one render linear; the
-/// paragraph cut stays semantically pinned (a future closer could pair back),
-/// so streaming is counter-bounded quadratic.
+/// dollar-math-eof-rescan (FIXED — per-render via precomputed closer tables AND
+/// streaming via the DollarTailCache): every `$` is a valid opener whose
+/// candidate closers are all invalid, so each opener used to scan to EOF (O(n²)
+/// inside one render). Memoized next-valid-closer lookup makes one render linear;
+/// the paragraph cut stays semantically pinned (a future closer could pair back)
+/// so no ParagraphCache can arm — but the whole open block is a single
+/// speculative math span whose escaped body just grows, so the DollarTailCache
+/// extends it in O(new bytes) and streaming is linear on both metrics.
 fn dollar_soup(target: usize) -> String {
     let mut s = String::with_capacity(target + 8);
     while s.len() < target {
@@ -1087,6 +1089,19 @@ fn shapes() -> Vec<Shape> {
         scanned: KnownQuadratic,
         rendered: KnownQuadratic,
     });
+    // dollar-math-eof-rescan: FIXED on BOTH metrics. The `$x $x …` soup is one
+    // open, unclosed single-`$` inline-math span from the paragraph start to EOF
+    // (every inner `$` is space-preceded, so none is a valid closer; the opener
+    // could still pair forward, so the commit cut is genuinely pinned at 0 and no
+    // ParagraphCache can arm). While the span stays open its render is fixed —
+    // `<span class="math math-inline">` + escape_html(body) + `</span>` — and
+    // escape_html is a context-free per-byte map, so the DollarTailCache extends
+    // the escaped body by only the appended bytes (O(new)); the slow-path tail
+    // rescan (scanned) and whole-paragraph re-render (rendered) are both gone.
+    // The guard drops to the byte-identical full path the moment a newline, a
+    // valid `$` closer, or a `$$` run appears (real math closes once per formula
+    // → amortized linear). Small span retained from its former super-quadratic
+    // days; it now sits comfortably linear (~7x over the 8x span).
     v.push(Shape {
         name: "dollar-math-eof-rescan",
         gen: dollar_soup,
@@ -1094,8 +1109,8 @@ fn shapes() -> Vec<Shape> {
         chunk: CHUNK,
         small: 1024,
         large: 8 * 1024,
-        scanned: KnownQuadratic,
-        rendered: KnownQuadratic,
+        scanned: Linear,
+        rendered: Linear,
     });
     // blockdata-disables-container-cache: FIXED — the ContainerBlockCache owns
     // `block_data` now (nested `ContainerData` per committed inner block);

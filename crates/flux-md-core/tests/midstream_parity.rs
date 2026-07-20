@@ -549,6 +549,82 @@ fn speculative_inline_dollar_math_golden() {
 }
 
 #[test]
+fn dollar_tail_cache_parity_and_drops() {
+    // The DollarTailCache linearizes the `$x $x …` soup: an open single-`$`
+    // inline-math span whose escaped body just grows. It must stay byte-identical
+    // to the full path at every chunk boundary, and DROP the instant the span
+    // could have closed or restructured — a valid `$` closer, a `$$` run, an
+    // escaped `$`, or a newline. `assert_parity_m` (char-by-char + empty append)
+    // is the strongest mid-stream stress; a 2-chunk sweep pins the retro-close
+    // and drop transitions across an arbitrary boundary.
+    let cases = [
+        // Fast path engaged, never drops (every inner `$` is space-preceded).
+        "$x $x $x $x ",
+        "$x $x $ *emph inside is math text* $x ",
+        // A `*` inside the OPEN span is opaque math text (no emphasis) — the
+        // fast path need NOT drop for it (it can never reach across the `$`).
+        "$x $x *b* $x ",
+        // Retro-close: a trailing `$` with a non-space to its left closes the
+        // span (the opener pairs forward), so the cache must drop to the full
+        // path — which, at this open prefix, renders the CLOSED span.
+        "$a b c$",
+        "$x $x $x$",
+        "$x^2 + y^2$ then plain *emphasized* text",
+        // An escaped `$` — the `\$`'s `$` (backslash to its left) is a closer
+        // candidate to the raw math scanner, so the guard drops.
+        "$x \\$y closes",
+        // A `$$` run appears — display math; the guard drops.
+        "$x $$y",
+        // A newline — the single-line span becomes multi-line; the guard drops.
+        "$x $x\nmore text",
+        // Currency prose: the engine's opener guard is only "non-space to the
+        // right" (the digit rule is closer-side), so `$5` DOES open a
+        // speculative span mid-stream — the cache arms and must mirror it.
+        "$5 and $10 left over",
+    ];
+    for md in cases {
+        assert_parity_m(md);
+        for cut in 1..md.len() {
+            if !md.is_char_boundary(cut) {
+                continue;
+            }
+            let mut p = make_math();
+            p.append(&md[..cut]);
+            p.append(&md[cut..]);
+            assert_eq!(
+                collect(&p),
+                one_shot_open_m(md),
+                "2-chunk open view split at {cut} != one-shot for {md:?}"
+            );
+            // Finalize must be chunk-independent regardless of where the cache
+            // engaged/dropped (the ironclad invariant).
+            p.finalize();
+            let one = {
+                let mut q = make_math();
+                q.append(md);
+                q.finalize();
+                collect(&q)
+            };
+            assert_eq!(collect(&p), one, "finalize split at {cut} != one-shot for {md:?}");
+        }
+    }
+}
+
+#[test]
+fn dollar_tail_cache_retro_close_across_chunk_boundary() {
+    // Stream the open span, then land the closing `$` in its OWN chunk: the fast
+    // path was engaged, the closer arrives, the cache drops, and the resulting
+    // open view equals a one-shot append of the whole prefix.
+    let mut p = make_math();
+    p.append("$a b c");
+    assert_eq!(collect(&p), one_shot_open_m("$a b c"), "open span before close");
+    p.append("$"); // valid closer (non-space `c` to its left) — retro-close
+    assert_eq!(collect(&p), one_shot_open_m("$a b c$"), "closed span after retro-close");
+    p.append(" tail *word*"); // trailing prose (with emphasis) after the close
+    assert_eq!(collect(&p), one_shot_open_m("$a b c$ tail *word*"), "prose after close");
+}
+
+#[test]
 fn speculative_inline_latex_math_golden() {
     // Open `\(a+b\)` (no closer yet): resolved inline-math span over the partial
     // body, opening `\(` hidden, no raw `\(` as visible text.
