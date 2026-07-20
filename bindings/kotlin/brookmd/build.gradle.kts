@@ -17,6 +17,8 @@ android {
 
     defaultConfig {
         minSdk = 24
+        // Instrumented (androidTest) runner for the on-device/emulator wire goldens.
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     compileOptions {
@@ -36,4 +38,12 @@ dependencies {
     // uniffi's generated Kotlin talks to the native library through JNA. On
     // Android the .aar classifier is required (it ships the JNI dispatch libs).
     implementation("net.java.dev.jna:jna:5.14.0@aar")
+
+    // Instrumented (androidTest) wire goldens, run on an x86_64 emulator in
+    // device-validate.yml. androidx.test.ext:junit vends AndroidJUnit4 (+ JUnit4);
+    // androidx.test:runner vends AndroidJUnitRunner (the testInstrumentationRunner
+    // above). kotlin("test") supplies the assertEquals/assertTrue helpers.
+    androidTestImplementation("androidx.test:runner:1.5.2")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation(kotlin("test"))
 }

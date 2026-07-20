@@ -8,8 +8,10 @@ the WASM/JS boundary.
 
 > **Status: EXPERIMENTAL.** The bindings compile and pass the wire-golden
 > XCTest suite in CI (`bindings-build.yml`, macOS runner) against a locally
-> built XCFramework. Not yet published; not device-validated beyond the CI
-> macOS host slice.
+> built XCFramework, and the same suite runs on an **iOS Simulator** via
+> `xcodebuild test` in CI (`device-validate.yml`, ios-simulator slice). What
+> remains truly device-only is physical-hardware behavior and RN app-level
+> integration. Not yet published.
 
 ## What's here
 

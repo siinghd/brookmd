@@ -1,0 +1,135 @@
+name: device-validate
+
+# Device-class validation for the first-party uniffi bindings: the same wire
+# goldens the host jobs (bindings-build.yml) run on the JVM / macOS host, but now
+# executed inside real Android + Apple runtimes.
+#
+#   * android-emulator — instrumented test (androidx.test / JUnit4) driving the
+#     generated BrookSession through a hardware-accelerated x86_64 emulator, with
+#     libbrook_md_ffi.so packaged into the self-instrumenting test APK.
+#   * ios-simulator    — the XCTest wire goldens run on an iOS Simulator via
+#     `xcodebuild test` against the locally built XCFramework's ios-simulator slice.
+#
+# What is NOT covered here (still truly device-only): behavior on physical
+# hardware (real ABIs/GPUs/thermals) and app-level React-Native integration.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/brookmd-ffi/**"
+      - "crates/brookmd-core/**"
+      - "bindings/**"
+      - ".github/workflows/device-validate.yml"
+
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref (emulator/simulator jobs are slow).
+concurrency:
+  group: device-validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-emulator:
+    name: android (emulator instrumented goldens)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + x86_64 Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # Hosted ubuntu runners ship an Android NDK; point cargo-ndk at the latest.
+      - name: Resolve NDK
+        run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+
+      # Only the emulator ABI (x86_64) is needed. Drop the release .so into the
+      # library module's jniLibs; AGP then packages it into the test APK. Mirrors
+      # the per-ABI build/cp in packages/brookmd-react-native/scripts/build-android.sh.
+      - name: Build x86_64 device .so into the library module jniLibs
+        run: |
+          ( cd crates/brookmd-ffi && cargo ndk --target x86_64-linux-android --platform 24 -- build --release )
+          mkdir -p bindings/kotlin/brookmd/src/main/jniLibs/x86_64
+          cp crates/brookmd-ffi/target/x86_64-linux-android/release/libbrook_md_ffi.so \
+             bindings/kotlin/brookmd/src/main/jniLibs/x86_64/libbrook_md_ffi.so
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Pin Gradle to match KGP 2.0.21 / AGP 8.5.2 (needs >= 8.7, predates 9), as
+      # bindings-build.yml does. Puts `gradle` on PATH for the emulator script step.
+      - name: Install Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      # Required for the hardware-accelerated (KVM) emulator on ubuntu runners.
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run instrumented wire goldens on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: gradle -p bindings/kotlin/brookmd connectedAndroidTest --no-daemon
+
+      - name: Upload connected test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-connected-test-reports
+          path: bindings/kotlin/brookmd/build/reports/androidTests/
+          if-no-files-found: warn
+
+  ios-simulator:
+    name: ios (simulator XCTest goldens)
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable) + Apple targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Builds all Apple slices (incl. the ios-simulator slice the sim links against).
+      - name: Build XCFramework (iOS + iOS-sim + macOS slices)
+        run: bash bindings/swift/scripts/build-xcframework.sh
+
+      # A bare SPM package: no -project/-workspace; xcodebuild reads Package.swift
+      # from the working directory. `-scheme BrookMd` (the library product) runs the
+      # package's test target on the iOS Simulator. `-list` first for diagnostics.
+      - name: Run XCTest wire goldens on the iOS Simulator
+        working-directory: bindings/swift
+        run: |
+          xcodebuild -list
+          xcodebuild test \
+            -scheme BrookMd \
+            -destination 'platform=iOS Simulator,name=iPhone 15,OS=latest' \
+            -resultBundlePath TestResults.xcresult
+
+      - name: Upload xcresult bundle
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-simulator-xcresult
+          path: bindings/swift/TestResults.xcresult
+          if-no-files-found: warn

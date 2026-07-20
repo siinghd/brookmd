@@ -8,8 +8,11 @@ Markdown and returns the JSON **wire strings** defined in
 WASM/JS boundary.
 
 > **Status: EXPERIMENTAL.** The generated bindings compile and pass the
-> wire-golden smoke tests on the **JVM host** in CI (`bindings-build.yml`). They
-> are **not yet device-validated** on Android and **not published** to Maven.
+> wire-golden smoke tests on the **JVM host** in CI (`bindings-build.yml`) and,
+> as an instrumented test, on an **Android emulator** (x86_64) in CI
+> (`device-validate.yml`) — same goldens, same code, loaded via JNA in an Android
+> runtime. What remains truly device-only is physical-hardware behavior and RN
+> app-level integration. Still **not published** to Maven.
 
 ## What's here
 
