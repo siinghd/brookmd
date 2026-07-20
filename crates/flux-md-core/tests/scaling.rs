@@ -397,9 +397,10 @@ fn fence_giant_info(target: usize) -> String {
     s
 }
 
-/// KNOWN O(n²): a blockquote whose FIRST line never completes — both container
-/// caches require a complete first line (Blockquote-vs-Alert isn't settled),
-/// so every append full-rescans the growing tail.
+/// A blockquote whose FIRST line never completes. Once its content diverges from
+/// every alert marker the container cache arms mid-line, so the slow-path tail
+/// reparse is gone (scanned linear); its open paragraph still re-renders each
+/// append (rendered quadratic — the ContainerCache commits per complete line).
 fn quote_giant_line(target: usize) -> String {
     let mut s = String::from("> ");
     while s.len() < target {
@@ -408,7 +409,8 @@ fn quote_giant_line(target: usize) -> String {
     s
 }
 
-/// KNOWN O(n²): same first-line bail, single giant CJK line (no spaces).
+/// Same mid-line arm, single giant CJK line (no spaces): same scanned-linear /
+/// rendered-quadratic profile as `quote_giant_line`.
 fn bq_cjk_one_line(target: usize) -> String {
     let mut s = String::from("> ");
     while s.len() < target {
@@ -1057,10 +1059,19 @@ fn shapes() -> Vec<Shape> {
         // blockdata-per-append-rebuild: FIXED — the armed caches derive the data
         // channel from the raw source / Rc-shared committed entries; promoted to
         // the blockdata_* linear twins above.
-        // Residual first-line-incomplete container pins (both container caches
-        // need a complete first line before Blockquote-vs-Alert settles).
-        quad("container-first-line-pin", quote_giant_line, base, KnownQuadratic, KnownQuadratic),
-        quad("container-first-line-pin-cjk", bq_cjk_one_line, base, KnownQuadratic, KnownQuadratic),
+        // container-first-line-pin(+cjk): SCANNED fixed — both container caches
+        // now arm MID-LINE once the partial first line can no longer become an
+        // alert marker (`first_line_alert_undecided`), so the O(n²) slow-path tail
+        // reparse (block scan + classify + render_block of the growing quote every
+        // append) is gone. RENDERED stays quadratic: the plain ContainerCache
+        // commits inner content only at COMPLETE-line boundaries — the trailing
+        // partial line is rendered speculatively then truncated back each append
+        // (so a later lazy continuation / blank close can still reinterpret it),
+        // so a first line that NEVER completes keeps its whole open paragraph in
+        // the re-rendered region. Wall-only inline re-render (same shape as the
+        // other open-tail pins); the costly block-level rescan is what arming cut.
+        quad("container-first-line-pin", quote_giant_line, base, Linear, KnownQuadratic),
+        quad("container-first-line-pin-cjk", bq_cjk_one_line, base, Linear, KnownQuadratic),
         // list-interior-blank-loose-bail: FIXED — indented_code_with_interior_
         // blanks + loose_subs_one_item + staircase_blank_flap promoted above.
     ];

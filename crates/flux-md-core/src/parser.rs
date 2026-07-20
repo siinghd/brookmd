@@ -41,6 +41,32 @@ fn container_inner_breaks_paragraph(stripped: &[u8], ctx: ScanCtx<'_>) -> bool {
         || parse_link_ref_def(stripped, 0).is_some()
         || indent_cols(stripped) >= 4
 }
+
+/// While an open blockquote's FIRST inner line is still incomplete (no `\n`
+/// yet), can it still resolve to a GitHub alert? `render::alert_head` makes a
+/// blockquote an alert iff its `>`-stripped first line, `str::trim`-med, is
+/// exactly `[!KIND]` (KIND ∈ NOTE/TIP/IMPORTANT/WARNING/CAUTION, upper-case).
+/// So the partial `stripped` content is still "undecided" only while — after
+/// its leading whitespace — it is a prefix of some marker (still being typed),
+/// or a completed marker trailed by whitespace alone. Outside that (≤12-byte)
+/// window the alert is impossible and a Blockquote cache may arm mid-line. A
+/// completed marker is normally already classified as an Alert (which bails on a
+/// missing newline separately); the trailing-whitespace arm keeps the predicate
+/// safe if consulted for it anyway. Non-UTF-8 stays undecided (keeps bailing).
+fn first_line_alert_undecided(stripped: &[u8]) -> bool {
+    const MARKERS: [&str; 5] = ["[!NOTE]", "[!TIP]", "[!IMPORTANT]", "[!WARNING]", "[!CAUTION]"];
+    let core = match std::str::from_utf8(stripped) {
+        Ok(s) => s.trim_start(),
+        Err(_) => return true,
+    };
+    if core.is_empty() {
+        return true;
+    }
+    MARKERS.iter().any(|m| {
+        m.starts_with(core)
+            || core.strip_prefix(m).is_some_and(|rest| rest.chars().all(char::is_whitespace))
+    })
+}
 use crate::inline::{render_inline, render_inline_boundary};
 use crate::url::{escape_attr, escape_html, sanitize_attrs};
 
@@ -3649,14 +3675,26 @@ impl StreamParser {
     ) -> Option<ContainerBlockCache> {
         let bytes = self.buffer.as_bytes();
         let end = bytes.len();
-        // Require a complete first line so Blockquote vs. Alert is settled.
-        let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
-        let first_line_end = start + first_nl;
+        // The Blockquote / Alert split is a first-line decision. A complete first
+        // line settles it (carried in `block_kind`); a partial one arms only a
+        // Blockquote whose content can no longer become an alert marker — see the
+        // per-kind arms. `first_line_end` is the partial line's tail pre-newline.
+        let first_nl = bytes[start..end].iter().position(|&b| b == b'\n');
+        let first_line_end = first_nl.map_or(end, |nl| start + nl);
         if bytes[start..first_line_end].contains(&b'\r') {
             return None;
         }
         let (kind, wrapper_open, wrapper_close, body_leading_nl, content_start) = match block_kind {
             BlockKind::Blockquote(_) => {
+                // Mid-line arm: no newline yet. Bail while the partial first line
+                // could still become an alert marker (else Blockquote-vs-Alert is
+                // unsettled); once impossible, the nested parser streams the
+                // partial inner (incl. block structure) in O(new bytes).
+                if first_nl.is_none()
+                    && first_line_alert_undecided(strip_blockquote_marker(&bytes[start..end])?)
+                {
+                    return None;
+                }
                 let mut w = String::with_capacity(16);
                 w.push_str("<blockquote");
                 w.push_str(opts.dir());
@@ -3670,6 +3708,9 @@ impl StreamParser {
                 )
             }
             BlockKind::Alert { kind: ak, .. } => {
+                // An alert's body starts on line 2, so the `[!KIND]` marker line
+                // must be complete before this cache can arm.
+                first_nl?;
                 let mut w = String::with_capacity(96);
                 w.push_str("<div class=\"markdown-alert markdown-alert-");
                 w.push_str(ak.class());
@@ -5243,10 +5284,12 @@ fn build_container_cache(
 ) -> Option<ContainerCache> {
     let bytes = buffer.as_bytes();
     let end = bytes.len();
-    // Require at least one complete line so the Blockquote / Alert distinction
-    // is settled (a partial first line could later become `[!NOTE]`).
-    let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
-    let first_line_end = start + first_nl;
+    // The Blockquote / Alert distinction is a first-line decision. A complete
+    // first line settles it (carried in `block_kind`); a partial one arms only a
+    // Blockquote whose content can no longer become an alert marker — see the
+    // per-kind arms. `first_line_end` is the partial line's tail pre-newline.
+    let first_nl = bytes[start..end].iter().position(|&b| b == b'\n');
+    let first_line_end = first_nl.map_or(end, |nl| start + nl);
     if bytes[start..first_line_end].contains(&b'\r') {
         return None;
     }
@@ -5259,6 +5302,19 @@ fn build_container_cache(
     let body_p_close = String::from("</p>\n");
     let (kind, wrapper_open, wrapper_close, body_leading_nl, lines_upto) = match block_kind {
         BlockKind::Blockquote(_) => {
+            // Mid-line arm: no newline yet. Bail unless the partial first line can
+            // no longer become an alert marker (`first_line_alert_undecided`) AND
+            // renders as a plain paragraph — structured inner is the
+            // ContainerBlockCache's job (arming here would re-arm-then-bail every
+            // append). A complete first line skips this (nothing left to settle).
+            if first_nl.is_none() {
+                let sc = strip_blockquote_marker(&bytes[start..end])?;
+                if first_line_alert_undecided(sc)
+                    || container_inner_breaks_paragraph(sc, opts.scan_ctx())
+                {
+                    return None;
+                }
+            }
             let mut w = String::with_capacity(32);
             w.push_str("<blockquote");
             w.push_str(opts.dir());
@@ -5266,6 +5322,9 @@ fn build_container_cache(
             (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), true, start)
         }
         BlockKind::Alert { kind: ak, .. } => {
+            // An alert's body starts on line 2, so the `[!KIND]` marker line must
+            // be complete before this cache can arm.
+            first_nl?;
             let mut w = String::with_capacity(96);
             w.push_str("<div class=\"markdown-alert markdown-alert-");
             w.push_str(ak.class());
