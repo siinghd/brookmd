@@ -1,5 +1,5 @@
 {
-  "name": "flux-md-demo",
+  "name": "brookmd-demo",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -11,7 +11,7 @@
   "dependencies": {
     "@types/dompurify": "^3.2.0",
     "dompurify": "^3.4.7",
-    "flux-md": "workspace:*",
+    "brookmd": "workspace:*",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

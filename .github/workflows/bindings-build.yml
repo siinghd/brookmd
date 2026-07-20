@@ -1,7 +1,7 @@
 name: bindings-build
 
 # Builds and tests the first-party Swift + Kotlin uniffi bindings generated from
-# `crates/flux-md-ffi`. The `ffi-test` job also closes a gap: the FFI crate's own
+# `crates/brookmd-ffi`. The `ffi-test` job also closes a gap: the FFI crate's own
 # `cargo test` / `clippy` run nowhere else today. `kotlin` and `swift` regenerate
 # the committed bindings (drift check) and run the wire-golden smoke tests on the
 # host — the JVM on ubuntu, the macOS slice on macos-14. Device targets are not
@@ -9,8 +9,8 @@ name: bindings-build
 on:
   pull_request:
     paths:
-      - "crates/flux-md-ffi/**"
-      - "crates/flux-md-core/**"
+      - "crates/brookmd-ffi/**"
+      - "crates/brookmd-core/**"
       - "bindings/**"
       - ".github/workflows/bindings-build.yml"
   workflow_dispatch:
@@ -31,12 +31,12 @@ jobs:
           components: clippy
 
       - name: cargo test
-        working-directory: crates/flux-md-ffi
+        working-directory: crates/brookmd-ffi
         run: cargo test
 
       # `--features cli` also builds/lints the in-crate bindgen bins.
       - name: cargo clippy
-        working-directory: crates/flux-md-ffi
+        working-directory: crates/brookmd-ffi
         run: cargo clippy --all-targets --features cli -- -D warnings
 
   kotlin:
@@ -54,13 +54,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # Builds the host cdylib (libflux_md_ffi.so) AND regenerates the Kotlin
+      # Builds the host cdylib (libbrook_md_ffi.so) AND regenerates the Kotlin
       # bindings from the release staticlib.
       - name: Regenerate Kotlin bindings
         run: bash bindings/kotlin/scripts/generate.sh
 
       - name: Drift check (generated Kotlin matches committed)
-        run: git diff --exit-code bindings/kotlin/fluxmd/src/main/kotlin
+        run: git diff --exit-code bindings/kotlin/brookmd/src/main/kotlin
 
       # Pin Gradle instead of trusting the runner image: the build files target
       # KGP 2.0.21 / AGP 8.5.2, which need Gradle >= 8.7 but predate Gradle 9.
@@ -69,18 +69,18 @@ jobs:
         with:
           gradle-version: "8.10.2"
 
-      # JNA loads libflux_md_ffi.so from jna.library.path; generate.sh built it here.
+      # JNA loads libbrook_md_ffi.so from jna.library.path; generate.sh built it here.
       - name: JVM host golden test
         run: >
           gradle -p bindings/kotlin/host-test test --no-daemon
-          -Djna.library.path=${{ github.workspace }}/crates/flux-md-ffi/target/release
+          -Djna.library.path=${{ github.workspace }}/crates/brookmd-ffi/target/release
 
       # Best-effort AAR assembly: jniLibs are empty (device .so come from the RN
       # package's build-android.sh / release artifacts), so this validates the
       # library module configures and packages, not a device build. Non-fatal.
       - name: Assemble Android AAR (best-effort, jniLibs empty)
         continue-on-error: true
-        run: gradle -p bindings/kotlin/fluxmd assembleRelease --no-daemon
+        run: gradle -p bindings/kotlin/brookmd assembleRelease --no-daemon
 
   swift:
     name: swift (drift + XCFramework + swift test)
@@ -97,7 +97,7 @@ jobs:
         run: bash bindings/swift/scripts/generate.sh
 
       - name: Drift check (generated Swift matches committed)
-        run: git diff --exit-code bindings/swift/Sources/FluxMd/flux_md_ffi.swift
+        run: git diff --exit-code bindings/swift/Sources/BrookMd/brook_md_ffi.swift
 
       - name: Build XCFramework (iOS + iOS-sim + macOS slices)
         run: bash bindings/swift/scripts/build-xcframework.sh
@@ -108,6 +108,6 @@ jobs:
       - name: Upload XCFramework
         uses: actions/upload-artifact@v4
         with:
-          name: flux-md-ffi-swift-xcframework
-          path: bindings/swift/Frameworks/flux_md_ffi.xcframework
+          name: brookmd-ffi-swift-xcframework
+          path: bindings/swift/Frameworks/brook_md_ffi.xcframework
           if-no-files-found: error

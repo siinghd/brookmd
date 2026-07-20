@@ -4,10 +4,10 @@ name: Publish to npm
 # and publish to npm via OIDC TRUSTED PUBLISHING — no NPM_TOKEN secret, ever.
 #
 # ── ONE-TIME SETUP (npmjs.com) ──────────────────────────────────────────────
-# On npmjs.com → the `flux-md` package → Settings → Trusted Publishers → add a
+# On npmjs.com → the `brookmd` package → Settings → Trusted Publishers → add a
 # GitHub Actions publisher:
 #     Organization or user: siinghd
-#     Repository:           flux-md
+#     Repository:           brookmd
 #     Workflow filename:    publish.yml     (filename only, with .yml)
 #     Allowed actions:      npm publish
 # After that, every `git tag vX.Y.Z && git push --tags` publishes automatically.
@@ -44,7 +44,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/flux-md-core
+          workspaces: crates/brookmd-core
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - uses: oven-sh/setup-bun@v2
@@ -64,20 +64,20 @@ jobs:
       - name: Build WASM
         run: bun run build:wasm
       - name: Build the compiled package (dist)
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         # `npm publish` runs prepublishOnly (build:wasm + this); `npm pack` (the
         # tarball tripwire below) does NOT, so build dist explicitly here.
         run: node scripts/build.mjs
       - name: Typecheck the package
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bunx tsc --noEmit -p tsconfig.json
       - name: JS package tests
         run: bun run test:components
       - name: SSR cold-import (fresh process, no browser globals)
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bun run test:ssr-cold
       - name: Consumer smoke (Vite output — separate worker chunk, non-inlined wasm)
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bun run test:consumer-smoke
       - name: Rust core (CommonMark + GFM floors)
         env:
@@ -85,12 +85,12 @@ jobs:
           GFM_MIN_PASS: "24"
         run: bun run test:rust
       - name: Complexity-scaling gate (streaming stays sub-quadratic)
-        working-directory: crates/flux-md-core
+        working-directory: crates/brookmd-core
         run: cargo test --release --features perf_counters --test scaling
       - name: Assert the tarball ships a non-empty WASM artifact
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         # The package ships compiled `dist` (files:["dist"]); the WASM lands at
-        # dist/wasm/flux_md_core_bg.wasm. Tripwire against a silently WASM-less
+        # dist/wasm/brook_md_core_bg.wasm. Tripwire against a silently WASM-less
         # publish. Pack into a clean temp dir and glob the tarball (don't parse
         # npm's stdout, which varies by version).
         run: |
@@ -99,9 +99,9 @@ jobs:
           npm pack --pack-destination "$dest" >/dev/null 2>&1
           tarball="$(echo "$dest"/*.tgz)"
           test -f "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
-          tar -tzf "$tarball" | grep -q '/dist/wasm/flux_md_core_bg\.wasm$' \
-            || { echo "::error::publish tarball is missing dist/wasm/flux_md_core_bg.wasm"; exit 1; }
-          size=$(tar -tzvf "$tarball" | awk '/\/dist\/wasm\/flux_md_core_bg\.wasm$/ { print $3; exit }')
+          tar -tzf "$tarball" | grep -q '/dist/wasm/brook_md_core_bg\.wasm$' \
+            || { echo "::error::publish tarball is missing dist/wasm/brook_md_core_bg.wasm"; exit 1; }
+          size=$(tar -tzvf "$tarball" | awk '/\/dist\/wasm\/brook_md_core_bg\.wasm$/ { print $3; exit }')
           test "${size:-0}" -gt 0 || { echo "::error::WASM artifact is present but empty"; exit 1; }
           echo "OK: tarball ships WASM (${size} bytes)"
           rm -rf "$dest"
@@ -111,7 +111,7 @@ jobs:
       # NO secret — see the one-time npmjs.com Trusted Publisher setup at the top.)
       - name: Decide whether to publish
         id: gate
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         env:
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
         run: |
@@ -121,15 +121,15 @@ jobs:
             echo "::notice::dry_run requested — skipping publish (build + checks ran)."
             echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if npm view "flux-md@${ver}" version >/dev/null 2>&1; then
-            echo "::notice::flux-md@${ver} is already published — skipping (no-op)."
+          if npm view "brookmd@${ver}" version >/dev/null 2>&1; then
+            echo "::notice::brookmd@${ver} is already published — skipping (no-op)."
             echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "publish=true" >> "$GITHUB_OUTPUT"
 
       - name: Publish to npm (OIDC trusted publishing, automatic provenance)
         if: ${{ steps.gate.outputs.publish == 'true' }}
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         # No NODE_AUTH_TOKEN: npm >= 11.5.1 authenticates via the GitHub OIDC token
         # (id-token: write) against the package's configured Trusted Publisher, and
         # attaches SLSA provenance automatically. If this step errors with an auth

@@ -8,13 +8,13 @@ import {
   useSyncExternalStore,
 } from "react";
 import {
-  FluxClient,
-  FluxMarkdown,
+  BrookClient,
+  BrookMarkdown,
   type BlockComponentProps,
   type Components,
   type HeadingData,
   type TableData,
-} from "flux-md";
+} from "brookmd";
 import DOMPurify from "dompurify";
 import { streamDemoDoc } from "../streaming/demoDoc";
 
@@ -85,7 +85,7 @@ function EnhancedTable(props: BlockComponentProps) {
   if (!table) {
     return (
       <div
-        className="flux-block flux-block-table"
+        className="brook-block brook-block-table"
         dangerouslySetInnerHTML={{ __html: sanitizeHtml(props.html) }}
       />
     );
@@ -115,7 +115,7 @@ function EnhancedTable(props: BlockComponentProps) {
   const alignOf = (i: number) => table.aligns[i] ?? undefined;
 
   return (
-    <div className="ds-table" data-flux-open={props.open ? "1" : undefined}>
+    <div className="ds-table" data-brook-open={props.open ? "1" : undefined}>
       <div className="ds-table-toolbar">
         <input
           className="ds-filter"
@@ -201,7 +201,7 @@ function HeadingAnchor(props: BlockComponentProps) {
   if (!h) {
     return (
       <div
-        className="flux-block flux-block-heading"
+        className="brook-block brook-block-heading"
         dangerouslySetInnerHTML={{ __html: sanitizeHtml(props.html) }}
       />
     );
@@ -215,17 +215,17 @@ function HeadingAnchor(props: BlockComponentProps) {
 }
 
 // Module scope so the components-object identity is stable (a fresh object each
-// render would bust flux-md's per-block memo and force every block to re-parse).
+// render would bust brookmd's per-block memo and force every block to re-parse).
 const COMPONENTS: Components = { Table: EnhancedTable, Heading: HeadingAnchor };
 
 /* ──────────────────────────────────────────────────────────────────────────
    3. TableOfContents — built LIVE from the client's snapshot (not from a
    Heading override that registers during render, which would setState mid-
-   render). We subscribe to the same external store FluxMarkdown uses, filter
+   render). We subscribe to the same external store BrookMarkdown uses, filter
    Heading blocks, and read each block's `kind.data` ({ level, text, id }).
    ────────────────────────────────────────────────────────────────────────── */
 
-function useHeadings(client: FluxClient): HeadingData[] {
+function useHeadings(client: BrookClient): HeadingData[] {
   const blocks = useSyncExternalStore(client.subscribe, client.getSnapshot, client.getSnapshot);
   return useMemo(() => {
     const out: HeadingData[] = [];
@@ -238,7 +238,7 @@ function useHeadings(client: FluxClient): HeadingData[] {
   }, [blocks]);
 }
 
-function TableOfContents({ client }: { client: FluxClient }) {
+function TableOfContents({ client }: { client: BrookClient }) {
   const headings = useHeadings(client);
   const minLevel = headings.length ? Math.min(...headings.map((h) => h.level)) : 1;
 
@@ -285,7 +285,7 @@ function TableOfContents({ client }: { client: FluxClient }) {
 export function DataStudio() {
   // One blockData-enabled client for this view's lifetime. THE opt-in: turning
   // on `blockData` is what populates each block's structured `kind.data`.
-  const [client] = useState(() => new FluxClient({ config: { blockData: true } }));
+  const [client] = useState(() => new BrookClient({ config: { blockData: true } }));
   const [running, setRunning] = useState(false);
   const [started, setStarted] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
@@ -306,7 +306,7 @@ export function DataStudio() {
   }, [client]);
 
   // Own the client's pool attachment. reattach() on (re)mount, destroy() on
-  // unmount — mirroring the library's own `useFluxStream`. This matters under
+  // unmount — mirroring the library's own `useBrookStream`. This matters under
   // React StrictMode (dev), whose double-mount destroys the SAME instance on the
   // simulated unmount, then remounts it: without reattach its patches would be
   // dropped and it'd render blank. reattach() is idempotent on first mount.
@@ -325,7 +325,7 @@ export function DataStudio() {
           <h1 className="ds-title">Data Studio</h1>
           <p className="ds-sub">
             The table toolbar (sort · filter · CSV) and the live outline are built
-            from <code>block.kind.data</code> — flux-md 0.10.0’s opt-in{" "}
+            from <code>block.kind.data</code> — brookmd 0.10.0’s opt-in{" "}
             <code>{`{ blockData: true }`}</code> channel. <b>No HTML re-parsing</b>,
             and it all works <b>mid-stream</b>: hit Run and sort or filter while
             rows are still arriving.
@@ -356,7 +356,7 @@ export function DataStudio() {
               </p>
             </div>
           ) : (
-            <FluxMarkdown client={client} components={COMPONENTS} sanitize={sanitizeHtml} />
+            <BrookMarkdown client={client} components={COMPONENTS} sanitize={sanitizeHtml} />
           )}
         </main>
       </div>

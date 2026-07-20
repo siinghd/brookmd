@@ -1,0 +1,2 @@
+# Placeholder so the ABI dir exists in git. CI / scripts/build-android.sh
+# drops libbrook_md_ffi.so here per ABI; the .so binaries are never committed.

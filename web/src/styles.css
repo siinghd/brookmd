@@ -1,4 +1,4 @@
-/* ── flux-md live demo — a quiet, editorial chat showcase ──────────────────
+/* ── brookmd live demo — a quiet, editorial chat showcase ──────────────────
    Neutral-dark surfaces, warm off-white ink, one coral accent. Type: Fraunces
    (display), Hanken Grotesk (body), JetBrains Mono (code + input). */
 
@@ -287,24 +287,24 @@ button { cursor: pointer; }
 }
 
 /* ════════════════════════════════════════════════════════════════════════
-   Markdown content — the FluxMarkdown output. Carried from the prior demo,
+   Markdown content — the BrookMarkdown output. Carried from the prior demo,
    re-themed via the variables above so assistant replies read cleanly.
    ════════════════════════════════════════════════════════════════════════ */
-.flux-md { word-wrap: break-word; overflow-wrap: anywhere; }
-.flux-md > * { margin: 0 0 14px 0; }
-.flux-md > *:last-child { margin-bottom: 0; }
-.flux-md h1 { font-size: 1.5em; font-weight: 700; color: var(--fg-0); margin-top: 6px; letter-spacing: -0.01em; }
-.flux-md h2 { font-size: 1.28em; font-weight: 700; color: var(--fg-0); margin-top: 22px; padding-bottom: 5px; border-bottom: 1px solid var(--bd); }
-.flux-md h3 { font-size: 1.12em; font-weight: 700; color: var(--fg-0); margin-top: 18px; }
-.flux-md h4 { font-size: 1em; font-weight: 700; color: var(--fg-0); }
-.flux-md h5, .flux-md h6 { font-size: 0.92em; font-weight: 700; color: var(--fg-0); }
-.flux-md p { color: var(--fg-1); }
-.flux-md a { color: var(--acc); text-decoration: none; }
-.flux-md a:hover { text-decoration: underline; }
-.flux-md ul, .flux-md ol { padding-left: 24px; color: var(--fg-1); }
-.flux-md li { margin: 4px 0; }
-.flux-md li::marker { color: var(--fg-3); }
-.flux-md blockquote {
+.brook-md { word-wrap: break-word; overflow-wrap: anywhere; }
+.brook-md > * { margin: 0 0 14px 0; }
+.brook-md > *:last-child { margin-bottom: 0; }
+.brook-md h1 { font-size: 1.5em; font-weight: 700; color: var(--fg-0); margin-top: 6px; letter-spacing: -0.01em; }
+.brook-md h2 { font-size: 1.28em; font-weight: 700; color: var(--fg-0); margin-top: 22px; padding-bottom: 5px; border-bottom: 1px solid var(--bd); }
+.brook-md h3 { font-size: 1.12em; font-weight: 700; color: var(--fg-0); margin-top: 18px; }
+.brook-md h4 { font-size: 1em; font-weight: 700; color: var(--fg-0); }
+.brook-md h5, .brook-md h6 { font-size: 0.92em; font-weight: 700; color: var(--fg-0); }
+.brook-md p { color: var(--fg-1); }
+.brook-md a { color: var(--acc); text-decoration: none; }
+.brook-md a:hover { text-decoration: underline; }
+.brook-md ul, .brook-md ol { padding-left: 24px; color: var(--fg-1); }
+.brook-md li { margin: 4px 0; }
+.brook-md li::marker { color: var(--fg-3); }
+.brook-md blockquote {
   border-left: 3px solid var(--acc-line);
   padding: 4px 16px;
   margin-left: 0;
@@ -312,10 +312,10 @@ button { cursor: pointer; }
   background: var(--bg-1);
   border-radius: 0 6px 6px 0;
 }
-.flux-md table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
-.flux-md th, .flux-md td { padding: 7px 11px; border: 1px solid var(--bd); text-align: left; }
-.flux-md th { background: var(--bg-2); color: var(--fg-0); font-weight: 700; }
-.flux-md code {
+.brook-md table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+.brook-md th, .brook-md td { padding: 7px 11px; border: 1px solid var(--bd); text-align: left; }
+.brook-md th { background: var(--bg-2); color: var(--fg-0); font-weight: 700; }
+.brook-md code {
   background: var(--bg-3);
   padding: 1.5px 6px;
   border-radius: 4px;
@@ -323,21 +323,21 @@ button { cursor: pointer; }
   font-size: 0.85em;
   color: #f0c674;
 }
-.flux-md hr { border: none; border-top: 1px solid var(--bd); margin: 20px 0; }
-.flux-md strong { color: var(--fg-0); font-weight: 700; }
-.flux-md em { color: var(--fg-0); font-style: italic; }
-.flux-md del { color: var(--fg-3); }
+.brook-md hr { border: none; border-top: 1px solid var(--bd); margin: 20px 0; }
+.brook-md strong { color: var(--fg-0); font-weight: 700; }
+.brook-md em { color: var(--fg-0); font-style: italic; }
+.brook-md del { color: var(--fg-3); }
 
 /* Code blocks */
-.flux-code-block { margin: 0 0 14px 0; background: var(--bg-3); border: 1px solid var(--bd); border-radius: 10px; overflow: hidden; }
-.flux-code-header {
+.brook-code-block { margin: 0 0 14px 0; background: var(--bg-3); border: 1px solid var(--bd); border-radius: 10px; overflow: hidden; }
+.brook-code-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 5px 12px; background: var(--bg-2); border-bottom: 1px solid var(--bd);
   font-size: 10px; font-family: var(--font-mono); color: var(--fg-3);
   text-transform: uppercase; letter-spacing: 0.06em;
 }
-.flux-code-streaming-pill { background: var(--acc-soft); color: var(--acc); padding: 1px 7px; border-radius: 4px; font-weight: 600; }
-.flux-code-copy {
+.brook-code-streaming-pill { background: var(--acc-soft); color: var(--acc); padding: 1px 7px; border-radius: 4px; font-weight: 600; }
+.brook-code-copy {
   display: inline-flex; align-items: center; gap: 5px;
   background: transparent; border: 1px solid var(--bd-2);
   color: var(--fg-2); font-family: inherit; font-size: inherit;
@@ -345,46 +345,46 @@ button { cursor: pointer; }
   padding: 2px 8px; border-radius: 4px;
   transition: color 0.15s, border-color 0.15s, background 0.15s;
 }
-.flux-code-copy:hover { color: var(--fg-0); border-color: var(--fg-3); background: var(--bg-1); }
-.flux-code-copy:focus-visible { outline: 2px solid var(--acc-line); outline-offset: 1px; }
-.flux-code-copy svg { display: block; }
-.flux-code-body { margin: 0; padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; overflow-x: auto; }
-.flux-code-body pre { margin: 0; padding: 0; background: transparent; }
-.flux-code-body code { background: transparent; padding: 0; color: var(--fg-1); font-size: inherit; white-space: pre; }
+.brook-code-copy:hover { color: var(--fg-0); border-color: var(--fg-3); background: var(--bg-1); }
+.brook-code-copy:focus-visible { outline: 2px solid var(--acc-line); outline-offset: 1px; }
+.brook-code-copy svg { display: block; }
+.brook-code-body { margin: 0; padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; line-height: 1.55; overflow-x: auto; }
+.brook-code-body pre { margin: 0; padding: 0; background: transparent; }
+.brook-code-body code { background: transparent; padding: 0; color: var(--fg-1); font-size: inherit; white-space: pre; }
 /* In-house syntax highlighter token classes (One-Dark-ish) */
-.flux-code-body .t-kw   { color: #c678dd; font-weight: 600; }
-.flux-code-body .t-str  { color: #98c379; }
-.flux-code-body .t-num  { color: #d19a66; }
-.flux-code-body .t-com  { color: #6b7280; font-style: italic; }
-.flux-code-body .t-fn   { color: #61afef; }
-.flux-code-body .t-ty   { color: #e5c07b; }
-.flux-code-body .t-mac  { color: #56b6c2; }
-.flux-code-body .t-attr { color: #56b6c2; }
-.flux-code-body .t-lt   { color: #d19a66; }
-.flux-code-body .t-dec  { color: #56b6c2; }
-.flux-code-body .t-var  { color: #d19a66; }
-.flux-code-body .t-tag  { color: #e06c75; }
-.flux-code-body .t-rx   { color: #98c379; }
-.flux-code-body .t-pun  { color: #abb2bf; }
-.flux-code-body .t-sel  { color: #e06c75; }
-.flux-code-body .t-txt  { color: var(--fg-1); }
+.brook-code-body .t-kw   { color: #c678dd; font-weight: 600; }
+.brook-code-body .t-str  { color: #98c379; }
+.brook-code-body .t-num  { color: #d19a66; }
+.brook-code-body .t-com  { color: #6b7280; font-style: italic; }
+.brook-code-body .t-fn   { color: #61afef; }
+.brook-code-body .t-ty   { color: #e5c07b; }
+.brook-code-body .t-mac  { color: #56b6c2; }
+.brook-code-body .t-attr { color: #56b6c2; }
+.brook-code-body .t-lt   { color: #d19a66; }
+.brook-code-body .t-dec  { color: #56b6c2; }
+.brook-code-body .t-var  { color: #d19a66; }
+.brook-code-body .t-tag  { color: #e06c75; }
+.brook-code-body .t-rx   { color: #98c379; }
+.brook-code-body .t-pun  { color: #abb2bf; }
+.brook-code-body .t-sel  { color: #e06c75; }
+.brook-code-body .t-txt  { color: var(--fg-1); }
 
 /* Math + mermaid headers mirror the code header */
-.flux-math-header, .flux-mermaid-header {
+.brook-math-header, .brook-mermaid-header {
   display: flex; align-items: center; justify-content: space-between;
   padding: 5px 12px; background: var(--bg-2); border-bottom: 1px solid var(--bd);
   font-size: 10px; font-family: var(--font-mono); color: var(--fg-3);
   text-transform: uppercase; letter-spacing: 0.06em;
 }
-.flux-math-body, .flux-mermaid-body { padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; overflow-x: auto; }
-.flux-math-block { background: var(--bg-2); border: 1px solid var(--bd); border-radius: 10px; padding: 14px; margin: 0 0 14px 0; overflow-x: auto; }
-.flux-math-block.flux-streaming { opacity: 0.7; font-family: var(--font-mono); }
-.flux-katex { display: flex; justify-content: center; }
-.flux-mermaid-block { background: var(--bg-2); border: 1px solid var(--bd); border-radius: 10px; padding: 14px; margin: 0 0 14px 0; text-align: center; }
-.flux-mermaid-block.flux-streaming { opacity: 0.7; }
-.flux-mermaid-rendered svg { max-width: 100%; }
+.brook-math-body, .brook-mermaid-body { padding: 12px 14px; font-family: var(--font-mono); font-size: 12.5px; overflow-x: auto; }
+.brook-math-block { background: var(--bg-2); border: 1px solid var(--bd); border-radius: 10px; padding: 14px; margin: 0 0 14px 0; overflow-x: auto; }
+.brook-math-block.brook-streaming { opacity: 0.7; font-family: var(--font-mono); }
+.brook-katex { display: flex; justify-content: center; }
+.brook-mermaid-block { background: var(--bg-2); border: 1px solid var(--bd); border-radius: 10px; padding: 14px; margin: 0 0 14px 0; text-align: center; }
+.brook-mermaid-block.brook-streaming { opacity: 0.7; }
+.brook-mermaid-rendered svg { max-width: 100%; }
 
-/* <Thinking> callout — visual weight matches .flux-code-block, body muted/italic. */
+/* <Thinking> callout — visual weight matches .brook-code-block, body muted/italic. */
 .thinking {
   margin: 0 0 14px 0;
   background: var(--bg-2);
@@ -415,7 +415,7 @@ button { cursor: pointer; }
   width: 6px; height: 6px; border-radius: 50%;
   background: var(--fg-3);
 }
-.thinking.flux-open .thinking-dot {
+.thinking.brook-open .thinking-dot {
   background: var(--acc);
   animation: thinking-pulse 1.4s ease-in-out infinite;
 }
@@ -431,8 +431,8 @@ button { cursor: pointer; }
 .thinking-body > *:last-child { margin-bottom: 0; }
 
 /* Streaming caret on the open (still-arriving) block */
-.flux-open { position: relative; }
-.flux-open::after {
+.brook-open { position: relative; }
+.brook-open::after {
   content: "▍";
   display: inline-block;
   animation: caret 1.05s steps(2) infinite;
@@ -534,7 +534,7 @@ button { cursor: pointer; }
   scroll-behavior: smooth;
   padding: 22px 26px 60px;
 }
-.ds-main .flux-md { max-width: var(--col); }
+.ds-main .brook-md { max-width: var(--col); }
 
 /* Live table of contents */
 .ds-toc-title {

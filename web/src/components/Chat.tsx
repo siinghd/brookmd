@@ -1,22 +1,22 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { FluxClient, FluxMarkdown, type BlockComponentProps, type Components } from "flux-md";
+import { BrookClient, BrookMarkdown, type BlockComponentProps, type Components } from "brookmd";
 import DOMPurify from "dompurify";
 import { streamChat, type ChatMessage } from "../streaming/openai";
 
 // Sanitize every block's HTML before it hits the DOM — covers the streaming
-// (open) tail too, via flux-md's `sanitize` hook. DOMPurify is comprehensive
+// (open) tail too, via brookmd's `sanitize` hook. DOMPurify is comprehensive
 // (drops scripts, on* handlers, javascript:/dangerous schemes, and unsafe tags);
-// stable identity so flux-md's per-block memo doesn't churn.
+// stable identity so brookmd's per-block memo doesn't churn.
 const sanitizeHtml = (html: string) => DOMPurify.sanitize(html);
 
 // Custom <Thinking> block — shown as a collapsible callout. The `html` prop is
 // the *inner* markdown already rendered (and run through DOMPurify via the
-// `sanitize` hook on FluxMarkdown), so dangerouslySetInnerHTML is safe here.
-// Keep `flux-open` on the wrapper while streaming so the page-level KaTeX
+// `sanitize` hook on BrookMarkdown), so dangerouslySetInnerHTML is safe here.
+// Keep `brook-open` on the wrapper while streaming so the page-level KaTeX
 // MutationObserver still skips partial LaTeX inside the block.
 function Thinking({ html, open }: BlockComponentProps) {
   return (
-    <details className={"thinking" + (open ? " flux-open" : "")} open={open}>
+    <details className={"thinking" + (open ? " brook-open" : "")} open={open}>
       <summary className="thinking-summary">
         <span className="thinking-dot" aria-hidden="true" />
         {open ? "Thinking…" : "Thought process"}
@@ -27,7 +27,7 @@ function Thinking({ html, open }: BlockComponentProps) {
 }
 
 // Module-scope so the components-object identity is stable; a fresh object
-// each render would bust flux-md's per-block memo.
+// each render would bust brookmd's per-block memo.
 const COMPONENTS: Components = { Thinking };
 
 interface Turn {
@@ -36,7 +36,7 @@ interface Turn {
   /** User text, or the assistant's accumulated text (for API history). */
   text: string;
   /** Assistant only — owns the streaming parser/worker. */
-  client?: FluxClient;
+  client?: BrookClient;
   done: boolean;
 }
 
@@ -83,7 +83,7 @@ export function Chat() {
 
   useLayoutEffect(scrollToBottom, [turns.length, scrollToBottom]);
 
-  // flux-md emits KaTeX-ready markup (`<span|div class="math …">LaTeX</span|div>`)
+  // brookmd emits KaTeX-ready markup (`<span|div class="math …">LaTeX</span|div>`)
   // and stays zero-dep; the demo brings KaTeX (loaded from CDN in index.html) and
   // typesets each math element once its block has closed (open blocks hold partial
   // LaTeX, so we skip anything still inside a streaming block).
@@ -98,7 +98,7 @@ export function Chat() {
         return;
       }
       root.querySelectorAll<HTMLElement>(".math:not([data-tex])").forEach((el) => {
-        if (el.closest(".flux-streaming, .flux-open")) return; // still streaming
+        if (el.closest(".brook-streaming, .brook-open")) return; // still streaming
         el.setAttribute("data-tex", "1");
         try {
           katex.render(el.textContent ?? "", el, {
@@ -150,10 +150,10 @@ export function Chat() {
 
       // unsafeHtml lets the model's HTML render (e.g. "give me the result in
       // HTML"); every block's HTML — including the streaming tail — is run
-      // through DOMPurify via FluxMarkdown's `sanitize` prop (see `sanitizeHtml`).
+      // through DOMPurify via BrookMarkdown's `sanitize` prop (see `sanitizeHtml`).
       // componentTags allowlists <Thinking> so the model's reasoning blocks
       // render via the React override below.
-      const client = new FluxClient({
+      const client = new BrookClient({
         config: { gfmMath: true, unsafeHtml: true, componentTags: ["Thinking"] },
       });
       const userTurn: Turn = { id: nextId.current++, role: "user", text, done: true };
@@ -222,7 +222,7 @@ export function Chat() {
       <header className="topbar">
         <div className="brand">
           <span className="bolt">⚡</span>
-          <b>flux-md</b>
+          <b>brookmd</b>
           <span className="brand-tag">streaming markdown</span>
         </div>
         {turns.length > 0 && (
@@ -239,7 +239,7 @@ export function Chat() {
               Markdown that renders <em>as it streams.</em>
             </h1>
             <p className="empty-sub">
-              A live demo of <b>flux-md</b> — a zero-dep, Rust→WASM streaming parser. Ask
+              A live demo of <b>brookmd</b> — a zero-dep, Rust→WASM streaming parser. Ask
               anything; the reply parses incrementally, off the main thread.
             </p>
             <div className="chips">
@@ -262,7 +262,7 @@ export function Chat() {
                   <div className="ai-mark">⚡</div>
                   <div className="ai-body">
                     {t.client && (
-                      <FluxMarkdown client={t.client} sanitize={sanitizeHtml} components={COMPONENTS} />
+                      <BrookMarkdown client={t.client} sanitize={sanitizeHtml} components={COMPONENTS} />
                     )}
                   </div>
                 </div>

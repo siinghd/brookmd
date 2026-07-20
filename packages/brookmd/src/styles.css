@@ -1,0 +1,188 @@
+/*
+ * brookmd — optional default theme.
+ *
+ *   import "brookmd/styles.css";
+ *
+ * Opt-in: import it for good-looking output out of the box (including the
+ * built-in syntax highlighter's colors); skip it to bring your own CSS — the
+ * rendered HTML is identical either way. Everything is scoped to `.brook-md`
+ * (the renderer's root) and driven by CSS custom properties, so you re-theme by
+ * overriding a few `--brook-*` vars rather than rewriting selectors.
+ *
+ * Light by default; dark automatically via `prefers-color-scheme`. Force a mode
+ * with `<div class="brook-md brook-dark">` or `brook-light`.
+ */
+
+.brook-md {
+  /* surfaces + text (light) */
+  --brook-fg: #1f2328;
+  --brook-fg-muted: #59636e;
+  --brook-fg-faint: #818b98;
+  --brook-border: #d1d9e0;
+  --brook-bg-code: #f6f8fa;
+  --brook-bg-inline: rgba(129, 139, 152, 0.16);
+  --brook-bg-quote: rgba(129, 139, 152, 0.08);
+  --brook-accent: #0969da;
+  /* syntax tokens (light) */
+  --brook-t-kw: #cf222e;
+  --brook-t-str: #0a3069;
+  --brook-t-num: #0550ae;
+  --brook-t-com: #59636e;
+  --brook-t-fn: #6639ba;
+  --brook-t-ty: #953800;
+  --brook-t-mac: #1f6feb;
+  --brook-t-attr: #116329;
+  --brook-t-tag: #116329;
+  --brook-t-var: #953800;
+  --brook-t-pun: var(--brook-fg);
+  /* sizing */
+  --brook-radius: 6px;
+  --brook-gap: 16px;
+
+  color: var(--brook-fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.6;
+  font-size: 1rem;
+  word-wrap: break-word;
+  overflow-wrap: anywhere;
+}
+
+/* Dark — automatic, and as an explicit `.brook-dark` escape hatch. */
+@media (prefers-color-scheme: dark) {
+  .brook-md:not(.brook-light) {
+    --brook-fg: #e6edf3;
+    --brook-fg-muted: #9198a1;
+    --brook-fg-faint: #6e7681;
+    --brook-border: #3d444d;
+    --brook-bg-code: #151b23;
+    --brook-bg-inline: rgba(101, 108, 118, 0.2);
+    --brook-bg-quote: rgba(101, 108, 118, 0.1);
+    --brook-accent: #4493f8;
+    --brook-t-kw: #ff7b72;
+    --brook-t-str: #a5d6ff;
+    --brook-t-num: #79c0ff;
+    --brook-t-com: #8b949e;
+    --brook-t-fn: #d2a8ff;
+    --brook-t-ty: #ffa657;
+    --brook-t-mac: #79c0ff;
+    --brook-t-attr: #7ee787;
+    --brook-t-tag: #7ee787;
+    --brook-t-var: #ffa657;
+  }
+}
+.brook-md.brook-dark {
+  --brook-fg: #e6edf3;
+  --brook-fg-muted: #9198a1;
+  --brook-fg-faint: #6e7681;
+  --brook-border: #3d444d;
+  --brook-bg-code: #151b23;
+  --brook-bg-inline: rgba(101, 108, 118, 0.2);
+  --brook-bg-quote: rgba(101, 108, 118, 0.1);
+  --brook-accent: #4493f8;
+  --brook-t-kw: #ff7b72;
+  --brook-t-str: #a5d6ff;
+  --brook-t-num: #79c0ff;
+  --brook-t-com: #8b949e;
+  --brook-t-fn: #d2a8ff;
+  --brook-t-ty: #ffa657;
+  --brook-t-mac: #79c0ff;
+  --brook-t-attr: #7ee787;
+  --brook-t-tag: #7ee787;
+  --brook-t-var: #ffa657;
+}
+
+/* ---- block rhythm ---------------------------------------------------------- */
+.brook-md > * { margin: 0 0 var(--brook-gap) 0; }
+.brook-md > *:last-child { margin-bottom: 0; }
+
+/* ---- headings -------------------------------------------------------------- */
+.brook-md h1, .brook-md h2, .brook-md h3,
+.brook-md h4, .brook-md h5, .brook-md h6 {
+  font-weight: 600;
+  line-height: 1.25;
+  margin: 24px 0 var(--brook-gap);
+}
+.brook-md h1 { font-size: 2em; padding-bottom: 0.3em; border-bottom: 1px solid var(--brook-border); }
+.brook-md h2 { font-size: 1.5em; padding-bottom: 0.3em; border-bottom: 1px solid var(--brook-border); }
+.brook-md h3 { font-size: 1.25em; }
+.brook-md h4 { font-size: 1em; }
+.brook-md h5 { font-size: 0.875em; }
+.brook-md h6 { font-size: 0.85em; color: var(--brook-fg-muted); }
+.brook-md > h1:first-child, .brook-md > h2:first-child, .brook-md > h3:first-child { margin-top: 0; }
+
+/* ---- inline ---------------------------------------------------------------- */
+.brook-md a { color: var(--brook-accent); text-decoration: none; }
+.brook-md a:hover { text-decoration: underline; }
+/* A streaming link whose URL hasn't finished arriving renders as an inert
+   `<a data-brook-pending>` with no href — the UA gives an href-less anchor no
+   link styling, so restate the settled resting style here (identical color and
+   decoration, so completion changes nothing visually). Cursor stays default:
+   not clickable yet. */
+.brook-md a[data-brook-pending] { color: var(--brook-accent); text-decoration: none; cursor: default; }
+.brook-md strong { font-weight: 600; }
+.brook-md em { font-style: italic; }
+.brook-md del { color: var(--brook-fg-muted); }
+.brook-md img { max-width: 100%; height: auto; }
+
+/* ---- lists ----------------------------------------------------------------- */
+.brook-md ul, .brook-md ol { padding-left: 2em; }
+.brook-md li { margin: 0.25em 0; }
+.brook-md li > ul, .brook-md li > ol { margin: 0.25em 0; }
+.brook-md li::marker { color: var(--brook-fg-faint); }
+.brook-md input[type="checkbox"] { margin: 0 0.4em 0 0; }
+
+/* ---- blockquote + alerts --------------------------------------------------- */
+.brook-md blockquote {
+  margin: 0 0 var(--brook-gap);
+  padding: 0.4em 1em;
+  color: var(--brook-fg-muted);
+  border-left: 0.25em solid var(--brook-border);
+  background: var(--brook-bg-quote);
+}
+.brook-md blockquote > :last-child { margin-bottom: 0; }
+
+/* ---- tables ---------------------------------------------------------------- */
+.brook-md table { border-collapse: collapse; width: 100%; display: block; overflow-x: auto; }
+.brook-md th, .brook-md td { padding: 6px 13px; border: 1px solid var(--brook-border); }
+.brook-md th { font-weight: 600; background: var(--brook-bg-code); }
+.brook-md tr:nth-child(2n) td { background: var(--brook-bg-quote); }
+
+/* ---- code ------------------------------------------------------------------ */
+.brook-md code, .brook-md pre {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-size: 0.9em;
+}
+.brook-md :not(pre) > code {
+  padding: 0.2em 0.4em;
+  border-radius: var(--brook-radius);
+  background: var(--brook-bg-inline);
+}
+.brook-md pre {
+  padding: 14px 16px;
+  overflow-x: auto;
+  border-radius: var(--brook-radius);
+  background: var(--brook-bg-code);
+  line-height: 1.5;
+}
+.brook-md pre code { padding: 0; background: none; border: 0; }
+
+/* ---- rule ------------------------------------------------------------------ */
+.brook-md hr { height: 1px; border: 0; background: var(--brook-border); margin: 24px 0; }
+
+/* ---- syntax highlighter (the built-in `highlight()` token spans) ----------- */
+.brook-md .t-kw   { color: var(--brook-t-kw); }
+.brook-md .t-str,
+.brook-md .t-rx   { color: var(--brook-t-str); }
+.brook-md .t-num,
+.brook-md .t-lt   { color: var(--brook-t-num); }
+.brook-md .t-com  { color: var(--brook-t-com); font-style: italic; }
+.brook-md .t-fn   { color: var(--brook-t-fn); }
+.brook-md .t-ty   { color: var(--brook-t-ty); }
+.brook-md .t-mac,
+.brook-md .t-dec  { color: var(--brook-t-mac); }
+.brook-md .t-attr,
+.brook-md .t-sel  { color: var(--brook-t-attr); }
+.brook-md .t-tag  { color: var(--brook-t-tag); }
+.brook-md .t-var  { color: var(--brook-t-var); }
+.brook-md .t-pun  { color: var(--brook-t-pun); }
+.brook-md .t-txt  { color: inherit; }

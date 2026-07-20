@@ -1,0 +1,66 @@
+[package]
+name = "brookmd-core"
+version = "0.22.0"
+edition = "2021"
+description = "Incremental, streaming-aware markdown parser with speculative closure"
+license = "MIT"
+repository = "https://github.com/siinghd/brookmd"
+readme = "README.md"
+keywords = ["markdown", "streaming", "parser", "commonmark", "gfm"]
+categories = ["parser-implementations", "text-processing", "wasm"]
+# Keep the published crate lean: source, manifest, README, and license only —
+# tests/, examples/, and fuzz/ are excluded (they are not part of the API).
+include = ["src/**", "Cargo.toml", "README.md", "WIRE.md", "LICENSE"]
+
+[lib]
+# Explicit lib name so the wasm-pack output (brook_md_core_bg.wasm / .js) and the
+# `use brook_md_core::…` imports in the native ffi/cabi crates stay `brook_md_core`
+# rather than the package-derived `brookmd_core`.
+name = "brook_md_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Zero parser deps. wasm-bindgen is the JS interop glue, not a markdown library —
+# and it is optional (the `wasm` feature): native Rust consumers can build without
+# it via `default-features = false`.
+# Patches/blocks cross the WASM↔JS boundary as a JSON string: serde_json::to_string
+# in Rust + JSON.parse on the main thread is cheaper than serde-wasm-bindgen's
+# per-node object construction, and a string structuredClones far cheaper than an
+# object graph on the worker→main postMessage (the worker forwards it verbatim).
+# Dropping serde-wasm-bindgen + js-sys also shrinks the wasm.
+wasm-bindgen = { version = "0.2", optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+
+[features]
+# `wasm` compiles the wasm-bindgen `BrookParser` glue in `lib.rs` and is ON by
+# default, so the existing wasm-pack build (which uses default features) is
+# unchanged. Native Rust consumers who only need the pure `StreamParser` API
+# build with `default-features = false` and pull in no wasm-bindgen.
+default = ["wasm"]
+wasm = ["dep:wasm-bindgen"]
+# Deterministic perf instrumentation for `tests/scaling.rs`. OFF by default and
+# never enabled in the WASM build, so it adds zero bytes to the shipped binary.
+perf_counters = []
+
+[dev-dependencies]
+# Property-based testing with automatic shrinking. Dev-only — never shipped, and
+# the WASM build doesn't see it. Used by `tests/parity_prop.rs`.
+proptest = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release.package."*"]
+opt-level = "z"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ["-Oz", "--strip-producers", "--enable-bulk-memory", "--enable-nontrapping-float-to-int"]
+
+[package.metadata.docs.rs]
+all-features = false
+features = []

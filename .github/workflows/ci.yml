@@ -14,9 +14,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/flux-md-core
+          workspaces: crates/brookmd-core
       - name: cargo test (enforces the 652/652 + GFM floors + proptest parity)
-        working-directory: crates/flux-md-core
+        working-directory: crates/brookmd-core
         env:
           CMARK_MIN_PASS: "652"
           GFM_MIN_PASS: "24"
@@ -26,7 +26,7 @@ jobs:
         # by counting slow-path tail re-scan bytes (feature `perf_counters`, off
         # in every shipped build). Catches O(n²) cliffs before merge — the class
         # we used to find only after shipping (0.18.2/0.18.3/0.18.4).
-        working-directory: crates/flux-md-core
+        working-directory: crates/brookmd-core
         run: cargo test --release --features perf_counters --test scaling
 
   js:
@@ -44,7 +44,7 @@ jobs:
         run: rustup toolchain install nightly --profile minimal --component rust-src --target wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/flux-md-core
+          workspaces: crates/brookmd-core
       - name: Install wasm-pack
         run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
       - uses: oven-sh/setup-bun@v2
@@ -52,15 +52,15 @@ jobs:
       - name: Build WASM
         run: bun run build:wasm
       - name: Build the compiled package (dist)
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         # `npm publish` runs prepublishOnly (build:wasm + this build); `npm pack`
         # does NOT run prepublishOnly, so build dist explicitly before the tarball
         # tripwire below, otherwise it packs a stale/empty dist.
         run: node scripts/build.mjs
       - name: Assert the publish tarball ships a non-empty WASM artifact
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         # The package ships compiled `dist` (files:["dist"]); the WASM lands at
-        # dist/wasm/flux_md_core_bg.wasm. Tripwire against a silently WASM-less
+        # dist/wasm/brook_md_core_bg.wasm. Tripwire against a silently WASM-less
         # publish. Pack into a clean temp dir and glob the tarball (don't parse
         # npm's stdout, which varies by version).
         run: |
@@ -69,17 +69,17 @@ jobs:
           npm pack --pack-destination "$dest" >/dev/null 2>&1
           tarball="$(echo "$dest"/*.tgz)"
           test -f "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
-          tar -tzf "$tarball" | grep -q '/dist/wasm/flux_md_core_bg\.wasm$' \
-            || { echo "::error::publish tarball is missing dist/wasm/flux_md_core_bg.wasm"; exit 1; }
-          size=$(tar -tzvf "$tarball" | awk '/\/dist\/wasm\/flux_md_core_bg\.wasm$/ { print $3; exit }')
+          tar -tzf "$tarball" | grep -q '/dist/wasm/brook_md_core_bg\.wasm$' \
+            || { echo "::error::publish tarball is missing dist/wasm/brook_md_core_bg.wasm"; exit 1; }
+          size=$(tar -tzvf "$tarball" | awk '/\/dist\/wasm\/brook_md_core_bg\.wasm$/ { print $3; exit }')
           test "${size:-0}" -gt 0 || { echo "::error::WASM artifact is present but empty"; exit 1; }
           echo "OK: tarball ships WASM (${size} bytes)"
           rm -rf "$dest"
       - name: Typecheck the package
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bunx tsc --noEmit -p tsconfig.json
       - name: Typecheck the tests
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bunx tsc --noEmit -p tsconfig.test.json
       - name: Component / pool / store tests
         run: bun run test:components
@@ -87,7 +87,7 @@ jobs:
         # Load-bearing SSR guard: a fresh process so module top-level code runs
         # cold (the in-process ssr.test.ts can pass under bun's warm cache). Trips
         # if any entrypoint touches a browser global at import/construct/render.
-        working-directory: packages/flux-md
+        working-directory: packages/brookmd
         run: bun run test:ssr-cold
       - name: Web build
         run: bun run build:web

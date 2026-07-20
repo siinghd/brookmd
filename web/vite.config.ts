@@ -16,6 +16,6 @@ export default defineConfig({
     format: "es",
   },
   optimizeDeps: {
-    exclude: ["flux-md/src/wasm/flux_md_core.js"],
+    exclude: ["brookmd/src/wasm/brook_md_core.js"],
   },
 });

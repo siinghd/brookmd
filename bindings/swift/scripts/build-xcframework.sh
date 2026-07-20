@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 #
-# Build flux-md-ffi for Apple targets and assemble the static-library
-# XCFramework that Package.swift's `FluxMdRustFFI` binary target consumes
-# (Frameworks/flux_md_ffi.xcframework). Slices:
+# Build brookmd-ffi for Apple targets and assemble the static-library
+# XCFramework that Package.swift's `BrookMdRustFFI` binary target consumes
+# (Frameworks/brook_md_ffi.xcframework). Slices:
 #   * ios          — aarch64-apple-ios
 #   * ios-simulator — lipo(aarch64-apple-ios-sim, x86_64-apple-ios)
 #   * macos        — lipo(aarch64-apple-darwin, x86_64-apple-darwin)
 # The macOS slice is what `swift test` links/runs against on a Mac host.
 #
-# Each slice ships the SAME generated Headers/ (flux_md_ffiFFI.h + a plain
-# `module flux_md_ffiFFI` module.modulemap). It also refreshes
-# Sources/FluxMd/flux_md_ffi.swift so the wrapper matches the framework.
+# Each slice ships the SAME generated Headers/ (brook_md_ffiFFI.h + a plain
+# `module brook_md_ffiFFI` module.modulemap). It also refreshes
+# Sources/BrookMd/brook_md_ffi.swift so the wrapper matches the framework.
 #
 # Requires: macOS with Xcode (xcodebuild, lipo) and a Rust toolchain. Exits early
 # on a non-macOS host — Apple builds are CI's job (macos-14 in bindings-build.yml).
@@ -18,11 +18,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SWIFT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-CRATE_DIR="$(cd "$SWIFT_DIR/../../crates/flux-md-ffi" && pwd)"
+CRATE_DIR="$(cd "$SWIFT_DIR/../../crates/brookmd-ffi" && pwd)"
 BUILD_DIR="$SWIFT_DIR/.build/xcframework"
 STAGING="$BUILD_DIR/Headers"
-XCFRAMEWORK="$SWIFT_DIR/Frameworks/flux_md_ffi.xcframework"
-LIB="libflux_md_ffi.a"
+XCFRAMEWORK="$SWIFT_DIR/Frameworks/brook_md_ffi.xcframework"
+LIB="libbrook_md_ffi.a"
 
 fail() { echo "error: $*" >&2; exit 1; }
 
@@ -55,10 +55,10 @@ mkdir -p "$STAGING"
 ( cd "$CRATE_DIR" && cargo run --quiet --features cli --bin uniffi-bindgen-swift -- \
     "$CRATE_DIR/target/$IOS/release/$LIB" "$STAGING" \
     --swift-sources --headers --modulemap \
-    --module-name flux_md_ffiFFI --modulemap-filename module.modulemap )
+    --module-name brook_md_ffiFFI --modulemap-filename module.modulemap )
 # The .swift is the package source, not a framework header — move it into place.
-mkdir -p "$SWIFT_DIR/Sources/FluxMd"
-mv "$STAGING/flux_md_ffi.swift" "$SWIFT_DIR/Sources/FluxMd/flux_md_ffi.swift"
+mkdir -p "$SWIFT_DIR/Sources/BrookMd"
+mv "$STAGING/brook_md_ffi.swift" "$SWIFT_DIR/Sources/BrookMd/brook_md_ffi.swift"
 
 echo "==> lipo simulator + macOS fat libs"
 SIM_FAT="$BUILD_DIR/ios-sim/$LIB"

@@ -1,2 +1,0 @@
-# Placeholder — libflux_md_ffi.so is staged here by scripts/build-android.sh
-# (per-ABI cargo-ndk cross-compile). Not committed; built in CI (rn-build.yml).

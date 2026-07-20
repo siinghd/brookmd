@@ -1,5 +1,5 @@
 /**
- * Playwright smoke for the Data Studio demo (flux-md 0.10.0 `blockData`).
+ * Playwright smoke for the Data Studio demo (brookmd 0.10.0 `blockData`).
  *
  * Proves, through a real browser, that rich UI is built from `block.kind.data`:
  *   1. EnhancedTable renders from the structured table data and SORTS by a
@@ -99,7 +99,7 @@ try {
 
   // Helpers scoped to the first table's element handle.
   const rowCount = () => tableEl.$$eval(".ds-grid tbody tr", (trs) => trs.length);
-  const isOpen = () => tableEl.evaluate((el) => el.getAttribute("data-flux-open") === "1");
+  const isOpen = () => tableEl.evaluate((el) => el.getAttribute("data-brook-open") === "1");
   const waitRows = async (n) => {
     for (let i = 0; i < 150 && (await rowCount()) < n; i++) await new Promise((r) => setTimeout(r, 100));
   };

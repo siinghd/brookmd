@@ -1,0 +1,29 @@
+# cargo-fuzz harness for brookmd-core. Its own workspace so it never pulls into
+# the parent crate's normal `cargo build`/`cargo test` (the WASM/publish path
+# never sees libfuzzer-sys). Run with:  cargo +nightly fuzz run parity
+[package]
+name = "brookmd-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.brookmd-core]
+path = ".."
+
+[[bin]]
+name = "parity"
+path = "fuzz_targets/parity.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

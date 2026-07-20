@@ -1,9 +1,9 @@
-# flux-md Swift bindings (EXPERIMENTAL)
+# brookmd Swift bindings (EXPERIMENTAL)
 
-First-party Swift bindings for the flux-md streaming Markdown parser, generated
-by [uniffi](https://mozilla.github.io/uniffi-rs/) from the `crates/flux-md-ffi`
-crate. `FluxSession` streams Markdown and returns the JSON **wire strings**
-defined in `crates/flux-md-core/WIRE.md` (contract v1.0.0) — byte-identical to
+First-party Swift bindings for the brookmd streaming Markdown parser, generated
+by [uniffi](https://mozilla.github.io/uniffi-rs/) from the `crates/brookmd-ffi`
+crate. `BrookSession` streams Markdown and returns the JSON **wire strings**
+defined in `crates/brookmd-core/WIRE.md` (contract v1.1.0) — byte-identical to
 the WASM/JS boundary.
 
 > **Status: EXPERIMENTAL.** The bindings compile and pass the wire-golden
@@ -15,20 +15,20 @@ the WASM/JS boundary.
 
 | Path | What it is |
 | --- | --- |
-| `Package.swift` | SPM package `FluxMd`; iOS 13+, macOS 11+. |
-| `Sources/FluxMd/flux_md_ffi.swift` | **Generated** uniffi Swift bindings (do not hand-edit — regenerate). |
-| `Tests/FluxMdTests/WireGoldenTests.swift` | XCTest wire goldens (byte-equality, block-data off + on). |
-| `Frameworks/flux_md_ffi.xcframework` | Built by `scripts/build-xcframework.sh` (not committed). |
+| `Package.swift` | SPM package `BrookMd`; iOS 13+, macOS 11+. |
+| `Sources/BrookMd/brook_md_ffi.swift` | **Generated** uniffi Swift bindings (do not hand-edit — regenerate). |
+| `Tests/BrookMdTests/WireGoldenTests.swift` | XCTest wire goldens (byte-equality, block-data off + on). |
+| `Frameworks/brook_md_ffi.xcframework` | Built by `scripts/build-xcframework.sh` (not committed). |
 | `scripts/generate.sh` | Regenerates the Swift source (idempotent). |
 | `scripts/build-xcframework.sh` | macOS-only; builds the iOS + iOS-sim + macOS slices into the XCFramework. |
 
 ## API
 
 ```swift
-import FluxMd
+import BrookMd
 
-let session = FluxSession()                        // library defaults
-// or: FluxSession.newWithConfig(config: FluxConfig(gfmAlerts: true, blockData: true))
+let session = BrookSession()                        // library defaults
+// or: BrookSession.newWithConfig(config: BrookConfig(gfmAlerts: true, blockData: true))
 
 let patch = session.append(chunk: "# Hello\n\n")     // JSON Patch string (WIRE.md §2)
 let tail  = session.finalize()                       // final JSON Patch
@@ -37,7 +37,7 @@ session.reset()                                      // reuse; ids restart at 0
 ```
 
 `append` / `finalize` / `allBlocks` return the exact wire bytes; decode with
-`JSONDecoder`. `FluxConfig` field defaults mirror the crate (`gfmAutolinks` and
+`JSONDecoder`. `BrookConfig` field defaults mirror the crate (`gfmAutolinks` and
 `gfmAlerts` **on**, everything else off).
 
 ## Consuming
@@ -50,19 +50,19 @@ bindings/swift/scripts/build-xcframework.sh   # macOS + Xcode required
 swift test --package-path bindings/swift
 ```
 
-The `FluxMdRustFFI` binary target references the XCFramework **by path**
-(`Frameworks/flux_md_ffi.xcframework`), so it must exist before `swift build` /
+The `BrookMdRustFFI` binary target references the XCFramework **by path**
+(`Frameworks/brook_md_ffi.xcframework`), so it must exist before `swift build` /
 `swift test` — CI builds it first. The generated Swift imports the low-level C
-module `flux_md_ffiFFI`, which the XCFramework vends via a plain
-`module flux_md_ffiFFI` modulemap in each slice's `Headers/`.
+module `brook_md_ffiFFI`, which the XCFramework vends via a plain
+`module brook_md_ffiFFI` modulemap in each slice's `Headers/`.
 
 **Future release plan (url + checksum):** a published package will replace the
 path-based `binaryTarget` with
 
 ```swift
 .binaryTarget(
-    name: "FluxMdRustFFI",
-    url: "https://…/flux_md_ffi.xcframework.zip",
+    name: "BrookMdRustFFI",
+    url: "https://…/brook_md_ffi.xcframework.zip",
     checksum: "…"   // swift package compute-checksum
 )
 ```
@@ -78,7 +78,7 @@ bindings/swift/scripts/generate.sh
 ```
 
 Runs the **in-crate** `uniffi-bindgen-swift` (pinned to `uniffi = "=0.31.0"`) and
-writes `Sources/FluxMd/flux_md_ffi.swift`. Commit the diff; CI regenerates and
+writes `Sources/BrookMd/brook_md_ffi.swift`. Commit the diff; CI regenerates and
 `git diff --exit-code`s it as a drift check.
 
 > Bindings are read from the release **staticlib** (`.a`), not the `.so`/`.dylib`:

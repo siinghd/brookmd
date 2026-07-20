@@ -23,11 +23,11 @@ jobs:
         run: rustup toolchain install nightly --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/flux-md-core/fuzz
+          workspaces: crates/brookmd-core/fuzz
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
       - name: Run the parity target on the seed corpus + fuzz
-        working-directory: crates/flux-md-core
+        working-directory: crates/brookmd-core
         # -max_total_time bounds the run; the seed corpus is replayed first so a
         # regression in a known shape fails fast. A crash writes a minimized
         # reproducer to fuzz/artifacts/, uploaded below.
@@ -39,5 +39,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts
-          path: crates/flux-md-core/fuzz/artifacts/
+          path: crates/brookmd-core/fuzz/artifacts/
           if-no-files-found: ignore

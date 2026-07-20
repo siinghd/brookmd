@@ -1,8 +1,8 @@
 // JVM host test for the generated uniffi Kotlin bindings.
 //
-// It compiles the exact same generated source the `fluxmd` Android library ships
+// It compiles the exact same generated source the `brookmd` Android library ships
 // (pulled in as an extra srcDir, no copy) and drives it through JNA against the
-// host `libflux_md_ffi.so`, asserting byte-equality with the wire goldens.
+// host `libbrook_md_ffi.so`, asserting byte-equality with the wire goldens.
 //
 // Run: gradle -p host-test test -Djna.library.path=/path/to/dir/with/.so
 plugins {
@@ -17,13 +17,13 @@ sourceSets {
     // Compile the committed, generated bindings from the sibling Android module.
     // A srcDir reference (not a copy) guarantees the two builds test identical code.
     main {
-        kotlin.srcDir("../fluxmd/src/main/kotlin")
+        kotlin.srcDir("../brookmd/src/main/kotlin")
     }
 }
 
 dependencies {
     // Plain JNA jar on the JVM host (NOT the @aar classifier, which is Android-only).
-    // uniffi's generated code does `Native.register(..., "flux_md_ffi")`, honoring
+    // uniffi's generated code does `Native.register(..., "brook_md_ffi")`, honoring
     // `-Djna.library.path` to locate the native library.
     implementation("net.java.dev.jna:jna:5.14.0")
     // kotlin-test mapped onto JUnit 4 (pulls junit:junit transitively); JUnit 4

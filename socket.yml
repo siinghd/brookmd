@@ -1,10 +1,10 @@
-# Socket.dev configuration for flux-md
+# Socket.dev configuration for brookmd
 #
-# Two CLASSES of Socket signal show up against flux-md. They are handled
+# Two CLASSES of Socket signal show up against brookmd. They are handled
 # differently on purpose:
 #
 #   A. FIRST-PARTY, INHERENT signals (hasNativeCode / networkAccess /
-#      filesystemAccess). These accurately describe flux-md itself: a Rust->WASM
+#      filesystemAccess). These accurately describe brookmd itself: a Rust->WASM
 #      parser that runs in a Web Worker, fetches a caller-supplied `src` URL, and
 #      (on Node/SSR) reads its own co-located .wasm off disk. We KEEP these
 #      ENABLED (`true`) and document them. Silencing an accurate first-party
@@ -13,7 +13,7 @@
 #
 #   B. UPSTREAM-FRAMEWORK-INTERNAL signals (usesEval / obfuscatedFile /
 #      dynamicRequire / potentialVulnerability / gptSecurity). These do NOT
-#      originate in flux-md. flux-md ships ZERO runtime dependencies (package.json
+#      originate in brookmd. brookmd ships ZERO runtime dependencies (package.json
 #      `dependencies` and `optionalDependencies` are both empty). The eval /
 #      obfuscation / "potential vulnerability" alerts come from TRANSITIVE
 #      internals of the OPTIONAL framework peers:
@@ -28,7 +28,7 @@
 #      solid-js and these packages never enter THEIR lockfile. The real fix is
 #      architectural (optional peers) and is already in place. We additionally set
 #      the BEHAVIORAL alert types (usesEval / obfuscatedFile / dynamicRequire) to
-#      `false` so framework internals don't block flux-md's OWN monorepo CI, where
+#      `false` so framework internals don't block brookmd's OWN monorepo CI, where
 #      devDependencies install all four frameworks for cross-framework tests and
 #      thus pull seroval + @vue/compiler-* in.
 #
@@ -43,13 +43,13 @@
 #
 # HONESTY CAVEAT: socket.yml `issueRules` are GLOBAL per-alert-type toggles; they
 # cannot scope to "only seroval" or "only @vue/*". Setting `usesEval:false`
-# therefore also disables eval detection for flux-md's own first-party source.
-# That is acceptable here ONLY because flux-md's source contains no `eval` and no
+# therefore also disables eval detection for brookmd's own first-party source.
+# That is acceptable here ONLY because brookmd's source contains no `eval` and no
 # `Function(...)` constructor — verified (returns nothing; excludes the
 # wasm-bindgen glue, which also has none):
-#   grep -rnE '\beval\s*\(|\bnew Function\b|\bFunction\s*\(' packages/flux-md/src \
+#   grep -rnE '\beval\s*\(|\bnew Function\b|\bFunction\s*\(' packages/brookmd/src \
 #     --include='*.ts' --include='*.tsx'
-# If flux-md ever adds first-party dynamic code, REMOVE these `false` toggles and
+# If brookmd ever adds first-party dynamic code, REMOVE these `false` toggles and
 # use per-package ignores instead — the Socket dashboard "ignore for this package",
 # or PR comments like `@SocketSecurity ignore seroval@1.5.4` /
 # `@SocketSecurity ignore @vue/compiler-core@3.5.39` — which are the precise,
@@ -70,12 +70,12 @@ issueRules:
 
   # hasNativeCode
   #
-  # flux-md ships a precompiled WebAssembly binary:
-  #   packages/flux-md/dist/wasm/flux_md_core_bg.wasm  (~180 KB)
+  # brookmd ships a precompiled WebAssembly binary:
+  #   packages/brookmd/dist/wasm/brook_md_core_bg.wasm  (~180 KB)
   # the Rust->WASM parser core. It is reproducibly buildable from
-  # crates/flux-md-core/ via `bun run build:wasm`, loaded only via the co-located
-  # wasm-bindgen glue (dist/wasm/flux_md_core.js) using
-  # `new URL("flux_md_core_bg.wasm", import.meta.url)`, executed inside a sandboxed
+  # crates/brookmd-core/ via `bun run build:wasm`, loaded only via the co-located
+  # wasm-bindgen glue (dist/wasm/brook_md_core.js) using
+  # `new URL("brook_md_core_bg.wasm", import.meta.url)`, executed inside a sandboxed
   # Web Worker (browser) or worker_threads (Node), and never fetched from a remote
   # endpoint. A WASM-core parser cannot exist without a compiled binary; the alert
   # is accurate and the binary is first-party + auditable.
@@ -84,47 +84,47 @@ issueRules:
 
   # networkAccess
   #
-  # flux-md's OWN network I/O is exactly two caller-driven cases:
-  #   1. <flux-markdown src="URL"> (element.ts) fetches the URL the application
-  #      developer supplies and streams it; flux-md never chooses a URL.
+  # brookmd's OWN network I/O is exactly two caller-driven cases:
+  #   1. <brook-markdown src="URL"> (element.ts) fetches the URL the application
+  #      developer supplies and streams it; brookmd never chooses a URL.
   #   2. wasm-bindgen glue fetch() of the co-located .wasm on first load, which
   #      bundlers resolve to a LOCAL build asset at build time.
   # No telemetry, no analytics, no first-party remote endpoints.
   # (@vue/compiler-sfc's `globalThis["fetch"]` network signal — transitive of the
   # OPTIONAL vue peer — also rides under this type. It is the Vue template
-  # compiler, not flux-md, and is absent from any consumer that does not install
-  # vue. We keep this type ENABLED because flux-md's own networkAccess is real and
+  # compiler, not brookmd, and is absent from any consumer that does not install
+  # vue. We keep this type ENABLED because brookmd's own networkAccess is real and
   # worth surfacing; the vue-compiler instance is documented as upstream.)
   networkAccess: true
 
   # filesystemAccess
   #
-  # flux-md/server (server.tsx) reads the package's OWN .wasm off disk on Node via
-  # `new URL("./wasm/flux_md_core_bg.wasm", import.meta.url)` + fs, because Node's
+  # brookmd/server (server.tsx) reads the package's OWN .wasm off disk on Node via
+  # `new URL("./wasm/brook_md_core_bg.wasm", import.meta.url)` + fs, because Node's
   # fetch() cannot load file:// URLs. Node-only branch; reads only the
   # package-internal asset, never a caller-supplied path. Standard wasm-bindgen
   # Node loading. Kept ENABLED + documented.
   filesystemAccess: true
 
   # =========================================================================
-  # B. UPSTREAM-FRAMEWORK-INTERNAL SIGNALS — suppressed (NOT flux-md code)
+  # B. UPSTREAM-FRAMEWORK-INTERNAL SIGNALS — suppressed (NOT brookmd code)
   #    These fire ONLY on transitive deps of the OPTIONAL framework peers
-  #    (seroval via solid-js; @vue/compiler-* via vue). flux-md itself has zero
+  #    (seroval via solid-js; @vue/compiler-* via vue). brookmd itself has zero
   #    runtime deps and no first-party eval / Function / dynamic-require.
   # =========================================================================
 
   # usesEval — seroval `(0,eval)(source)` (solid-js serializer deserialize) and
   # @vue/compiler-core Function-constructor codegen (vue template compiler).
-  # Neither is flux-md; flux-md's own source has no eval/Function (verified above).
+  # Neither is brookmd; brookmd's own source has no eval/Function (verified above).
   usesEval: false
 
   # obfuscatedFile — minified esm-bundler builds of the framework
-  # compilers/serializers read as "obfuscated". flux-md ships readable, compiled,
+  # compilers/serializers read as "obfuscated". brookmd ships readable, compiled,
   # non-minified ESM (dist/*.js) — these instances are upstream-framework only.
   obfuscatedFile: false
 
   # dynamicRequire — dynamic module resolution inside the framework
-  # compiler/runtime internals (optional peers). Not present in flux-md source;
+  # compiler/runtime internals (optional peers). Not present in brookmd source;
   # server.tsx's only dynamic import is a single literal `import("node:fs/promises")`.
   dynamicRequire: false
 

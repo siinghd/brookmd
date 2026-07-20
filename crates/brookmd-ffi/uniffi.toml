@@ -1,0 +1,11 @@
+# uniffi bindings configuration for brookmd-ffi.
+#
+# Discovered automatically in library mode (it sits next to this crate's
+# Cargo.toml); the generate scripts also pass it via `--config` explicitly.
+# Keep the package/module names in sync with the committed bindings under
+# `bindings/kotlin` and `bindings/swift`.
+
+[bindings.kotlin]
+# The generated .kt lands under io/github/siinghd/brookmd/ and the JVM host-test
+# + Android library both import from this package.
+package_name = "io.github.siinghd.brookmd"

@@ -7,21 +7,21 @@ crates/*/target/
 
 # Web build output
 web/dist/
-web/dist-flux/
+web/dist-brook/
 *.tsbuildinfo
 
-# Compiled package output (built on demand by `bun run --cwd packages/flux-md build`
+# Compiled package output (built on demand by `bun run --cwd packages/brookmd build`
 # and by prepublishOnly). Ignored at the repo root — ABOVE the package — so it
 # stays out of git but is still shipped by `npm pack` (files=["dist"]); see the
 # WASM note below for why repo-root ignores don't reach npm-packlist.
-/packages/flux-md/dist/
+/packages/brookmd/dist/
 
 # Generated WASM (wasm-pack output) — built on demand, never committed.
 # Ignored here at the repo root, ABOVE the package, so it stays out of git but
 # is still shipped by `npm pack` (npm-packlist only reads ignore files at/below
 # the package root, never the repo root). build:wasm deletes wasm-pack's own
 # src/wasm/.gitignore so no nested ignore can drop the WASM from the tarball.
-/packages/flux-md/src/wasm/
+/packages/brookmd/src/wasm/
 
 # Editor / OS / local tooling state
 .DS_Store

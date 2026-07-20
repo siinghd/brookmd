@@ -1,16 +1,16 @@
 name: rn-build
 
-# Builds and tests the flux-md-react-native native layer. The `js` job is the
+# Builds and tests the brookmd-react-native native layer. The `js` job is the
 # authoritative host check (bun tests + typecheck, exactly as run locally); the
-# `android` and `ios` jobs cross-compile the flux-md-ffi crate for device targets
+# `android` and `ios` jobs cross-compile the brookmd-ffi crate for device targets
 # and upload the artifacts. Device jobs run on hosted runners with an NDK / Xcode
 # available — they are not validated on the dev box.
 on:
   pull_request:
     paths:
-      - "crates/flux-md-ffi/**"
-      - "crates/flux-md-core/**"
-      - "packages/flux-md-react-native/**"
+      - "crates/brookmd-ffi/**"
+      - "crates/brookmd-core/**"
+      - "packages/brookmd-react-native/**"
       - ".github/workflows/rn-build.yml"
   workflow_dispatch:
 
@@ -40,29 +40,29 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      # The host tests drive flux-md's real compiled WASM parser; build it first
+      # The host tests drive brookmd's real compiled WASM parser; build it first
       # (stable toolchain) so the streaming-parity suite runs rather than skips.
-      - name: Build flux-md WASM
+      - name: Build brookmd WASM
         run: bun run build:wasm:stable
 
-      # The RN package imports flux-md via its package exports (flux-md/client,
-      # flux-md/worker-core, flux-md/html-to-react, …), which resolve to dist/.
-      # flux-md has no prepare hook, so build its dist explicitly or every import
+      # The RN package imports brookmd via its package exports (brookmd/client,
+      # brookmd/worker-core, brookmd/html-to-react, …), which resolve to dist/.
+      # brookmd has no prepare hook, so build its dist explicitly or every import
       # resolves to a missing file on a clean runner.
-      - name: Build flux-md dist
-        working-directory: packages/flux-md
+      - name: Build brookmd dist
+        working-directory: packages/brookmd
         run: node scripts/build.mjs
 
-      - name: Test flux-md-react-native
-        working-directory: packages/flux-md-react-native
+      - name: Test brookmd-react-native
+        working-directory: packages/brookmd-react-native
         run: bun test
 
-      - name: Typecheck flux-md-react-native (test config)
-        working-directory: packages/flux-md-react-native
+      - name: Typecheck brookmd-react-native (test config)
+        working-directory: packages/brookmd-react-native
         run: ./node_modules/.bin/tsc --noEmit -p tsconfig.test.json
 
-      - name: Typecheck flux-md-react-native (main config)
-        working-directory: packages/flux-md-react-native
+      - name: Typecheck brookmd-react-native (main config)
+        working-directory: packages/brookmd-react-native
         run: ./node_modules/.bin/tsc --noEmit -p tsconfig.json
 
   android:
@@ -85,14 +85,14 @@ jobs:
         run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
 
       - name: Build device .so for all ABIs
-        working-directory: packages/flux-md-react-native
+        working-directory: packages/brookmd-react-native
         run: bash scripts/build-android.sh
 
       - name: Upload jniLibs
         uses: actions/upload-artifact@v4
         with:
-          name: flux-md-ffi-android-jniLibs
-          path: packages/flux-md-react-native/android/src/main/jniLibs/**/*.so
+          name: brookmd-ffi-android-jniLibs
+          path: packages/brookmd-react-native/android/src/main/jniLibs/**/*.so
           if-no-files-found: error
 
   ios:
@@ -107,12 +107,12 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
 
       - name: Build XCFramework (device + simulator)
-        working-directory: packages/flux-md-react-native
+        working-directory: packages/brookmd-react-native
         run: bash scripts/build-ios.sh
 
       - name: Upload XCFramework
         uses: actions/upload-artifact@v4
         with:
-          name: flux-md-ffi-ios-xcframework
-          path: packages/flux-md-react-native/ios/FluxMdFfi.xcframework
+          name: brookmd-ffi-ios-xcframework
+          path: packages/brookmd-react-native/ios/BrookMdFfi.xcframework
           if-no-files-found: error

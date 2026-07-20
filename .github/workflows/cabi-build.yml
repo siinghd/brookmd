@@ -1,7 +1,7 @@
 name: cabi-build
 
-# Builds and tests the flux-md C-ABI layer (crates/flux-md-cabi), consumed by the
-# flux_md Flutter/Dart package via dart:ffi. The `test` job is the authoritative
+# Builds and tests the brookmd C-ABI layer (crates/brookmd-cabi), consumed by the
+# brook_md Flutter/Dart package via dart:ffi. The `test` job is the authoritative
 # host check (cargo test + clippy, exactly as run locally); the `android` and
 # `apple` jobs cross-compile the crate for device/desktop targets and upload the
 # prebuilt binaries as artifacts. Device jobs run on hosted runners with an NDK /
@@ -9,8 +9,8 @@ name: cabi-build
 on:
   pull_request:
     paths:
-      - "crates/flux-md-cabi/**"
-      - "crates/flux-md-core/**"
+      - "crates/brookmd-cabi/**"
+      - "crates/brookmd-core/**"
       - ".github/workflows/cabi-build.yml"
   workflow_dispatch:
 
@@ -31,10 +31,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: crates/flux-md-cabi
+          workspaces: crates/brookmd-cabi
 
       - name: cargo test (wire goldens + symbol-drift tripwire)
-        working-directory: crates/flux-md-cabi
+        working-directory: crates/brookmd-cabi
         # A release build first so the cdylib exists and the symbol-drift test's
         # `nm -D` check runs against a real artifact rather than skipping.
         run: |
@@ -42,7 +42,7 @@ jobs:
           cargo test
 
       - name: cargo clippy (deny warnings)
-        working-directory: crates/flux-md-cabi
+        working-directory: crates/brookmd-cabi
         run: cargo clippy --all-targets -- -D warnings
 
   android:
@@ -65,7 +65,7 @@ jobs:
         run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
 
       - name: Build cdylib for all ABIs
-        working-directory: crates/flux-md-cabi
+        working-directory: crates/brookmd-cabi
         # cargo-ndk's -o stages each .so under <abi>/ (arm64-v8a, …) in an artifact
         # dir — NOT the RN package's jniLibs; this crate ships prebuilt binaries.
         run: |
@@ -77,13 +77,13 @@ jobs:
             -o "$out" \
             --platform 24 \
             -- build --release
-          cp include/flux_md.h "$out/flux_md.h"
+          cp include/brook_md.h "$out/brook_md.h"
           ls -R "$out"
 
       - name: Upload android binaries
         uses: actions/upload-artifact@v4
         with:
-          name: flux-md-cabi-android
+          name: brookmd-cabi-android
           path: artifacts/android/**
           if-no-files-found: error
 
@@ -99,14 +99,14 @@ jobs:
           targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin
 
       - name: Build iOS XCFramework + universal macOS dylib
-        working-directory: crates/flux-md-cabi
+        working-directory: crates/brookmd-cabi
         run: |
           set -euo pipefail
           out="${{ github.workspace }}/artifacts/apple"
           mkdir -p "$out"
 
-          A="libflux_md_cabi.a"       # staticlib slice → iOS (linked into the app)
-          DYL="libflux_md_cabi.dylib" # cdylib slice → macOS desktop
+          A="libbrook_md_cabi.a"       # staticlib slice → iOS (linked into the app)
+          DYL="libbrook_md_cabi.dylib" # cdylib slice → macOS desktop
 
           DEVICE=aarch64-apple-ios
           SIM_ARM=aarch64-apple-ios-sim
@@ -126,11 +126,11 @@ jobs:
             -output "$sim_fat"
 
           # XCFramework: device static slice + fat simulator slice, header bundled.
-          rm -rf "$out/FluxMdCabi.xcframework"
+          rm -rf "$out/BrookMdCabi.xcframework"
           xcodebuild -create-xcframework \
             -library "target/$DEVICE/release/$A" -headers include \
             -library "$sim_fat" -headers include \
-            -output "$out/FluxMdCabi.xcframework"
+            -output "$out/BrookMdCabi.xcframework"
           rm -f "$sim_fat"
 
           # Universal macOS dylib for desktop Flutter.
@@ -139,12 +139,12 @@ jobs:
             "target/$MAC_X86/release/$DYL" \
             -output "$out/$DYL"
 
-          cp include/flux_md.h "$out/flux_md.h"
+          cp include/brook_md.h "$out/brook_md.h"
           ls -R "$out"
 
       - name: Upload apple binaries
         uses: actions/upload-artifact@v4
         with:
-          name: flux-md-cabi-apple
+          name: brookmd-cabi-apple
           path: artifacts/apple/**
           if-no-files-found: error

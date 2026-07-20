@@ -1,28 +1,28 @@
-# flux-md
+# brookmd
 
-[![npm](https://img.shields.io/npm/v/flux-md.svg)](https://www.npmjs.com/package/flux-md)
-[![CI](https://github.com/siinghd/flux-md/actions/workflows/ci.yml/badge.svg)](https://github.com/siinghd/flux-md/actions/workflows/ci.yml)
-[![license](https://img.shields.io/npm/l/flux-md.svg)](LICENSE)
+[![npm](https://img.shields.io/npm/v/brookmd.svg)](https://www.npmjs.com/package/brookmd)
+[![CI](https://github.com/siinghd/brookmd/actions/workflows/ci.yml/badge.svg)](https://github.com/siinghd/brookmd/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/brookmd.svg)](LICENSE)
 
 **Zero-dep streaming markdown for the browser.** A Rust→WASM core with one pooled
 Web Worker per stream, incremental parse with speculative closure for mid-stream
 constructs, and stable block identities so unchanged blocks never re-reconcile.
 
-Wire each LLM stream to a `FluxClient` and the markdown renders incrementally
+Wire each LLM stream to a `BrookClient` and the markdown renders incrementally
 **off the main thread**, block by block — so many concurrent streams render
 without melting the UI thread. 100% CommonMark 0.31 + GFM.
 
-**[Live demo](https://md.hsingh.app/)** · **[Full docs &amp; API →](packages/flux-md/README.md)** · **[Changelog](packages/flux-md/CHANGELOG.md)**
+**[Live demo](https://md.hsingh.app/)** · **[Full docs &amp; API →](packages/brookmd/README.md)** · **[Changelog](packages/brookmd/CHANGELOG.md)**
 
 ```bash
-npm i flux-md
+npm i brookmd
 ```
 
 ```tsx
-import { FluxMarkdown } from "flux-md/react";
+import { BrookMarkdown } from "brookmd/react";
 
 // `stream` is an AsyncIterable<string> (SSE deltas), a Response, or a ReadableStream
-<FluxMarkdown stream={stream} />;
+<BrookMarkdown stream={stream} />;
 ```
 
 ## Highlights
@@ -37,11 +37,11 @@ import { FluxMarkdown } from "flux-md/react";
   `block.kind.data`, so you build toolbars (sort/filter/CSV), tables of contents,
   charts, and copy buttons from data — no HTML re-parsing, no AST tree to walk.
 - **Renderers for every stack** — React, Vue 3, Svelte (4 & 5), Solid, a
-  framework-agnostic `<flux-markdown>` Web Component, and a vanilla DOM mount.
+  framework-agnostic `<brook-markdown>` Web Component, and a vanilla DOM mount.
 - **Zero runtime dependencies.** The whole engine is one WASM binary plus a small
   TypeScript client.
 
-See the **[package README](packages/flux-md/README.md)** for the full API,
+See the **[package README](packages/brookmd/README.md)** for the full API,
 per-stream config, framework bindings, security model, and scaling helpers
 (`virtualize`, `stickToBottom`).
 
@@ -49,12 +49,12 @@ per-stream config, framework bindings, security model, and scaling helpers
 
 | Path | What |
 |------|------|
-| [`packages/flux-md`](packages/flux-md) | The published npm package — TS client + renderers, and the full docs. |
-| [`crates/flux-md-core`](crates/flux-md-core) | The Rust parser/renderer, published to [crates.io](https://crates.io/crates/flux-md-core); compiled to WASM for the npm package. Emits the versioned JSON [wire contract](crates/flux-md-core/WIRE.md). |
-| [`crates/flux-md-ffi`](crates/flux-md-ffi) | uniffi wrapper over the core for native targets (React Native, Swift, Kotlin). |
-| [`crates/flux-md-cabi`](crates/flux-md-cabi) | Plain C-ABI wrapper (Dart/Flutter and any C FFI consumer). |
-| [`packages/flux-md-react-native`](packages/flux-md-react-native) | React Native renderer over the native core (experimental — not yet on npm). |
-| [`packages/flux-md-flutter`](packages/flux-md-flutter) | Flutter/Dart scaffold over the C ABI (experimental). |
+| [`packages/brookmd`](packages/brookmd) | The published npm package — TS client + renderers, and the full docs. |
+| [`crates/brookmd-core`](crates/brookmd-core) | The Rust parser/renderer, published to [crates.io](https://crates.io/crates/brookmd-core); compiled to WASM for the npm package. Emits the versioned JSON [wire contract](crates/brookmd-core/WIRE.md). |
+| [`crates/brookmd-ffi`](crates/brookmd-ffi) | uniffi wrapper over the core for native targets (React Native, Swift, Kotlin). |
+| [`crates/brookmd-cabi`](crates/brookmd-cabi) | Plain C-ABI wrapper (Dart/Flutter and any C FFI consumer). |
+| [`packages/brookmd-react-native`](packages/brookmd-react-native) | React Native renderer over the native core (experimental — not yet on npm). |
+| [`packages/brookmd-flutter`](packages/brookmd-flutter) | Flutter/Dart scaffold over the C ABI (experimental). |
 | [`bindings/kotlin`](bindings/kotlin) | Kotlin/Android bindings (experimental). |
 | [`bindings/swift`](bindings/swift) | Swift package (iOS + macOS) bindings (experimental). |
 | [`web`](web) | The live demo / playground ([md.hsingh.app](https://md.hsingh.app/)). |
@@ -62,9 +62,9 @@ per-stream config, framework bindings, security model, and scaling helpers
 ## Beyond JavaScript
 
 The same Rust core streams the same versioned JSON wire
-([WIRE.md](crates/flux-md-core/WIRE.md)) across every boundary — WASM for
-browsers/Node, [uniffi](crates/flux-md-ffi) for React Native/Swift/Kotlin, and a
-[C ABI](crates/flux-md-cabi) for Flutter or any language with a C FFI. Golden
+([WIRE.md](crates/brookmd-core/WIRE.md)) across every boundary — WASM for
+browsers/Node, [uniffi](crates/brookmd-ffi) for React Native/Swift/Kotlin, and a
+[C ABI](crates/brookmd-cabi) for Flutter or any language with a C FFI. Golden
 tests pin all three boundaries to byte-identical output. The native paths are
 **experimental**: CI cross-compiles and host-tests them, but they are not yet
 published or device-validated.
@@ -74,7 +74,7 @@ published or device-validated.
 ```bash
 bun install
 bun run build:wasm        # compile the Rust core → WASM
-cd packages/flux-md && bun test
+cd packages/brookmd && bun test
 ```
 
 CI enforces the CommonMark 652/652 + GFM conformance floors, the JS test suite, a

@@ -1,7 +1,7 @@
 /**
  * A canned markdown document for the "Data Studio" demo. It contains GFM tables,
  * several headings (so the live TOC has something to build), and a code block —
- * exactly the block kinds whose structured `kind.data` (the flux-md 0.10.0
+ * exactly the block kinds whose structured `kind.data` (the brookmd 0.10.0
  * opt-in `blockData` channel) the demo consumes WITHOUT re-parsing HTML.
  *
  * Streamed via {@link streamDemoDoc}, a tiny async generator that yields the doc
