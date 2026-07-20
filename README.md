@@ -4,13 +4,15 @@
 [![CI](https://github.com/siinghd/brookmd/actions/workflows/ci.yml/badge.svg)](https://github.com/siinghd/brookmd/actions/workflows/ci.yml)
 [![license](https://img.shields.io/npm/l/brookmd.svg)](LICENSE)
 
-**Zero-dep streaming markdown for the browser.** A Rust→WASM core with one pooled
-Web Worker per stream, incremental parse with speculative closure for mid-stream
-constructs, and stable block identities so unchanged blocks never re-reconcile.
+**Streaming markdown for every platform.** One Rust core — incremental parse
+with speculative closure for mid-stream constructs, stable block identities so
+unchanged blocks never re-reconcile — compiled to WASM for the web and to
+native libraries for mobile and desktop. Every boundary emits the same
+versioned JSON wire, byte-for-byte. 100% CommonMark 0.31 + GFM.
 
-Wire each LLM stream to a `BrookClient` and the markdown renders incrementally
-**off the main thread**, block by block — so many concurrent streams render
-without melting the UI thread. 100% CommonMark 0.31 + GFM.
+In the browser, wire each LLM stream to a `BrookClient` and the markdown
+renders incrementally **off the main thread**, block by block — so many
+concurrent streams render without melting the UI thread.
 
 **[Live demo](https://md.hsingh.app/)** · **[Full docs &amp; API →](packages/brookmd/README.md)** · **[Changelog](packages/brookmd/CHANGELOG.md)**
 
@@ -37,7 +39,9 @@ import { BrookMarkdown } from "brookmd/react";
   `block.kind.data`, so you build toolbars (sort/filter/CSV), tables of contents,
   charts, and copy buttons from data — no HTML re-parsing, no AST tree to walk.
 - **Renderers for every stack** — React, Vue 3, Svelte (4 & 5), Solid, a
-  framework-agnostic `<brook-markdown>` Web Component, and a vanilla DOM mount.
+  framework-agnostic `<brook-markdown>` Web Component, and a vanilla DOM mount
+  on the web; a React Native renderer and Swift/Kotlin/Flutter bindings over
+  the native core (experimental — see [Platforms](#platforms)).
 - **Zero runtime dependencies.** The whole engine is one WASM binary plus a small
   TypeScript client.
 
@@ -59,15 +63,25 @@ per-stream config, framework bindings, security model, and scaling helpers
 | [`bindings/swift`](bindings/swift) | Swift package (iOS + macOS) bindings (experimental). |
 | [`web`](web) | The live demo / playground ([md.hsingh.app](https://md.hsingh.app/)). |
 
-## Beyond JavaScript
+## Platforms
 
 The same Rust core streams the same versioned JSON wire
-([WIRE.md](crates/brookmd-core/WIRE.md)) across every boundary — WASM for
-browsers/Node, [uniffi](crates/brookmd-ffi) for React Native/Swift/Kotlin, and a
-[C ABI](crates/brookmd-cabi) for Flutter or any language with a C FFI. Golden
-tests pin all three boundaries to byte-identical output. The native paths are
-**experimental**: CI cross-compiles and host-tests them, but they are not yet
-published or device-validated.
+([WIRE.md](crates/brookmd-core/WIRE.md)) across every boundary; golden tests
+pin every binding to byte-identical output.
+
+| Platform | Use | Status |
+|----------|-----|--------|
+| Browser / Node / SSR | [`brookmd`](https://www.npmjs.com/package/brookmd) on npm (React, Vue, Svelte, Solid, Web Component, DOM, server) | **Stable** — published |
+| Rust | [`brookmd-core`](https://crates.io/crates/brookmd-core) on crates.io | **Stable** — published |
+| React Native (iOS + Android) | [`packages/brookmd-react-native`](packages/brookmd-react-native) — native parser via JSI, RN renderer | Experimental — CI-built, pending device validation; not yet on npm |
+| iOS / macOS (Swift) | [`bindings/swift`](bindings/swift) — SPM package `BrookMd` over an XCFramework | Experimental — CI-built and host-tested |
+| Android (Kotlin) | [`bindings/kotlin`](bindings/kotlin) — Android library + JVM-tested uniffi bindings | Experimental — CI-built and host-tested |
+| Flutter / Dart | [`packages/brookmd-flutter`](packages/brookmd-flutter) over the C ABI | Experimental — scaffold |
+| Anything with a C FFI | [`crates/brookmd-cabi`](crates/brookmd-cabi) + `include/brook_md.h` | Experimental — tested on host |
+
+Native bindings ship prebuilt from CI (Android `.so` per ABI, Apple
+XCFrameworks with iOS + macOS slices); nothing native is published to a
+package registry yet.
 
 ## Development
 

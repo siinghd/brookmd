@@ -6,6 +6,12 @@ Drop in a streaming-aware renderer — **React, Vue, Svelte, Solid, a framework-
 
 Parsing runs entirely **off the main thread** — each stream gets its own pooled Web Worker, so many concurrent LLM responses render without contending for the UI thread. On each token the parser re-parses only the **active tail**, not the whole document, and heavy renderers (syntax highlighting, math, mermaid) are **deferred until a block closes**. The result is low retained memory and a main thread that stays responsive while streaming. See [the live demo](https://md.hsingh.app/).
 
+> **Beyond the browser:** the same Rust core also powers experimental React
+> Native, Swift (iOS/macOS), Kotlin/Android, Flutter, and C-ABI bindings —
+> every platform speaks the same versioned wire, byte-for-byte. See the
+> [platform matrix](https://github.com/siinghd/brookmd#platforms) in the
+> repository README.
+
 ## Install
 
 ```bash
