@@ -1198,3 +1198,97 @@ fn mod3_tail_cache_retro_strong_across_chunk_boundary() {
     p.append(" then *plain* text"); // trailing prose (with emphasis) after the close
     assert_eq!(collect(&p), one("a**bc* c* c** then *plain* text"), "prose after close");
 }
+
+// ---------------------------------------------------------------------------
+// Deep-quote staircase (the `DeepQuoteCache` fast path): a monotonically
+// deepening nested blockquote — line k carries k `> ` markers — streams in
+// O(new bytes) with no per-level recursion, and must stay byte-identical to the
+// one-shot open view at every chunk split. Guards the container-depth-growth-pin
+// fix (folded settled levels, empty deeper markers, incomplete deepest line).
+// ---------------------------------------------------------------------------
+
+fn streamed_open_chunked(md: &str, chunk: usize) -> String {
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    let b = md.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let mut e = (i + chunk).min(b.len());
+        while e < b.len() && (b[e] & 0xC0) == 0x80 {
+            e += 1;
+        }
+        p.append(&md[i..e]);
+        i = e;
+    }
+    p.append("");
+    collect(&p)
+}
+
+fn staircase(depth: usize) -> String {
+    let mut s = String::new();
+    for k in 1..=depth {
+        for _ in 0..k {
+            s.push_str("> ");
+        }
+        s.push_str(&format!("level {k} prose with **bold**\n"));
+    }
+    s
+}
+
+#[test]
+fn deep_quote_staircase_parity_all_cuts() {
+    // A staircase crossing MAX_CONTAINER_DEPTH (24) into the DeepQuoteCache. Every
+    // prefix cut, chunk 128 (fast, structural), must equal the one-shot open view —
+    // this catches folded-level, empty-deeper-marker and closer-count divergences.
+    let md = staircase(32);
+    for cut in 1..=md.len() {
+        if !md.is_char_boundary(cut) {
+            continue;
+        }
+        let prefix = &md[..cut];
+        assert_eq!(
+            streamed_open_chunked(prefix, 128),
+            one_shot_open(prefix),
+            "chunk-128 open view != one-shot at cut {cut}: {prefix:?}"
+        );
+    }
+    // Char-by-char (chunk 1) full-doc parity: the marker-by-marker deepening path,
+    // where each deeper level's markers arrive before its content.
+    assert_parity(&md);
+}
+
+#[test]
+fn deep_quote_staircase_deviations_parity() {
+    // Each deviation from the pure staircase must bail to the byte-identical full
+    // path. Verified char-by-char AND at several chunk sizes for every prefix cut.
+    let mut cases: Vec<String> = Vec::new();
+    // deepening, then a SHALLOWER line
+    cases.push(format!("{}> > shallow again\n> > > deeper\n", staircase(28)));
+    // deepening, then a BLANK line, then a new quote
+    cases.push(format!("{}\n> after blank\n", staircase(27)));
+    // deepening, then a LAZY continuation (no marker)
+    cases.push(format!("{}lazy continuation line\n", staircase(26)));
+    // deepening, then a nested ALERT marker + body
+    cases.push(format!("{}{}[!NOTE]\n{}note body\n", staircase(25), "> ".repeat(26), "> ".repeat(27)));
+    // deepening, then a nested LIST item (non-prose content)
+    cases.push(format!("{}{}- item\n", staircase(25), "> ".repeat(26)));
+    // an as-yet-content-less deeper marker line mid-stream (empty inner blockquote)
+    cases.push(format!("{}{}\n", staircase(26), "> ".repeat(27)));
+    for md in &cases {
+        // All-cuts at chunk 128 — the structural coverage (where the fix's
+        // folded-level / empty-deeper-marker / closer divergences surfaced).
+        for cut in 1..=md.len() {
+            if !md.is_char_boundary(cut) {
+                continue;
+            }
+            let prefix = &md[..cut];
+            assert_eq!(
+                streamed_open_chunked(prefix, 128),
+                one_shot_open(prefix),
+                "chunk-128 open view != one-shot at cut {cut}: {prefix:?}"
+            );
+        }
+        // Char-by-char (chunk 1) parity for the whole document — the per-byte
+        // marker-streaming path (deeper markers arriving before content).
+        assert_parity(md);
+    }
+}

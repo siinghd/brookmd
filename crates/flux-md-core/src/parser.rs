@@ -325,6 +325,11 @@ pub struct StreamParser {
     /// nested `StreamParser` so structured containers stream in O(total bytes)
     /// instead of re-parsing the whole growing tail every append.
     container_block_cache: Option<ContainerBlockCache>,
+    /// Iterative fast path for a monotonically-deepening nested-blockquote
+    /// staircase — the shape the recursive [`ContainerBlockCache`] streams
+    /// worse-than-quadratically. Byte-identical to that path but with no per-level
+    /// call-stack recursion (see [`DeepQuoteCache`]). Top-level, `block_data` off.
+    deep_quote_cache: Option<DeepQuoteCache>,
     /// True only for a NESTED parser owned by a [`ContainerBlockCache`]. When set,
     /// every block this parser produces (committed AND active) renders with
     /// `open_tail = true`, matching `render_blockquote` / `render_alert`, which
@@ -1022,6 +1027,78 @@ struct ContainerBlockCache {
     committed_nested: Vec<Rc<NestedBlock>>,
 }
 
+/// Deepest cache depth [`DeepQuoteCache`] renders before it hands the tail back to
+/// the full reparse. It equals the byte-parity boundary of the recursive
+/// [`ContainerBlockCache`] path it replaces: that path caches
+/// [`MAX_CONTAINER_DEPTH`] nested-parser levels (each consuming NO render budget),
+/// then the innermost full-reparses, whose `render_block` recursion truncates at
+/// [`render::MAX_RENDER_DEPTH`] (100) — so the streamed staircase renders exactly
+/// `MAX_CONTAINER_DEPTH + 100` blockquotes deep, then escapes the remainder.
+/// `DeepQuoteCache` reproduces that byte-for-byte up to this bound and BAILS the
+/// instant a deeper level would cross it, so the (adversarial, past-real-document)
+/// truncation regime stays on the original path unchanged.
+const DEEP_QUOTE_MAX_DEPTH: usize = MAX_CONTAINER_DEPTH + 100;
+
+/// Iterative fast path for a monotonically-DEEPENING nested-blockquote staircase
+/// (line k carries exactly k `> ` markers, each level a single plain-prose
+/// paragraph) — the one container shape the recursive [`ContainerBlockCache`]
+/// streams worse-than-quadratically. That path spends one nested [`StreamParser`]
+/// per level (capped at [`MAX_CONTAINER_DEPTH`] to bound the recursive-`append`
+/// call stack against the WASM shadow stack); past the cap the innermost parser
+/// re-scans and re-renders its whole growing tail every append.
+///
+/// This cache instead folds each settled shallower level's opener EXACTLY once
+/// into `settled` and keeps ONE open parser for the deepest line, so it extends in
+/// O(new bytes) with NO per-level call-stack recursion (a heap `String` + a single
+/// parser, never nested parsers — so arbitrary depth costs no shadow stack). It is
+/// byte-identical to the recursive path: each level is `render_blockquote`'s
+/// `<blockquote>` wrapper around one prose paragraph rendered with the same engine
+/// and `force_open_tail`.
+///
+/// It BAILS (drops itself → the full reparse re-arms the recursive path, i.e. the
+/// unchanged baseline) on ANY deviation from the pure single-step deepening shape:
+/// a line not exactly one level deeper, a non-prose first content byte (anything
+/// that could open a different block or an alert), a lazy/blank/shallower line, a
+/// `\r`, a footnote marker (with footnotes on), or a depth reaching
+/// [`DEEP_QUOTE_MAX_DEPTH`] (past which the baseline render-truncates — preserved
+/// by handing back). Only armed at the top level with `block_data` off (the
+/// recursive path owns the nested `ContainerData` channel).
+struct DeepQuoteCache {
+    /// Absolute offset of the outermost `>` of the staircase's first line.
+    start: usize,
+    /// Stable id of the outer blockquote block (preserved across appends).
+    id: u64,
+    /// `<blockquote{dir}>` — the same wrapper opener for every level (the alert
+    /// path is excluded; a level whose content is an alert marker bails).
+    wrapper_open: String,
+    /// Frozen openers for the SETTLED levels `1..open_depth`: each is
+    /// `wrapper_open + "\n" + <prose-paragraph html> + "\n"`, folded exactly once
+    /// when the level settles (a strictly-deeper line arrives; committed levels
+    /// never change under `force_open_tail`).
+    settled: String,
+    /// Depth (number of `> ` markers) of the current deepest line; `0` before the
+    /// first line is classified. `settled` holds `open_depth - 1` levels.
+    open_depth: usize,
+    /// Renders the deepest line's content (markers stripped), OPEN
+    /// (`force_open_tail`), matching `render_blockquote`'s inner sub-block. Reset
+    /// to a fresh parser each time the deepest level settles.
+    open: Box<StreamParser>,
+    /// Whether the deepest line has received its terminating `\n` (drives the
+    /// trailing `\n` after its `<p>` and whether the next byte opens a new level).
+    open_complete: bool,
+    /// Absolute offset of the next unconsumed byte (into `buffer`).
+    fed_upto: usize,
+}
+
+/// A content byte that is safe to treat as the start of a plain-prose paragraph
+/// line inside a blockquote: an ASCII letter. Everything else may open a different
+/// block or an alert (`[`, `#`, `>`, `-`/`*`/`+`, digits, fences, `<`, indent, …)
+/// or change block structure, so [`DeepQuoteCache`] bails and lets the full path
+/// render it. Deliberately narrow — bails only over-drop (never mis-render).
+fn dq_prose_start(b: u8) -> bool {
+    b.is_ascii_alphabetic()
+}
+
 /// Incremental render state for a single open *flat* list at the tail — the
 /// LLM-emit shape where every line is a same-family marker (no continuation,
 /// no nesting). Handles both tight and loose lists; a tight list whose
@@ -1483,6 +1560,7 @@ impl StreamParser {
             table_cache: None,
             container_cache: None,
             container_block_cache: None,
+            deep_quote_cache: None,
             force_open_tail: false,
             container_depth: 0,
             list_cache: None,
@@ -1790,6 +1868,9 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_container() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_deep_quote() {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_container_block() {
@@ -2326,6 +2407,7 @@ impl StreamParser {
         self.table_cache = None;
         self.container_cache = None;
         self.container_block_cache = None;
+        self.deep_quote_cache = None;
         self.list_cache = None;
         self.indented_cache = None;
         self.html_cache = None;
@@ -2460,16 +2542,28 @@ impl StreamParser {
                         );
                         // The paragraph-only cache bails (returns None) on
                         // STRUCTURED inner content (a list/quote/heading/table/…).
-                        // For that case, arm the recursive nested-parser cache so
-                        // it still streams in O(new bytes) instead of re-parsing
-                        // the whole growing tail each append.
-                        if self.container_cache.is_none()
-                            && self.container_depth < MAX_CONTAINER_DEPTH
-                        {
+                        // A monotonically-deepening prose staircase — the shape the
+                        // recursive cache streams worse-than-quadratically — gets the
+                        // iterative `DeepQuoteCache` first (top level, block_data off);
+                        // everything else arms the recursive nested-parser cache so it
+                        // still streams in O(new bytes) instead of re-parsing the
+                        // whole growing tail each append.
+                        if self.container_cache.is_none() {
                             let id = new_active[0].id;
-                            let kind = new_active[0].kind.clone();
-                            self.container_block_cache =
-                                self.build_container_block_cache(start, id, &kind, &opts);
+                            if self.container_depth == 0
+                                && !self.block_data
+                                && !self.gfm_footnotes
+                            {
+                                self.deep_quote_cache =
+                                    self.build_deep_quote_cache(start, id, &opts);
+                            }
+                            if self.deep_quote_cache.is_none()
+                                && self.container_depth < MAX_CONTAINER_DEPTH
+                            {
+                                let kind = new_active[0].kind.clone();
+                                self.container_block_cache =
+                                    self.build_container_block_cache(start, id, &kind, &opts);
+                            }
                         }
                     }
                     RawBlockKind::List { ordered, start: list_start_num } => {
@@ -4097,6 +4191,188 @@ impl StreamParser {
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
 
+    /// Arm the iterative deep-quote staircase cache (see [`DeepQuoteCache`]) for an
+    /// open blockquote at `start` whose inner is a monotonically-deepening
+    /// prose staircase. `None` (→ the recursive [`ContainerBlockCache`] takes over)
+    /// on any non-staircase shape. Only called at the top level with `block_data`
+    /// and `gfm_footnotes` off. The first fill processes every line already present;
+    /// later appends fold only new bytes.
+    fn build_deep_quote_cache(&self, start: usize, id: u64, opts: &RenderOpts) -> Option<DeepQuoteCache> {
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        let mut w = String::with_capacity(16);
+        w.push_str("<blockquote");
+        w.push_str(opts.dir());
+        w.push('>');
+        let mut cache = DeepQuoteCache {
+            start,
+            id,
+            wrapper_open: w,
+            settled: String::new(),
+            open_depth: 0,
+            // Placeholder — replaced by a fresh parser the moment the first level
+            // opens (open_depth 0 → 1); never rendered.
+            open: self.make_nested_parser(),
+            open_complete: true,
+            fed_upto: start,
+        };
+        if !self.dq_extend(&mut cache, bytes, end) {
+            return None;
+        }
+        // A genuine deepening (≥ 2 levels). Depth-1 is the plain `ContainerCache`'s
+        // job; a single un-deepened blockquote never reaches this arm anyway (it
+        // only fires once the paragraph cache bailed on structured inner).
+        if cache.open_depth < 2 {
+            return None;
+        }
+        Some(cache)
+    }
+
+    /// Extend a [`DeepQuoteCache`] over the buffer bytes `[cache.fed_upto, end)`,
+    /// folding each settled shallower level once and streaming the deepest line's
+    /// content into `cache.open`. Returns `false` (the caller drops the cache → the
+    /// full reparse re-arms the byte-identical recursive path) on ANY deviation from
+    /// the pure single-step-deepening prose staircase.
+    fn dq_extend(&self, cache: &mut DeepQuoteCache, bytes: &[u8], end: usize) -> bool {
+        loop {
+            if cache.open_depth >= 1 && !cache.open_complete {
+                // Stream the deepest line's content (markers already consumed) to
+                // `open` until its terminating `\n`.
+                let from = cache.fed_upto;
+                match bytes[from..end].iter().position(|&b| b == b'\n') {
+                    Some(rel) => {
+                        let nl = from + rel;
+                        if bytes[from..nl].contains(&b'\r') {
+                            return false; // CRLF — full path
+                        }
+                        let Ok(s) = std::str::from_utf8(&bytes[from..nl]) else {
+                            return false;
+                        };
+                        if !s.is_empty() {
+                            cache.open.append(s);
+                        }
+                        cache.fed_upto = nl + 1;
+                        cache.open_complete = true;
+                        // Loop → classify the next (must-be-deeper) line.
+                    }
+                    None => {
+                        if bytes[from..end].contains(&b'\r') {
+                            return false;
+                        }
+                        let Ok(s) = std::str::from_utf8(&bytes[from..end]) else {
+                            return false;
+                        };
+                        if !s.is_empty() {
+                            cache.open.append(s);
+                        }
+                        cache.fed_upto = end;
+                        return true; // deepest line still open
+                    }
+                }
+            } else {
+                // Expecting the next line — for a pure staircase, exactly one level
+                // deeper, `> `×want then prose.
+                let want = cache.open_depth + 1;
+                if want >= DEEP_QUOTE_MAX_DEPTH {
+                    // The baseline render-truncates at this depth — hand back so the
+                    // (adversarial) truncation regime stays byte-identical.
+                    return false;
+                }
+                let from = cache.fed_upto;
+                let region = &bytes[from..end];
+                // First byte that is neither a `>` marker nor a marker space — the
+                // start of this line's content, if any has arrived.
+                match region.iter().position(|&b| b != b'>' && b != b' ') {
+                    None => {
+                        // Marker/space bytes only (no content byte yet). While the
+                        // trailing markers stay at/under the current depth the
+                        // structure is unchanged, so keep rendering `open_depth`; the
+                        // instant they reach a DEEPER level (an empty inner blockquote
+                        // the full path would already show) hand back — that transient
+                        // is rare at real chunk sizes and byte-parity outranks it.
+                        let markers = region.iter().filter(|&&b| b == b'>').count();
+                        if markers > cache.open_depth {
+                            return false;
+                        }
+                        return true;
+                    }
+                    Some(rel) => {
+                        let cb = region[rel];
+                        if cb == b'\n' || cb == b'\r' {
+                            // A markers-only line (empty inner blockquote) or CRLF —
+                            // subtle; the full path renders it.
+                            return false;
+                        }
+                        // The content must sit exactly after `> `×want, and be prose.
+                        if rel != 2 * want {
+                            return false; // wrong depth / irregular marker spacing
+                        }
+                        for j in 0..want {
+                            if region[2 * j] != b'>' || region[2 * j + 1] != b' ' {
+                                return false;
+                            }
+                        }
+                        if !dq_prose_start(cb) {
+                            // `[` alert/ref, `#`, `-`, fence, `<`, digit, … — a block
+                            // that is not a plain paragraph.
+                            return false;
+                        }
+                        if cache.open_depth >= 1 {
+                            // Settle the now-shallower deepest level: fold it once.
+                            let body = dq_collect(&cache.open);
+                            if body.is_empty() {
+                                return false;
+                            }
+                            cache.settled.push_str(&cache.wrapper_open);
+                            cache.settled.push('\n');
+                            cache.settled.push_str(&body);
+                            cache.settled.push('\n');
+                        }
+                        cache.open_depth = want;
+                        cache.open = self.make_nested_parser();
+                        cache.open_complete = false;
+                        cache.fed_upto = from + rel;
+                        // Loop → stream the new deepest line's content.
+                    }
+                }
+            }
+        }
+    }
+
+    /// O(new bytes) extension of an open deep-quote staircase at the tail (see
+    /// [`DeepQuoteCache`]). Returns `None` (dropping the cache → full reparse) on
+    /// any BAIL condition.
+    fn try_incremental_deep_quote(&mut self) -> Option<Patch> {
+        let mut cache = self.deep_quote_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let end = bytes.len();
+        // Tail-only check (same as the other caches): nothing but whitespace may
+        // sit between the committed boundary and the container's opener.
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        if !self.dq_extend(&mut cache, bytes, end) {
+            return None;
+        }
+        let html = assemble_deep_quote(&cache);
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Blockquote(None),
+            start: cache.start,
+            end,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.deep_quote_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
     /// A recursive nested parser configured to reproduce THIS parser's rendering
     /// of stripped inner content (a container's `>`-stripped body, an open list
     /// item's de-indented body): SAME feature flags as the outer EXCEPT
@@ -5210,6 +5486,45 @@ fn assemble_container_block(cache: &ContainerBlockCache) -> String {
         &cache.inner,
         &cache.wrapper_close,
     )
+}
+
+/// The `\n`-joined HTML of a [`DeepQuoteCache`]'s deepest-line parser — one
+/// `render_block` fragment per open sub-block, matching how `render_blockquote`
+/// joins its body (a well-formed prose line is a single paragraph block).
+fn dq_collect(open: &StreamParser) -> String {
+    let mut s = String::new();
+    for b in open.all_blocks() {
+        if !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&b.html);
+    }
+    s
+}
+
+/// Assemble a [`DeepQuoteCache`]'s active-block HTML: the frozen settled-level
+/// openers, then the deepest (open) level's `<blockquote>` + prose paragraph, then
+/// one `</blockquote>` per level joined by `\n` — byte-identical to the nested
+/// `render_blockquote` chain, which wraps its body in a leading `\n` (non-empty
+/// body) and a `\n` after every sub-block before the closer (so the deepest
+/// paragraph's trailing `\n` is present whether or not its line is complete).
+fn assemble_deep_quote(cache: &DeepQuoteCache) -> String {
+    let body = dq_collect(&cache.open);
+    let mut html = String::with_capacity(cache.settled.len() + body.len() + 32 + cache.open_depth * 14);
+    html.push_str(&cache.settled);
+    html.push_str(&cache.wrapper_open);
+    if !body.is_empty() {
+        html.push('\n');
+        html.push_str(&body);
+        html.push('\n');
+    }
+    for i in 0..cache.open_depth {
+        if i > 0 {
+            html.push('\n');
+        }
+        html.push_str("</blockquote>");
+    }
+    html
 }
 
 /// Assemble a wrapper + nested-parser body: wrapper opener, a leading `\n` iff

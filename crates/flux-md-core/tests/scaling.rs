@@ -250,12 +250,12 @@ fn quote_footnote_defs(target: usize) -> String {
 
 fn quote_depth_growing(target: usize) -> String {
     // Ever-deepening nested blockquotes: line k carries k `>` markers. The
-    // recursive container-block cache spends one nested parser per level and is
-    // capped at MAX_CONTAINER_DEPTH; past the cap the innermost parser
-    // full-reparses its growing tail every append with O(depth) marker
-    // restripping per line — worse than quadratic. Fixing this needs an
-    // iterative wrapper-stack representation (fold the settled shallower level
-    // once when the stack deepens, single innermost parser).
+    // recursive container-block cache spent one nested parser per level, capped at
+    // MAX_CONTAINER_DEPTH; past the cap the innermost parser full-reparsed its
+    // growing tail every append — worse than quadratic. Now linear via the
+    // iterative DeepQuoteCache (fold each settled shallower level's opener once,
+    // single open parser for the deepest line, a heap stack instead of nested
+    // parsers → no shadow-stack cost), byte-identical to the recursive path.
     let mut s = String::with_capacity(target + 4096);
     let mut k = 1usize;
     while s.len() < target {
@@ -1154,11 +1154,20 @@ fn shapes() -> Vec<Shape> {
     // blockdata-disables-container-cache: FIXED — the ContainerBlockCache owns
     // `block_data` now (nested `ContainerData` per committed inner block);
     // promoted to the blockdata_alert / blockdata_blockquote linear twins above.
-    // The DEPTH half of container-stack-churn-lazy remains: per-line O(depth)
-    // marker restripping past MAX_CONTAINER_DEPTH is slightly worse than pure
-    // n² (~104x across this 8x span); the quad guard leaves headroom over the
-    // measured curve. Fix = iterative wrapper-stack (fold settled shallower
-    // levels once), a follow-up.
+    // container-depth-growth-pin: FIXED on BOTH metrics via the iterative
+    // DeepQuoteCache. The recursive ContainerBlockCache spent one nested parser per
+    // level (capped at MAX_CONTAINER_DEPTH so the recursive `append` call chain
+    // can't overflow the WASM shadow stack); past the cap the innermost parser
+    // re-scanned + re-rendered its whole growing nested-quote tail every append
+    // (worse than n²). The DeepQuoteCache folds each settled shallower level's
+    // `<blockquote>`+paragraph opener EXACTLY once and keeps ONE open parser for the
+    // deepest line, extending in O(new bytes) with a heap `String` stack (never
+    // nested parsers → no shadow-stack cost). Byte-identical to the recursive path:
+    // it is armed only on the pure single-step-deepening prose staircase (top level,
+    // block_data + footnotes off) and BAILS to that path — the unchanged baseline,
+    // incl. its depth-(MAX_CONTAINER_DEPTH+100) render truncation — on any deviation
+    // (a line not exactly one deeper, a non-prose/alert content byte, a lazy/blank/
+    // shallower line, an as-yet-content-less deeper marker, or that depth bound).
     v.push(Shape {
         name: "container-depth-growth-pin",
         gen: quote_depth_growing,
@@ -1166,8 +1175,8 @@ fn shapes() -> Vec<Shape> {
         chunk: CHUNK,
         small: 2 * 1024,
         large: 16 * 1024,
-        scanned: KnownQuadratic,
-        rendered: KnownQuadratic,
+        scanned: Linear,
+        rendered: Linear,
     });
     v
 }
