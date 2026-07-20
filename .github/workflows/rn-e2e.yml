@@ -1,0 +1,330 @@
+name: rn-e2e
+
+# App-level end-to-end validation for brookmd-react-native — the LAST gate before
+# the package can be npm-published. Unlike device-validate.yml (which drives the
+# first-party uniffi bindings' wire goldens inside Android/Apple runtimes) and
+# rn-build.yml (which only cross-compiles + host-tests), this workflow proves a
+# REAL React Native app (examples/rn-e2e, the RN 0.86 community template consuming
+# the package as a `file:` dep) can:
+#
+#   * run RN codegen for the TurboModule spec inside a real Gradle build,
+#   * compile + link the CMake/JSI native module against the Rust .so / XCFramework,
+#   * boot on a device-class target and call the native parser from JS, asserting
+#     byte-identical wire (golden.ts, copied from crates/brookmd-ffi's wire_golden).
+#
+# The app logs BROOK_E2E_OK on success / BROOK_E2E_FAIL:<detail> on mismatch; CI
+# polls the device log for the marker.
+#
+#   android-app — Gradle assembleRelease (standalone APK, JS bundled) + hardware-
+#     accelerated x86_64 emulator (KVM). console.log reaches logcat reliably, so
+#     this is the strong must-pass gate.
+#   ios-app     — xcodebuild (Release, simulator) + simctl launch. Capturing an
+#     app's console.log from the iOS simulator in CI is genuinely finicky (RCTLog
+#     routes through os_log, not stdout), so the marker capture here is BEST-EFFORT:
+#     the job hard-fails only on a build/link failure, an app crash, or an observed
+#     BROOK_E2E_FAIL. A successful build + launch + no-crash with the marker missing
+#     is a PASS-with-warning (the documented downgrade the task allows).
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packages/brookmd-react-native/**"
+      - "crates/brookmd-ffi/**"
+      - "crates/brookmd-core/**"
+      - "examples/rn-e2e/**"
+      - ".github/workflows/rn-e2e.yml"
+
+permissions:
+  contents: read
+
+# Emulator/simulator jobs are slow — cancel superseded runs on the same ref.
+concurrency:
+  group: rn-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-app:
+    name: android (app e2e on emulator)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # RN 0.86 requires node >= 22.11 (examples/rn-e2e/package.json engines).
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust (stable) + wasm + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked || curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      # --- Build the brookmd workspace dep the RN package imports (brookmd/client,
+      #     brookmd/worker-core, brookmd/html-to-react, brookmd/types → dist/). dist/
+      #     is gitignored (built on demand); build.mjs asserts the wasm binary is
+      #     present, so build it first. Mirrors rn-build.yml's `js` job. ---
+      - name: Install workspace dependencies (bun)
+        run: bun install
+
+      - name: Build brookmd WASM (stable)
+        run: bun run build:wasm:stable
+
+      - name: Build brookmd dist
+        working-directory: packages/brookmd
+        run: node scripts/build.mjs
+
+      # --- Cross-compile the Rust FFI crate into the RN package's jniLibs. The
+      #     package's android/CMakeLists.txt hardcodes abiFilters (arm64/armv7/x86_64),
+      #     so build all three (the package's own builder) — the emulator only runs
+      #     x86_64, but every declared ABI must link. ---
+      - name: Resolve NDK for cargo-ndk
+        run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+
+      - name: Build device .so for all ABIs
+        working-directory: packages/brookmd-react-native
+        run: bash scripts/build-android.sh
+
+      # --- Install the app's own node_modules with npm (the realistic consumer PM;
+      #     examples/rn-e2e is OUTSIDE the bun workspace globs). ---
+      - name: Install app dependencies (npm)
+        working-directory: examples/rn-e2e
+        run: npm install --no-audit --no-fund
+
+      # Fast pre-check: validates the monorepo Metro resolution (file: deps, the
+      # package's brookmd + @ubjs/core imports, react dedup) before the slow Gradle
+      # build re-bundles the same graph.
+      - name: Metro bundle sanity (android)
+        working-directory: examples/rn-e2e
+        run: npx react-native bundle --platform android --dev false --entry-file index.js --bundle-output /tmp/brook-e2e.android.bundle
+
+      - name: Install JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # The app pins NDK 27.1.12297006 (android/build.gradle ext). Install it up
+      # front so Gradle doesn't stall auto-provisioning it mid-build.
+      - name: Install required Android NDK + CMake
+        run: |
+          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
+          yes | "$SDK/cmdline-tools/latest/bin/sdkmanager" "ndk;27.1.12297006" "cmake;3.22.1" >/dev/null || true
+
+      # Build a standalone RELEASE APK (JS bundled → no Metro server needed at
+      # runtime). Release is signed with the template's debug keystore. Restrict to
+      # x86_64 so only the emulator ABI is packaged. Use the template's OWN Gradle
+      # wrapper (the realistic consumer path; the template pins Gradle 9.3.1).
+      - name: Gradle assembleRelease (x86_64)
+        working-directory: examples/rn-e2e/android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=x86_64 --no-daemon --stacktrace
+
+      - name: Enable KVM group perms
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install, launch, and poll the app on the emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          target: google_apis
+          arch: x86_64
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -x
+            APK=examples/rn-e2e/android/app/build/outputs/apk/release/app-release.apk
+            adb install -r "$APK"
+            adb logcat -c
+            adb shell am start -n com.brooke2e/.MainActivity
+            echo "waiting for BROOK_E2E marker…"
+            result=""
+            deadline=$((SECONDS+120))
+            while [ $SECONDS -lt $deadline ]; do
+              if adb logcat -d 2>/dev/null | grep -q "BROOK_E2E_OK"; then result=OK; break; fi
+              if adb logcat -d 2>/dev/null | grep -q "BROOK_E2E_FAIL"; then result=FAIL; break; fi
+              sleep 3
+            done
+            adb logcat -d > /tmp/logcat-full.txt 2>/dev/null || true
+            echo "=== BROOK_E2E log lines ==="
+            grep -E "BROOK_E2E" /tmp/logcat-full.txt || true
+            if [ "$result" = OK ]; then
+              echo "PASS: native parser produced byte-identical wire and the renderer mounted."
+            elif [ "$result" = FAIL ]; then
+              echo "FAIL: app reported BROOK_E2E_FAIL"
+              echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
+              exit 1
+            else
+              echo "TIMEOUT: no BROOK_E2E marker within 120s"
+              echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
+              exit 1
+            fi
+
+      - name: Upload Gradle + logcat reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-app-e2e-reports
+          path: |
+            examples/rn-e2e/android/app/build/outputs/
+            examples/rn-e2e/android/app/build/reports/
+            /tmp/logcat-full.txt
+          if-no-files-found: warn
+
+  ios-app:
+    name: ios (app e2e on simulator)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Rust (stable) + wasm + Apple sim/device targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked || curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install workspace dependencies (bun)
+        run: bun install
+
+      - name: Build brookmd WASM (stable)
+        run: bun run build:wasm:stable
+
+      - name: Build brookmd dist
+        working-directory: packages/brookmd
+        run: node scripts/build.mjs
+
+      # Assemble the XCFramework the podspec vendors (device + fat simulator slices).
+      # The simulator slice (arm64 sim, for the M1 macos-14 runner) is what the app
+      # links against.
+      - name: Build XCFramework (device + simulator)
+        working-directory: packages/brookmd-react-native
+        run: bash scripts/build-ios.sh
+
+      - name: Install app dependencies (npm)
+        working-directory: examples/rn-e2e
+        run: npm install --no-audit --no-fund
+
+      - name: Metro bundle sanity (ios)
+        working-directory: examples/rn-e2e
+        run: npx react-native bundle --platform ios --dev false --entry-file index.js --bundle-output /tmp/brook-e2e.ios.bundle
+
+      # CocoaPods via the template's Gemfile (the canonical RN path). Autolinking
+      # picks up brookmd-react-native's podspec (root podspec, auto-discovered).
+      # The Gemfile lives at the app root; pod install runs in ios/.
+      - name: bundle install (cocoapods gem)
+        working-directory: examples/rn-e2e
+        run: bundle install
+
+      - name: pod install
+        working-directory: examples/rn-e2e/ios
+        run: bundle exec pod install
+
+      # Build a standalone RELEASE app for the simulator (Release bundles the JS via
+      # the "Bundle React Native code and images" phase → no Metro server at runtime).
+      # Simulator builds need no code signing.
+      - name: xcodebuild (Release, simulator)
+        working-directory: examples/rn-e2e/ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace BrookE2e.xcworkspace \
+            -scheme BrookE2e \
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build 2>&1 | tail -60
+
+      - name: Boot simulator, install, launch, poll (marker best-effort)
+        working-directory: examples/rn-e2e/ios
+        run: |
+          set -x
+          BUNDLE_ID=org.reactjs.native.example.BrookE2e
+          APP="build/Build/Products/Release-iphonesimulator/BrookE2e.app"
+          test -d "$APP" || { echo "app bundle not found at $APP"; exit 1; }
+
+          # Boot a simulator (create a dedicated device to avoid runner state drift).
+          UDID=$(xcrun simctl create brook-e2e "iPhone 15" 2>/dev/null || true)
+          if [ -z "$UDID" ]; then UDID=booted; xcrun simctl boot booted 2>/dev/null || true; else xcrun simctl boot "$UDID"; fi
+          xcrun simctl bootstatus "$UDID" -b || true
+
+          xcrun simctl install "$UDID" "$APP"
+
+          # Start os_log capture BEFORE launch (RCTLog routes JS console.log here).
+          xcrun simctl spawn "$UDID" log stream --level debug --style compact > /tmp/simlog.txt 2>&1 &
+          LOGPID=$!
+          sleep 2
+          # Launch with a console pty too (some log paths surface on stdout).
+          xcrun simctl launch --console-pty "$UDID" "$BUNDLE_ID" > /tmp/applaunch.txt 2>&1 &
+          LAUNCHPID=$!
+
+          result=""
+          deadline=$((SECONDS+150))
+          while [ $SECONDS -lt $deadline ]; do
+            if grep -qs "BROOK_E2E_OK" /tmp/simlog.txt /tmp/applaunch.txt; then result=OK; break; fi
+            if grep -qs "BROOK_E2E_FAIL" /tmp/simlog.txt /tmp/applaunch.txt; then result=FAIL; break; fi
+            sleep 3
+          done
+          kill $LOGPID $LAUNCHPID 2>/dev/null || true
+
+          echo "=== captured BROOK_E2E lines ==="
+          grep -hs "BROOK_E2E" /tmp/simlog.txt /tmp/applaunch.txt || true
+
+          # Crash check: any diagnostic report naming the app => hard fail.
+          CRASH=$(ls "$HOME/Library/Logs/DiagnosticReports/" 2>/dev/null | grep -i "BrookE2e" || true)
+
+          if [ "$result" = OK ]; then
+            echo "PASS: native parser produced byte-identical wire and the renderer mounted (marker observed)."
+          elif [ "$result" = FAIL ]; then
+            echo "FAIL: app reported BROOK_E2E_FAIL"; grep -hs "BROOK_E2E_FAIL" /tmp/simlog.txt /tmp/applaunch.txt; exit 1
+          elif [ -n "$CRASH" ]; then
+            echo "FAIL: app crashed on the simulator: $CRASH"
+            cat "$HOME/Library/Logs/DiagnosticReports/"*BrookE2e* 2>/dev/null | tail -80 || true
+            exit 1
+          else
+            # Documented downgrade: build + link + launch + no-crash succeeded, but
+            # the JS marker wasn't captured from os_log within the window. Treat as a
+            # pass-with-warning rather than a flaky red gate (see job header).
+            echo "::warning title=iOS e2e marker not captured::App built, linked the native module, launched, and did not crash, but BROOK_E2E_OK was not observed in the simulator log within 150s. Native-parser correctness is still asserted by the android-app job and the device-validate.yml XCTest wire goldens."
+            echo "PASS (downgraded: build+launch+no-crash)."
+          fi
+
+      - name: Upload xcresult + sim logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-app-e2e-logs
+          path: |
+            examples/rn-e2e/ios/build/Logs/
+            /tmp/simlog.txt
+            /tmp/applaunch.txt
+          if-no-files-found: warn

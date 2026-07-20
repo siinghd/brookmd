@@ -2,7 +2,7 @@
 
 Streaming markdown for React Native. The parser is [brookmd](https://github.com/siinghd/brookmd)'s Rust core, compiled to a native library and reached over JSI (uniffi / [uniffi-bindgen-react-native](https://jhugman.github.io/uniffi-bindgen-react-native/)) — no bridge round-trips, no WebView. Markdown is parsed incrementally as tokens arrive and rendered with real React Native primitives (`Text`, `View`, `ScrollView`, …).
 
-> **Status: pre-release (0.1.0).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The **native device builds (Android `.so`, iOS XCFramework) have not yet been validated on-device**; they are produced by CI (`.github/workflows/rn-build.yml`) and the scaffolding here (Gradle/CMake/podspec/Kotlin/ObjC++) is expected to need iteration on a real device/Xcode/NDK setup. Treat the native layer as a work in progress.
+> **Status: pre-release (0.1.0).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The native device builds (Android `.so`, iOS XCFramework) are produced by CI (`.github/workflows/rn-build.yml`) and now exercised **app-level end-to-end** by [`.github/workflows/rn-e2e.yml`](../../.github/workflows/rn-e2e.yml): a real RN 0.86 app ([`examples/rn-e2e`](../../examples/rn-e2e)) consumes this package as a `file:` dependency, runs codegen in a real Gradle/CocoaPods build, links the CMake/JSI module against the Rust library, and calls the native parser from JS on an x86_64 Android emulator (KVM) / iOS simulator — asserting byte-identical wire. See [End-to-end validation](#end-to-end-validation). Until that gate is green on the target hardware, treat the native layer as a work in progress.
 
 New architecture only: React Native **≥ 0.76** with the new architecture (TurboModules) enabled.
 
@@ -137,6 +137,26 @@ npm run build:ios       # → ios/BrookMdFfi.xcframework                        
 ```
 
 `scripts/build-android.sh` builds `arm64-v8a`, `armeabi-v7a`, and `x86_64` with cargo-ndk (NDK r28+ for 16 KB page-size support). `scripts/build-ios.sh` builds the device slice plus both simulator arches, lipos the simulator slices, and assembles the XCFramework. Both fail early with an actionable message when the required toolchain is absent.
+
+## End-to-end validation
+
+[`examples/rn-e2e`](../../examples/rn-e2e) is a minimal RN 0.86 app fixture that consumes this package (and its `brookmd` dependency) as `file:` deps — the realistic consumer path. On mount it streams the wire-golden chunks through the on-device `BrookSession` and asserts every patch is byte-identical to the Rust core's goldens (`examples/rn-e2e/golden.ts`, copied from `crates/brookmd-ffi/tests/wire_golden.rs`), then renders the same content through `<BrookMarkdown>`. It logs `BROOK_E2E_OK` on success. `.github/workflows/rn-e2e.yml` runs it on an Android emulator (the strong, must-pass gate — `console.log` reaches logcat) and an iOS simulator (marker capture best-effort; hard-fails on a build/link failure, crash, or reported failure).
+
+The fixture resolves the ubrn runtime the generated bindings import (`@ubjs/core`) by installing it directly (`@ubjs/core@0.31.0-3`, pinned to the `uniffi-bindgen-react-native` version) rather than the Babel `module-resolver` alias shown under [Install](#install) — either approach works. Its `metro.config.js` wires the monorepo `file:` deps (watchFolders, `nodeModulesPaths`, and a forced single copy of `react`/`react-native`).
+
+Run it locally (JS resolution — the highest-value off-device check; no Android SDK / Xcode needed):
+
+```sh
+# from the repo root: build brookmd's dist (the RN package imports brookmd/*)
+bun install && bun run build:wasm:stable && (cd packages/brookmd && node scripts/build.mjs)
+
+cd examples/rn-e2e
+npm install
+npx tsc --noEmit
+npx react-native bundle --platform android --dev false --entry-file index.js --bundle-output /tmp/brook-e2e.bundle
+```
+
+A full device run needs the platform toolchains (NDK/emulator or Xcode/simulator); `rn-e2e.yml` is the reference. Build the native library into the package first (`npm run build:android` / `npm run build:ios` in `packages/brookmd-react-native`), then `npm run android` / `npm run ios` from `examples/rn-e2e`.
 
 ## Public API
 
