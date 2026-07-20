@@ -67,7 +67,7 @@ fn first_line_alert_undecided(stripped: &[u8]) -> bool {
             || core.strip_prefix(m).is_some_and(|rest| rest.chars().all(char::is_whitespace))
     })
 }
-use crate::inline::{render_inline, render_inline_boundary};
+use crate::inline::{open_tag_streaming_quote, render_inline, render_inline_boundary};
 use crate::url::{escape_attr, escape_html, sanitize_attrs};
 
 /// Collect link reference definitions from `text` into `refs`, recursing into
@@ -370,6 +370,17 @@ pub struct StreamParser {
     /// soup where the commit cut is pinned at 0 (a future closer could pair
     /// back) so no [`ParagraphCache`] can arm (see [`DollarTailCache`]).
     dollar_tail_cache: Option<DollarTailCache>,
+    /// Fast path for a paragraph that is one maximal pure-ASCII-alphanumeric run
+    /// at the paragraph start — the `aaaa…` giant word. With extended autolinks
+    /// on, no byte in the run is a boundary candidate (a future `@`/`.` could
+    /// bind the whole run right-to-left into an autolink), so the commit cut
+    /// pins at 0 and no [`ParagraphCache`] can arm (see [`AlnumTailCache`]).
+    alnum_tail_cache: Option<AlnumTailCache>,
+    /// Fast path for a paragraph that is one never-closing raw open tag whose
+    /// unclosed quoted attribute value grows to EOF — `<a href="…` under
+    /// sanitize/unsafe HTML. The failed-`<` unstable mark pins the cut at the
+    /// `<`, so no [`ParagraphCache`] can arm (see [`RawTagTailCache`]).
+    raw_tag_tail_cache: Option<RawTagTailCache>,
 }
 
 #[derive(Default)]
@@ -558,6 +569,72 @@ struct DollarTailCache {
     scanned: usize,
     /// Escaped inline-math body rendered so far (`escape_html(buffer[start+1..scanned])`).
     math: String,
+}
+
+/// Incremental render state for an open paragraph that is one maximal run of
+/// pure ASCII alphanumerics from the paragraph start to EOF — the `aaaa…` giant
+/// word (a bare token, a base64/hex blob, a long identifier a stream hasn't yet
+/// spaced).
+///
+/// With extended autolinks on the commit cut is genuinely pinned at 0: no alnum
+/// byte is a boundary candidate ([`synth_boundary`] excludes them because a
+/// future `@`/`.` could bind the whole run right-to-left into an email/`www.`
+/// autolink), and there is no inter-word space, so [`compute_cut`] returns 0 and
+/// no [`ParagraphCache`] can arm — every append re-scans + re-renders the whole
+/// growing paragraph (O(n²) on both counters).
+///
+/// But a pure-alnum run can NEVER complete an autolink (`try_ext_autolink` needs
+/// `http://`/`www.`, `try_ext_email` needs `@` — all require punctuation the run
+/// lacks) nor open any other inline construct, and `escape_html` leaves every
+/// alnum byte unchanged. So while the run stays pure-alnum its render is fixed —
+/// `<p>` + `escape_html(body)` + `</p>` — and the escaped body extends by only
+/// the appended bytes (O(new)). The guard (see [`alnum_run_stays_open`]) drops
+/// to the byte-identical full path the instant a non-alnum byte appears (a
+/// space, a `.`/`@`/`:` that could settle or trigger a construct, a newline) —
+/// so one retro re-render per settling byte, amortized linear.
+struct AlnumTailCache {
+    /// Absolute byte offset of the run start (== the paragraph start).
+    start: usize,
+    /// Stable id of the paragraph block.
+    id: u64,
+    /// Absolute offset; `buffer[start .. scanned]` is all ASCII alphanumeric and
+    /// `body == escape_html(buffer[start .. scanned])`. Advances by the appended
+    /// bytes each engagement.
+    scanned: usize,
+    /// Escaped paragraph body rendered so far (`escape_html(buffer[start..scanned])`;
+    /// for pure alnum this equals the bytes themselves).
+    body: String,
+}
+
+/// Incremental render state for an open paragraph that is one never-closing raw
+/// open tag whose unclosed quoted attribute value grows to EOF — `<a href="…`
+/// under sanitize/unsafe HTML (a backend streaming `<a href="…">` instead of a
+/// markdown link, before the closing quote / `>` arrives).
+///
+/// The failed-`<` unstable mark (which pre-dates the 0.20.3 open-tail tag
+/// suppression) pins the commit cut at the `<`, so no [`ParagraphCache`] can arm
+/// and the growing suffix re-renders every append. But while the tag streams to
+/// EOF inside its quoted value, [`inline_html_streams_to_eof`] suppresses it —
+/// the paragraph renders to the CONSTANT `<p></p>` (see
+/// [`open_tag_streaming_quote`]). So the fast path is O(1) per append: it only
+/// tracks whether appended bytes keep the value unclosed. The guard (see
+/// [`raw_tag_stays_open`]) drops to the byte-identical full path the instant the
+/// value's matching quote closes (the tag can now complete or gain attrs) or a
+/// newline splits the single-line paragraph. Only engaged when raw HTML is
+/// active (sanitize/unsafe); in escape mode the `<` renders as visible `&lt;…`
+/// text, a different (still-pinned, out-of-scope) shape.
+struct RawTagTailCache {
+    /// Absolute byte offset of the opening `<` (== the paragraph start).
+    start: usize,
+    /// Stable id of the paragraph block.
+    id: u64,
+    /// Absolute offset; `buffer[start .. scanned]` is a newline-free open tag
+    /// streaming to EOF inside an unclosed `quote`-delimited attribute value.
+    /// Advances by the appended bytes each engagement.
+    scanned: usize,
+    /// The open attribute value's delimiter (`b'"'` or `b'\''`). A matching quote
+    /// in the appended bytes closes the value and drops the cache.
+    quote: u8,
 }
 
 /// Incremental render state for a single open GFM table at the tail. Streaming
@@ -1367,6 +1444,8 @@ impl StreamParser {
             rule_cache: None,
             fence_info_cache: None,
             dollar_tail_cache: None,
+            alnum_tail_cache: None,
+            raw_tag_tail_cache: None,
         }
     }
 
@@ -1645,6 +1724,12 @@ impl StreamParser {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_dollar_tail() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_alnum_tail() {
+                return patch;
+            }
+            if let Some(patch) = self.try_incremental_raw_tag_tail() {
                 return patch;
             }
             if let Some(patch) = self.try_incremental_table() {
@@ -2195,6 +2280,8 @@ impl StreamParser {
         self.rule_cache = None;
         self.fence_info_cache = None;
         self.dollar_tail_cache = None;
+        self.alnum_tail_cache = None;
+        self.raw_tag_tail_cache = None;
         if !finalizing && new_active.len() == 1 {
             let raw = renderable[to_commit];
             let start = tail_start + raw.range.start;
@@ -2253,6 +2340,27 @@ impl StreamParser {
                         if self.para_cache.is_none() && self.gfm_math {
                             self.dollar_tail_cache =
                                 build_dollar_tail_cache(&self.buffer, start, new_active[0].id);
+                        }
+                        // Same pinned-cut situation for the `aaaa…` giant word:
+                        // with extended autolinks on, a pure-alnum run has no
+                        // boundary candidate (a future `@`/`.` could bind it), so
+                        // the cache can't arm. The whole open block is one alnum
+                        // run whose escaped body just grows, so the alnum-tail
+                        // fast path extends it in O(new bytes).
+                        if self.para_cache.is_none() && self.gfm_autolinks {
+                            self.alnum_tail_cache =
+                                build_alnum_tail_cache(&self.buffer, start, new_active[0].id);
+                        }
+                        // And for a never-closing raw open tag whose quoted attr
+                        // value streams to EOF (`<a href="…`): the failed-`<`
+                        // unstable mark pins the cut at the `<`, so the cache can't
+                        // arm. While suppressed the render is a CONSTANT `<p></p>`,
+                        // so the raw-tag fast path extends it in O(1). (The three
+                        // caches are mutually exclusive by paragraph first byte:
+                        // `$` / alnum / `<`.)
+                        if self.para_cache.is_none() && (self.unsafe_html || self.html_sanitize) {
+                            self.raw_tag_tail_cache =
+                                build_raw_tag_tail_cache(&self.buffer, start, new_active[0].id);
                         }
                     }
                     // Footnotes stay ARMED: the cache renders refs as
@@ -2947,6 +3055,113 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.dollar_tail_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(new bytes) extension of an open pure-ASCII-alphanumeric paragraph at the
+    /// tail (the `aaaa…` giant word — see [`AlnumTailCache`]). While the run stays
+    /// pure-alnum its render is `<p>escape_html(body)</p>`, and `escape_html` is a
+    /// context-free per-byte map that leaves alnum unchanged, so the escaped body
+    /// just grows by the appended bytes. Returns `None` (dropping the cache) the
+    /// moment a non-alnum byte appears — a space/`.`/`@`/`:`/newline that could
+    /// settle the cut or trigger a construct — so the full reparse handles it,
+    /// byte-identically.
+    fn try_incremental_alnum_tail(&mut self) -> Option<Patch> {
+        let mut cache = self.alnum_tail_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // The paragraph must still be the sole tail block (only whitespace before
+        // it, nothing committed past its start).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Fold only the appended bytes. The run drops the moment they add any
+        // non-alnum byte (a boundary settles, a construct/autolink could open, or
+        // the line ends) — the full path then re-renders that append.
+        if len > cache.scanned {
+            if !alnum_run_stays_open(bytes, cache.scanned, len) {
+                return None;
+            }
+            escape_html(&self.buffer[cache.scanned..len], &mut cache.body);
+            cache.scanned = len;
+        }
+        // `<p>body</p>` — `render_paragraph`'s opener + the escaped run; its
+        // trailing-whitespace trim is a no-op (the body has no whitespace).
+        let mut html = String::with_capacity(cache.body.len() + 24);
+        html.push_str("<p");
+        // Mirrors `RenderOpts::dir()` (static — independent of content).
+        if self.dir_auto {
+            html.push_str(" dir=\"auto\"");
+        }
+        html.push('>');
+        html.push_str(&cache.body);
+        html.push_str("</p>");
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Paragraph,
+            start: cache.start,
+            end: len,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.alnum_tail_cache = Some(cache);
+        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+    }
+
+    /// O(1) extension of an open never-closing raw tag whose quoted attribute
+    /// value streams to EOF (`<a href="…` — see [`RawTagTailCache`]). While the
+    /// tag stays EOF-streaming inside the value, `inline_html_streams_to_eof`
+    /// suppresses it, so the paragraph render is the CONSTANT `<p></p>` and no new
+    /// bytes enter the inline renderer. Returns `None` (dropping the cache) the
+    /// moment the appended bytes close the value (a matching quote — the tag can
+    /// now complete or gain attrs) or add a newline (the single-line paragraph
+    /// splits) — so the full reparse handles it, byte-identically.
+    fn try_incremental_raw_tag_tail(&mut self) -> Option<Patch> {
+        let mut cache = self.raw_tag_tail_cache.take()?;
+        let bytes = self.buffer.as_bytes();
+        let len = bytes.len();
+        // The paragraph must still be the sole tail block (only whitespace before
+        // it, nothing committed past its start).
+        if cache.start < self.committed_offset
+            || bytes[self.committed_offset..cache.start]
+                .iter()
+                .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        {
+            return None;
+        }
+        // Scan only the appended bytes for a value-closing quote or a newline.
+        if len > cache.scanned {
+            if !raw_tag_stays_open(bytes, cache.scanned, len, cache.quote) {
+                return None;
+            }
+            cache.scanned = len;
+        }
+        // `<p></p>` — the suppressed tag renders nothing; the trailing-whitespace
+        // trim over the empty inner is a no-op.
+        let mut html = String::with_capacity(24);
+        html.push_str("<p");
+        // Mirrors `RenderOpts::dir()` (static — independent of content).
+        if self.dir_auto {
+            html.push_str(" dir=\"auto\"");
+        }
+        html.push_str("></p>");
+        let block = Block {
+            id: cache.id,
+            kind: BlockKind::Paragraph,
+            start: cache.start,
+            end: len,
+            html,
+            open: true,
+            speculative: true,
+        };
+        self.active_blocks = vec![block.clone()];
+        self.raw_tag_tail_cache = Some(cache);
         Some(Patch { newly_committed: Vec::new(), active: vec![block] })
     }
 
@@ -5964,6 +6179,66 @@ fn build_dollar_tail_cache(buffer: &str, start: usize, id: u64) -> Option<Dollar
     let mut math = String::with_capacity(len - start);
     escape_html(&buffer[start + 1..len], &mut math);
     Some(DollarTailCache { start, id, scanned: len, math })
+}
+
+/// True iff every byte of `bytes[from..to]` is ASCII alphanumeric — the fast
+/// path's invariant (see [`AlnumTailCache`]). Deliberately narrow: `.+_-@` and
+/// whitespace are EXCLUDED even though some are inert in isolation, because any
+/// of them can settle the commit cut or (with autolinks) trigger a construct
+/// mid-run, and excluding them only ever OVER-drops to the byte-identical full
+/// path. A pure-ASCII-alnum run can neither open an inline construct nor complete
+/// an autolink (`try_ext_autolink` needs `http://`/`www.`, `try_ext_email` needs
+/// `@` — all punctuation this run lacks), and `escape_html` leaves it unchanged.
+fn alnum_run_stays_open(bytes: &[u8], from: usize, to: usize) -> bool {
+    bytes[from..to].iter().all(u8::is_ascii_alphanumeric)
+}
+
+/// Arm the alnum-tail cache when the open paragraph at `start` is one pure-ASCII-
+/// alphanumeric run to EOF (see [`AlnumTailCache`]). `None` unless the whole
+/// `buffer[start..]` is non-empty and all alnum. Callers gate this on
+/// `gfm_autolinks` (the only config under which the cut is pinned here).
+fn build_alnum_tail_cache(buffer: &str, start: usize, id: u64) -> Option<AlnumTailCache> {
+    let bytes = buffer.as_bytes();
+    let len = bytes.len();
+    if start >= len || !alnum_run_stays_open(bytes, start, len) {
+        return None;
+    }
+    let mut body = String::with_capacity(len - start);
+    escape_html(&buffer[start..len], &mut body);
+    Some(AlnumTailCache { start, id, scanned: len, body })
+}
+
+/// True iff the appended bytes `bytes[from..to]` keep an open raw tag streaming
+/// to EOF inside its unclosed `quote`-delimited attribute value (see
+/// [`RawTagTailCache`]). Drops on the matching `quote` (the value closes — the
+/// tag can then complete or gain attrs) or a newline (the single-line paragraph
+/// splits). Any other byte is opaque value content that keeps the value open.
+fn raw_tag_stays_open(bytes: &[u8], from: usize, to: usize, quote: u8) -> bool {
+    !bytes[from..to].iter().any(|&b| b == quote || b == b'\n' || b == b'\r')
+}
+
+/// Arm the raw-tag-tail cache when the open paragraph at `start` is one raw open
+/// tag whose quoted attribute value streams to EOF (see [`RawTagTailCache`]).
+/// `None` unless the paragraph starts with `<`, `buffer[start..]` is newline-free
+/// (single-line invariant), and the tag is currently inside an unclosed quoted
+/// attribute value (per [`open_tag_streaming_quote`], which mirrors
+/// `inline_html_streams_to_eof`'s open-tag grammar). Callers gate this on
+/// sanitize/unsafe HTML (in escape mode the `<` is visible `&lt;…` text, not
+/// suppressed).
+fn build_raw_tag_tail_cache(buffer: &str, start: usize, id: u64) -> Option<RawTagTailCache> {
+    let bytes = buffer.as_bytes();
+    if bytes.get(start) != Some(&b'<') {
+        return None;
+    }
+    // Single-line invariant: a newline before the value closes would let the
+    // block restructure without the extension guard seeing it. Require the whole
+    // open tag (and its partial value) newline-free at arm; the guard then only
+    // has to watch the appended bytes.
+    if bytes[start..].iter().any(|&b| b == b'\n' || b == b'\r') {
+        return None;
+    }
+    let quote = open_tag_streaming_quote(bytes, start)?;
+    Some(RawTagTailCache { start, id, scanned: bytes.len(), quote })
 }
 
 /// Arm the paragraph cache for the open paragraph at `start`, rendering its

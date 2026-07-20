@@ -912,3 +912,184 @@ fn streaming_tag_suppression_spares_comparisons_and_finalize_is_literal() {
     let open = streamed_open("cut <a href=\"https://u.example/x");
     assert!(visible_text(&open).contains("<a href="), "escape mode must not suppress: {open}");
 }
+
+// ---------------------------------------------------------------------------
+// AlnumTailCache (giant-word-autolinks-pin) + RawTagTailCache (raw-tag-tail-pin)
+// — the streaming O(n²) pins these two caches linearize. The pins are semantic
+// (the commit cut is genuinely stuck at 0), so the caches must reproduce the
+// full path's open view byte-for-byte at every chunk split and DROP the instant
+// a byte could settle the cut. `assert_sweep` (char-by-char + a 2-chunk sweep at
+// every boundary, open view AND finalize) is the strongest mid-stream stress.
+// ---------------------------------------------------------------------------
+
+/// Assert the streamed open view equals the one-shot open view for `md`,
+/// char-by-char and for a 2-chunk split at every char boundary, and that finalize
+/// is chunk-independent regardless of where the cache engaged or dropped.
+fn assert_sweep(make: &dyn Fn() -> StreamParser, md: &str) {
+    let one_open = {
+        let mut p = make();
+        p.append(md);
+        collect(&p)
+    };
+    // Char-by-char + a trailing empty append (fires any freshly-armed cache).
+    {
+        let mut p = make();
+        let mut buf = [0u8; 4];
+        for ch in md.chars() {
+            p.append(ch.encode_utf8(&mut buf));
+        }
+        p.append("");
+        assert_eq!(collect(&p), one_open, "char-stream open != one-shot for {md:?}");
+    }
+    let one_final = {
+        let mut q = make();
+        q.append(md);
+        q.finalize();
+        collect(&q)
+    };
+    for cut in 1..md.len() {
+        if !md.is_char_boundary(cut) {
+            continue;
+        }
+        let mut p = make();
+        p.append(&md[..cut]);
+        p.append(&md[cut..]);
+        assert_eq!(collect(&p), one_open, "2-chunk open split at {cut} != one-shot for {md:?}");
+        p.finalize();
+        assert_eq!(collect(&p), one_final, "2-chunk finalize split at {cut} != one-shot for {md:?}");
+    }
+}
+
+#[test]
+fn alnum_tail_cache_parity_and_drops() {
+    // Extended autolinks ON pins the cut for a space-free alnum run (a future
+    // `@`/`.` could bind it into an autolink), so the AlnumTailCache carries the
+    // open view. It must mirror the full path and drop the instant a non-alnum
+    // byte settles the run — a space, a `.`/`@`/`:` that could open/complete an
+    // autolink, an emphasis opener, or a newline.
+    let make = || StreamParser::new().with_gfm_alerts(true).with_gfm_autolinks(true);
+    let cases = [
+        // Fast path engaged, never drops (pure alnum to EOF).
+        "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "abc123DEF456GHI789",
+        // Run then a byte that settles / could bind — the cache must drop and the
+        // full path (which sees the whole prefix) render byte-identically.
+        "aaaaaaaa bbbbbbbb",          // space: a boundary settles
+        "aaaaaaaa@bbbbb.com",         // `@`: retro email-autolink bind across the run
+        "aaaaaaaa.bbbbbbbb",          // `.`: could begin a domain
+        "aaaaaaaa-bbbb_cccc+dddd",    // `.+_-` mixes (all drop the fast path)
+        "www.example.com",            // `www.` autolink onset
+        "wwwaaaaaaaaaaaa",            // `www` with no dot: NOT an autolink
+        "https://example.com/path",   // scheme autolink mid-run
+        "httpsaaaaaaaaaaaa",          // scheme letters with no `://`: NOT an autolink
+        "aaaaaaaa\nmore words here",  // newline: the single line ends
+        "aaaaaaaa*emph*",             // emphasis opener after the run
+        "aaaaaaaa&amp;bbbb",          // entity opener after the run
+    ];
+    for md in cases {
+        assert_sweep(&make, md);
+    }
+}
+
+#[test]
+fn alnum_tail_cache_retro_bind_across_chunk_boundary() {
+    // Stream the open alnum run, then land the `@` (and domain) in its own chunk:
+    // the fast path was engaged, the settling byte arrives, the cache drops, and
+    // the open view equals a one-shot append of the whole prefix.
+    let make = || StreamParser::new().with_gfm_alerts(true).with_gfm_autolinks(true);
+    let mut p = make();
+    p.append("aaaaaaaa");
+    let plain = {
+        let mut q = make();
+        q.append("aaaaaaaa");
+        collect(&q)
+    };
+    assert_eq!(collect(&p), plain, "pure alnum before the bind");
+    p.append("@example.com"); // retro email-autolink bind
+    let bound = {
+        let mut q = make();
+        q.append("aaaaaaaa@example.com");
+        collect(&q)
+    };
+    assert_eq!(collect(&p), bound, "email autolink after the retro bind");
+}
+
+#[test]
+fn raw_tag_tail_cache_parity_and_drops() {
+    // A never-closing raw open tag whose quoted attr value streams to EOF is
+    // SUPPRESSED under unsafe/sanitize HTML — the render is a constant `<p></p>`,
+    // carried by the RawTagTailCache. It must drop the instant the value's
+    // matching quote closes (the tag can complete or gain attrs) or a newline
+    // splits the line, and `>`/`<` INSIDE the quoted value must NOT close it.
+    let make = || StreamParser::new().with_gfm_alerts(true).with_unsafe_html(true);
+    let cases = [
+        // Fast path engaged (unclosed quoted value to EOF).
+        "<a href=\"https://example.com/aaaaaaaaaaaaaaaa",
+        "<a href=\"https://example.com/x?a=1&b=2&c=3",   // `&`/`?`/`=` are opaque value bytes
+        "<a href=\"https://ex.com/a>b>c>d",               // `>` INSIDE quotes does NOT close
+        "<a href=\"a<b<c<d",                              // second `<` inside the value
+        "<a href='https://ex.com/aaaaaaaa",              // single-quoted value
+        "<img src=\"data:image/png;base64,AAAABBBBCCCC",  // different tag/attr
+        // Drop transitions that keep the block a paragraph (prefix-stable) — the
+        // full path (whole prefix) renders byte-identically.
+        "<a href=\"https://ex.com/\" data-x=\"y",         // first attr closes, second opens
+        "<a href=\"https://ex.com/\"",                    // quote closes, awaiting `>`
+        "<a href=\"https://ex.com/x\nmore",               // newline arrives inside the value
+        // NOTE: a tag that COMPLETES with a `>` landing alone at end-of-line
+        // mid-stream (`<a href="…">` then text) commits a type-7 raw-HTML block —
+        // a PRE-EXISTING, chunk-dependent property of raw-HTML blocks (verified on
+        // the untouched tree: char-stream sees the HTML block, one-shot-of-the-
+        // full-line sees a paragraph), orthogonal to this cache (which has already
+        // dropped at the closing quote). Its completion is covered chunk-stably by
+        // `raw_tag_tail_cache_quote_close_across_chunk_boundary` below.
+    ];
+    for md in cases {
+        assert_sweep(&make, md);
+    }
+}
+
+#[test]
+fn raw_tag_tail_cache_quote_close_across_chunk_boundary() {
+    // Stream the open tag, then land the closing quote + `>` in their own chunk:
+    // the fast path was engaged, the value closes, the cache drops, and the open
+    // view equals a one-shot append of the whole prefix.
+    let make = || StreamParser::new().with_gfm_alerts(true).with_unsafe_html(true);
+    let mut p = make();
+    p.append("<a href=\"https://ex.com/aaaa");
+    let suppressed = {
+        let mut q = make();
+        q.append("<a href=\"https://ex.com/aaaa");
+        collect(&q)
+    };
+    assert_eq!(collect(&p), suppressed, "open tag suppressed to <p></p>");
+    p.append("\">hello</a>"); // quote closes + tag completes in its own chunk
+    let done = {
+        let mut q = make();
+        q.append("<a href=\"https://ex.com/aaaa\">hello</a>");
+        collect(&q)
+    };
+    assert_eq!(collect(&p), done, "completed anchor after the close");
+}
+
+#[test]
+fn raw_tag_tail_cache_mode_interaction() {
+    // Sanitize mode suppresses identically to unsafe (same code path) — the cache
+    // MAY engage there. Escape mode renders the `<` as visible `&lt;…` text — a
+    // different (out-of-scope) shape — so the cache must NOT engage; either way
+    // the streamed view stays byte-identical to the full path.
+    let md = "<a href=\"https://example.com/aaaaaaaaaaaa";
+    let make_unsafe = || StreamParser::new().with_gfm_alerts(true).with_unsafe_html(true);
+    let make_sanitize = || {
+        let mut p = StreamParser::new().with_gfm_alerts(true);
+        p.set_html_sanitize(true, vec![], vec![]);
+        p
+    };
+    let make_escape = || StreamParser::new().with_gfm_alerts(true);
+    assert_sweep(&make_unsafe, md);
+    assert_sweep(&make_sanitize, md);
+    assert_sweep(&make_escape, md);
+    // The escape-mode open view keeps the raw prefix visible (never suppressed).
+    let mut e = make_escape();
+    e.append(md);
+    assert!(visible_text(&collect(&e)).contains("<a href="), "escape mode must not suppress the tag");
+}

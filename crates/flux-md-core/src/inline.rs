@@ -1611,6 +1611,110 @@ fn open_tag_or_autolink_streams_to_eof(rest: &[u8]) -> bool {
     }
 }
 
+/// If the raw open tag at `start` is currently streaming to EOF *inside an
+/// unclosed quoted attribute value*, return that value's quote byte (`b'"'` or
+/// `b'\''`); otherwise `None`. This is the one open-tag streaming state whose
+/// suppressed render extends in O(1) as bytes append: while no matching quote
+/// closes the value the tag stays EOF-streaming (so
+/// [`inline_html_streams_to_eof`] keeps suppressing it) and the render is
+/// unchanged. Mirrors the open-tag arm of [`open_tag_or_autolink_streams_to_eof`]
+/// exactly; every OTHER terminal — settled, broken, or streaming-but-not-in-a-
+/// quote (tag name / ws / unquoted value abutting EOF, the autolink arm) —
+/// returns `None`, so a caller keying a fast path off it only ever OVER-drops to
+/// the byte-identical full path.
+pub(crate) fn open_tag_streaming_quote(bytes: &[u8], start: usize) -> Option<u8> {
+    let rest = &bytes[start..];
+    // `<` + ASCII letter opens a tag; anything else is not this state.
+    if rest.first() != Some(&b'<') || !rest.get(1)?.is_ascii_alphabetic() {
+        return None;
+    }
+    let mut i = 1;
+    while i < rest.len() && (rest[i].is_ascii_alphanumeric() || rest[i] == b'-') {
+        i += 1;
+    }
+    if i == rest.len() {
+        return None; // tag name abuts EOF — streaming, but not in a quote
+    }
+    loop {
+        let prev = i;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+            i += 1;
+        }
+        if i == rest.len() {
+            return None; // ws abuts EOF
+        }
+        if rest[i] == b'/' || rest[i] == b'>' {
+            return None; // self-closing awaiting `>` / complete — settled
+        }
+        if i == prev {
+            return None; // attrs must be ws-separated — broken
+        }
+        if !(rest[i].is_ascii_alphabetic() || rest[i] == b'_' || rest[i] == b':') {
+            return None; // invalid attr-name start — broken
+        }
+        while i < rest.len() && (rest[i].is_ascii_alphanumeric() || matches!(rest[i], b'_' | b':' | b'.' | b'-')) {
+            i += 1;
+        }
+        if i == rest.len() {
+            return None; // attr name abuts EOF
+        }
+        let save = i;
+        while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+            i += 1;
+        }
+        if i == rest.len() {
+            return None; // ws after an attr name abuts EOF
+        }
+        if rest[i] == b'=' {
+            i += 1;
+            while i < rest.len() && matches!(rest[i], b' ' | b'\t' | b'\n') {
+                i += 1;
+            }
+            if i == rest.len() {
+                return None; // awaiting the value
+            }
+            match rest[i] {
+                b'"' => {
+                    i += 1;
+                    while i < rest.len() && rest[i] != b'"' {
+                        i += 1;
+                    }
+                    if i == rest.len() {
+                        debug_assert!(inline_html_streams_to_eof(bytes, start));
+                        return Some(b'"'); // unclosed double-quoted value abuts EOF
+                    }
+                    i += 1;
+                }
+                b'\'' => {
+                    i += 1;
+                    while i < rest.len() && rest[i] != b'\'' {
+                        i += 1;
+                    }
+                    if i == rest.len() {
+                        debug_assert!(inline_html_streams_to_eof(bytes, start));
+                        return Some(b'\''); // unclosed single-quoted value abuts EOF
+                    }
+                    i += 1;
+                }
+                _ => {
+                    let vstart = i;
+                    while i < rest.len() && !matches!(rest[i], b' ' | b'\t' | b'\n' | b'>' | b'<' | b'\'' | b'"' | b'=' | b'`') {
+                        i += 1;
+                    }
+                    if i == vstart {
+                        return None; // invalid first value byte — broken
+                    }
+                    if i == rest.len() {
+                        return None; // unquoted value abuts EOF — streaming, not a quote
+                    }
+                }
+            }
+        } else {
+            i = save;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Inline custom components (opt-in `inline_component_tags`)
 // ---------------------------------------------------------------------

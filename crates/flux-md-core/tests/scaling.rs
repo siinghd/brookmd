@@ -795,8 +795,9 @@ fn raw_html_anchors(target: usize) -> String {
 /// ONE never-closing raw tag with an unboundedly growing quoted attribute —
 /// the raw-HTML twin of the `[link](growing-url…` tail pin. The failed-`<`
 /// unstable mark (which PRE-DATES the open-tail tag suppression) pins the
-/// paragraph cut at the `<`, so the growing suffix re-renders per append.
-/// Bounded by attribute length in practice; documented pin.
+/// paragraph cut at the `<`; while the tag streams to EOF inside its unclosed
+/// quoted value the render is a constant `<p></p>`, so the RawTagTailCache
+/// extends it in O(1) (see the shape entry below).
 fn raw_tag_growing_attr(target: usize) -> String {
     let mut s = String::from("<a href=\"https://example.com/");
     while s.len() < target {
@@ -1010,19 +1011,36 @@ fn shapes() -> Vec<Shape> {
         // -- the 17 verified O(n²) hunt groups (fix campaign; flip to Linear
         //    as each lands) ---------------------------------------------------
         quad("open-block-html-reemit", unclosed_fence, base, Linear, Linear), // wall-only (memcpy); emitted shows it
-        // commit-cut-pinned-no-boundary, residual semantic pin: with extended
-        // autolinks ON a future `@` legitimately reaches back through the alnum
-        // run, so the cut cannot advance. Inert-run flavors (entity_soup,
-        // punctuated_giant_word, autolinks-off) are FIXED and linear above.
-        quad("giant-word-autolinks-pin", one_giant_word, base, KnownQuadratic, KnownQuadratic),
-        // Pre-existing tail pin (failed-`<` unstable mark): a single unbounded
-        // never-closing raw tag re-renders its growing suffix per append.
+        // commit-cut-pinned-no-boundary: FIXED on BOTH metrics via the
+        // AlnumTailCache. With extended autolinks ON the `aaaa…` run has no
+        // boundary candidate (a future `@`/`.` could bind it right-to-left into an
+        // autolink), so the cut pins at 0 and no ParagraphCache can arm. But a
+        // pure-ASCII-alnum run can neither open a construct nor complete an
+        // autolink (which needs `http://`/`www.`/`@` punctuation the run lacks),
+        // and escape_html leaves alnum unchanged — so the render is fixed at `<p>`
+        // + escape_html(body) + `</p>` and the cache extends the escaped body by
+        // only the appended bytes (O(new)). The guard drops to the byte-identical
+        // full path the instant a non-alnum byte settles the run. Inert-run
+        // flavors (entity_soup, punctuated_giant_word, autolinks-off) are linear
+        // above by the synthetic-boundary path.
+        quad("giant-word-autolinks-pin", one_giant_word, base, Linear, Linear),
+        // raw-tag-tail-pin: FIXED on BOTH metrics via the RawTagTailCache. The
+        // failed-`<` unstable mark (pre-dating the open-tail tag suppression) pins
+        // the cut at the `<`, so no ParagraphCache can arm. But while the tag
+        // streams to EOF inside its unclosed quoted attr value, the 0.20.3
+        // suppression emits nothing — the paragraph render is the CONSTANT
+        // `<p></p>` — so the cache extension is O(1): it only checks the appended
+        // bytes for the value-closing quote or a newline. The guard drops to the
+        // byte-identical full path the instant the quote closes (the tag can
+        // complete or gain attrs) or a newline splits the line. Engaged only under
+        // sanitize/unsafe HTML (in escape mode the `<` is visible `&lt;…` text, a
+        // separate out-of-scope pin).
         quad(
             "raw-tag-tail-pin",
             raw_tag_growing_attr,
             Opts { unsafe_html: true, ..Opts::default() },
-            KnownQuadratic,
-            KnownQuadratic,
+            Linear,
+            Linear,
         ),
         // uncached-open-block-kinds: FIXED — the five member shapes are pinned
         // linear here; the two first-line-incomplete container flavors remain
