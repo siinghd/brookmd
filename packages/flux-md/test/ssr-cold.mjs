@@ -24,6 +24,9 @@ const entrypoints = [
   "../src/index.ts", "../src/client.ts", "../src/react.tsx", "../src/dom.ts",
   "../src/element.ts", "../src/vue.ts", "../src/svelte.ts", "../src/solid.tsx",
   "../src/hi.ts", "../src/html-to-react.ts", "../src/types.ts",
+  // Advanced engine-neutral entries reused by non-DOM consumers (e.g. React
+  // Native): each must stay import-safe with zero browser globals.
+  "../src/block-props.ts", "../src/worker-core.ts",
 ];
 for (const ep of entrypoints) {
   try { await import(ep); ok("import " + ep); } catch (e) { fail("import " + ep, e); }

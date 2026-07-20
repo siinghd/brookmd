@@ -18,6 +18,9 @@
     "./svelte": { "types": "./dist/svelte.d.ts", "import": "./dist/svelte.js" },
     "./solid": { "types": "./dist/solid.d.ts", "import": "./dist/solid.js" },
     "./highlight": { "types": "./dist/hi.d.ts", "import": "./dist/hi.js" },
+    "./html-to-react": { "types": "./dist/html-to-react.d.ts", "import": "./dist/html-to-react.js" },
+    "./block-props": { "types": "./dist/block-props.d.ts", "import": "./dist/block-props.js" },
+    "./worker-core": { "types": "./dist/worker-core.d.ts", "import": "./dist/worker-core.js" },
     "./types": { "types": "./dist/types.d.ts", "import": "./dist/types.js" },
     "./styles.css": "./dist/styles.css",
     "./package.json": "./package.json"

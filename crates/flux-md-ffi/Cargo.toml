@@ -1,0 +1,31 @@
+[package]
+name = "flux-md-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "uniffi FFI wrapper over flux-md-core, for uniffi-bindgen-react-native (ubrn)"
+license = "MIT"
+repository = "https://github.com/siinghd/flux-md"
+# Ships inside the npm React Native package (built for iOS/Android device targets
+# by ubrn), not to crates.io. Revisit if we ever publish the native layer.
+publish = false
+
+[lib]
+name = "flux_md_ffi"
+# staticlib → iOS (linked into the app), cdylib → Android (.so loaded at runtime),
+# rlib → `cargo test` here on the host. ubrn extracts the uniffi interface metadata
+# from the compiled cdylib/staticlib via uniffi "library mode".
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# Pure native API only — NO wasm-bindgen. `default-features = false` drops the
+# `wasm` feature so this crate builds for device targets and links `StreamParser`,
+# `Patch`, `Block`, and the `wire::*` JSON helpers directly.
+flux-md-core = { path = "../flux-md-core", default-features = false }
+
+# COMPAT PIN — DO NOT bump in isolation.
+# uniffi-bindgen-react-native (ubrn) 0.31.0-3 pins `uniffi = "=0.31.0"` in its own
+# Cargo.toml and generates the TS/C++ bindings against THIS crate's compiled
+# library via uniffi library mode. The uniffi runtime linked here and ubrn's
+# bundled bindgen must be the same version (method checksums changed in 0.31), so
+# this version is locked to ubrn's. Upgrade ubrn and this pin together.
+uniffi = "=0.31.0"

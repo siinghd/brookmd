@@ -1,0 +1,35 @@
+# uniffi-bindgen-react-native (ubrn) project config.
+#
+# Drives `ubrn generate` / `ubrn build` for the native layer. The bindings are
+# generated from the `flux-md-ffi` crate (../../crates/flux-md-ffi), which wraps
+# `flux-md-core` behind a uniffi `FluxSession` object. See README "How it works".
+#
+# ubrn is pinned to 0.31.0-3 and the crate pins `uniffi = "=0.31.0"` to match it
+# (method checksums changed in 0.31 — bump ubrn and the crate together).
+name: flux-md-react-native
+
+rust:
+  # The FFI crate lives in the repo's cargo workspace, not vendored here.
+  directory: ../../crates/flux-md-ffi
+  manifestPath: Cargo.toml
+
+# Where `ubrn generate jsi bindings` writes the generated TypeScript + C++.
+bindings:
+  ts: src/generated
+  cpp: cpp/generated
+
+android:
+  # Device ABIs built by scripts/build-android.sh (cargo-ndk). 16 KB page size:
+  # requires NDK r28+ (adds max-page-size=16384 to the linker by default).
+  targets:
+    - aarch64-linux-android
+    - armv7-linux-androideabi
+    - x86_64-linux-android
+
+ios:
+  # Device + both simulator slices; scripts/build-ios.sh lipos the two sim
+  # arches and assembles an XCFramework.
+  targets:
+    - aarch64-apple-ios
+    - aarch64-apple-ios-sim
+    - x86_64-apple-ios

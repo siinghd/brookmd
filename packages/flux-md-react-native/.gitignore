@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Native build output — cross-compiled per-device, never committed (built on
+# demand by scripts/build-{android,ios}.sh, and in CI by rn-build.yml).
+android/build/
+ios/build/
+android/src/main/jniLibs/**/*.so
+*.xcframework
+
+# Keep the jniLibs/ios placeholders so the directory structure ships.
+!**/.gitkeep
+
+# Editor / OS state
+.DS_Store
+*.local
