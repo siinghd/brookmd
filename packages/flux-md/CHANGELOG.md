@@ -4,6 +4,44 @@ Notable changes to flux-md. Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.21.0 — 2026-07-20
+
+### Added
+
+- **New subpath exports** — `flux-md/html-to-react`, `flux-md/block-props`,
+  and `flux-md/worker-core` expose the pure HTML tokenizer, block-prop
+  helpers, and the backend-agnostic worker state machine for custom
+  renderers. These are the building blocks the upcoming React Native
+  package consumes; no behavior change for existing imports.
+- **Native bindings in the repository** (experimental, not yet published as
+  packages): Swift (SPM, iOS + macOS), Kotlin/Android, a plain C ABI crate,
+  and a Flutter/Dart scaffold — every boundary emits the same versioned wire
+  JSON (`WIRE.md` v1.0.0), pinned by golden byte-equality tests per language.
+
+### Performance
+
+- **Streaming worst-case campaign: five previously quadratic shapes are now
+  linear**, with byte-identical output (streamed views equal one-shot renders
+  at every chunk boundary; verified by the perf gate, mid-stream parity
+  sweeps, and fuzzing):
+  - an open, unclosed `$…` inline-math span (a streaming formula before its
+    closer): 64 KB in 1 KB chunks 154 ms → 10 ms;
+  - a growing all-alphanumeric word with autolinks on: 103 ms → 5.5 ms;
+  - an unterminated raw tag with `unsafeHtml`: 78 ms → 2.6 ms;
+  - emphasis soups held open by the CommonMark mod-3 rule: 247 ms → 5.3 ms;
+  - ever-deepening blockquote nesting: depth-110 staircase 341 ms → 1.0 ms;
+  - bonus: blockquotes/alerts whose first line hasn't completed now engage
+    their incremental caches mid-line (1005 ms → 487 ms at 64 KB).
+
+## 0.20.1 – 0.20.3 — 2026-07-15 *(backfilled)*
+
+- 0.20.1: streaming divergence swaps preserve the rendered view during
+  incremental re-merges (no collapse until final); `doFinalize` wire-loss
+  fix; fuzz-caught dangling-`[text](` mis-parse and reattach re-feed fixes.
+- 0.20.3: an open raw `<a href="…` under `unsafeHtml`/sanitize no longer
+  flashes the URL while streaming; a changed block keeps its position's id
+  across a divergence swap, so stateful component overrides survive.
+
 ## 0.20.0 — 2026-07-02
 
 ### Added
