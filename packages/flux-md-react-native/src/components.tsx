@@ -16,9 +16,18 @@
 //     `div`, `section`, `pre`, `hr`) render as <View>/<ScrollView>, and their
 //     children are filtered to real elements (inter-tag whitespace text nodes —
 //     illegal directly inside a View — are dropped).
-import { Children, cloneElement, isValidElement, type ComponentType, type ReactNode } from "react";
-import type { Components } from "flux-md/types";
-import { safeUrl } from "flux-md/html-to-react";
+import {
+  Children,
+  cloneElement,
+  createElement,
+  isValidElement,
+  memo,
+  useMemo,
+  type ComponentType,
+  type ReactNode,
+} from "react";
+import type { Block, Components, ListData, NestedBlock, TableData } from "flux-md/types";
+import { htmlToReact, safeUrl } from "flux-md/html-to-react";
 import type { AlertKind, Theme } from "./theme";
 
 /**
@@ -72,6 +81,16 @@ function isInlineChild(node: ReactNode): boolean {
 
 const HEADING_SCALE: Record<string, number> = { h1: 2, h2: 1.5, h3: 1.25, h4: 1, h5: 0.875, h6: 0.85 };
 
+/** Renders an OPEN List/Table/Blockquote/Alert from `block.kind.data` (keyed
+ *  sub-parts), or returns `null` to fall back to the whole-html path. */
+export type OpenBlockRenderer = (block: Block, components: Components) => ReactNode | null;
+
+/** Symbol key under which {@link createComponents} attaches its {@link OpenBlockRenderer}
+ *  to the returned map. Symbol-keyed so it survives the `{...defaults, ...overrides}`
+ *  spread without ever colliding with an HTML-tag key. The renderer reads it to
+ *  drive the keyed streaming-tail path; absence means "no keyed path" (whole-html). */
+export const RENDER_OPEN_BLOCK: unique symbol = Symbol("flux-md-rn.renderOpenBlock");
+
 /**
  * Build the tag→primitive component map. Pass the result as `<FluxMarkdown
  * components={...}>` or straight to `htmlToReact(html, components)`.
@@ -80,11 +99,36 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
   const { Text, View, ScrollView, Image, Linking, StyleSheet } = primitives;
   const fs = theme.fontSize;
   const lh = Math.round(fs * theme.lineHeightScale);
+  const hairline = StyleSheet.hairlineWidth as unknown as number;
+  // Heading style baked per level — no inline {fontSize,lineHeight} object rebuilt
+  // per render (the array/object identity would defeat downstream memo/reconcile).
+  const hStyle = (tag: string) => {
+    const size = Math.round(fs * (HEADING_SCALE[tag] ?? 1));
+    return {
+      color: theme.heading,
+      fontWeight: "700" as const,
+      marginBottom: fs * 0.4,
+      marginTop: fs * 0.2,
+      fontSize: size,
+      lineHeight: Math.round(size * 1.25),
+    };
+  };
+  const cellBase = { flex: 1, color: theme.text, fontSize: fs * 0.95, padding: fs * 0.4, borderWidth: hairline, borderColor: theme.border };
+  const alertBase = { borderLeftWidth: 4, borderRadius: 6, padding: fs * 0.6, marginBottom: fs * 0.6 };
+  const alertOf = (k: AlertKind) => ({ ...alertBase, borderLeftColor: theme.alerts[k].bar, backgroundColor: theme.alerts[k].bg });
 
   const s = StyleSheet.create({
     block: { marginBottom: fs * 0.6 },
     paragraph: { color: theme.text, fontSize: fs, lineHeight: lh },
-    heading: { color: theme.heading, fontWeight: "700", marginBottom: fs * 0.4, marginTop: fs * 0.2 },
+    // Composite hoists: pre-merged so no per-render style array is allocated.
+    paragraphBlock: { color: theme.text, fontSize: fs, lineHeight: lh, marginBottom: fs * 0.6 },
+    alertTitleP: { color: theme.text, fontSize: fs, lineHeight: lh, fontWeight: "700", marginBottom: fs * 0.2 },
+    h1: hStyle("h1"),
+    h2: hStyle("h2"),
+    h3: hStyle("h3"),
+    h4: hStyle("h4"),
+    h5: hStyle("h5"),
+    h6: hStyle("h6"),
     strong: { fontWeight: "700" },
     em: { fontStyle: "italic" },
     del: { textDecorationLine: "line-through" },
@@ -99,7 +143,7 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
     pre: {
       backgroundColor: theme.surface,
       borderRadius: 6,
-      borderWidth: StyleSheet.hairlineWidth as unknown as number,
+      borderWidth: hairline,
       borderColor: theme.border,
       padding: fs * 0.75,
       marginBottom: fs * 0.6,
@@ -111,25 +155,18 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
       paddingLeft: fs * 0.75,
       marginBottom: fs * 0.6,
     },
-    hr: { height: StyleSheet.hairlineWidth as unknown as number, backgroundColor: theme.border, marginVertical: fs },
+    hr: { height: hairline, backgroundColor: theme.border, marginVertical: fs },
     list: { marginBottom: fs * 0.6 },
     li: { flexDirection: "row", alignItems: "flex-start", marginBottom: fs * 0.15 },
     liMarker: { color: theme.text, fontSize: fs, lineHeight: lh, marginRight: fs * 0.4, minWidth: fs * 0.9 },
     liContent: { flex: 1 },
     liBody: { color: theme.text, fontSize: fs, lineHeight: lh },
     checkbox: { color: theme.text, fontSize: fs, lineHeight: lh },
-    table: { borderWidth: StyleSheet.hairlineWidth as unknown as number, borderColor: theme.border, marginBottom: fs * 0.6 },
+    table: { borderWidth: hairline, borderColor: theme.border, marginBottom: fs * 0.6 },
     tr: { flexDirection: "row" },
-    cell: {
-      flex: 1,
-      color: theme.text,
-      fontSize: fs * 0.95,
-      padding: fs * 0.4,
-      borderWidth: StyleSheet.hairlineWidth as unknown as number,
-      borderColor: theme.border,
-    },
-    cellHeader: { fontWeight: "700" },
-    footnotes: { marginTop: fs, borderTopWidth: StyleSheet.hairlineWidth as unknown as number, borderTopColor: theme.border, paddingTop: fs * 0.5 },
+    cell: cellBase,
+    cellHead: { ...cellBase, fontWeight: "700" },
+    footnotes: { marginTop: fs, borderTopWidth: hairline, borderTopColor: theme.border, paddingTop: fs * 0.5 },
     sup: { color: theme.link, fontSize: fs * 0.7, lineHeight: lh },
     mathInline: { color: theme.text, fontFamily: theme.mono, fontSize: fs * 0.95 },
     mathDisplay: {
@@ -141,8 +178,12 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
       marginBottom: fs * 0.6,
       textAlign: "center",
     },
-    alert: { borderLeftWidth: 4, borderRadius: 6, padding: fs * 0.6, marginBottom: fs * 0.6 },
-    alertTitle: { fontWeight: "700", marginBottom: fs * 0.2 },
+    // Per-kind alert cards, tint baked in (no inline {borderLeftColor,...} array).
+    alertNote: alertOf("note"),
+    alertTip: alertOf("tip"),
+    alertImportant: alertOf("important"),
+    alertWarning: alertOf("warning"),
+    alertCaution: alertOf("caution"),
     image: { width: "100%", height: 200, resizeMode: "contain", marginBottom: fs * 0.4 },
   } as Record<string, object>);
 
@@ -193,14 +234,14 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
   // --- text blocks (Text) ----------------------------------------------------
   const Paragraph = (p: P) => {
     if (cls(p).includes("markdown-alert-title")) {
-      return <Text style={[s.alertTitle, s.paragraph]}>{p.children}</Text>;
+      return <Text style={s.alertTitleP}>{p.children}</Text>;
     }
-    return <Text style={[s.paragraph, s.block]}>{p.children}</Text>;
+    return <Text style={s.paragraphBlock}>{p.children}</Text>;
   };
 
   const heading = (tag: string): ComponentType<P> => {
-    const size = Math.round(fs * (HEADING_SCALE[tag] ?? 1));
-    const H = (p: P) => <Text style={[s.heading, { fontSize: size, lineHeight: Math.round(size * 1.25) }]}>{p.children}</Text>;
+    const style = s[tag] ?? s.h1;
+    const H = (p: P) => <Text style={style}>{p.children}</Text>;
     H.displayName = tag.toUpperCase();
     return H;
   };
@@ -304,7 +345,7 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
   const Thead = (p: P) => <View>{elementChildren(p.children)}</View>;
   const Tbody = (p: P) => <View>{elementChildren(p.children)}</View>;
   const Tr = (p: P) => <View style={s.tr}>{elementChildren(p.children)}</View>;
-  const Th = (p: P) => <Text style={[s.cell, s.cellHeader]}>{p.children}</Text>;
+  const Th = (p: P) => <Text style={s.cellHead}>{p.children}</Text>;
   const Td = (p: P) => <Text style={s.cell}>{p.children}</Text>;
 
   const Img = (p: P) => {
@@ -322,19 +363,161 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
     const m = className.match(/markdown-alert-(note|tip|important|warning|caution)/);
     return m ? (m[1] as AlertKind) : null;
   };
+  const ALERT_STYLE: Record<AlertKind, object> = {
+    note: s.alertNote,
+    tip: s.alertTip,
+    important: s.alertImportant,
+    warning: s.alertWarning,
+    caution: s.alertCaution,
+  };
 
   const Div = (p: P) => {
     const c = cls(p);
     if (c.includes("math-display")) return <Text style={s.mathDisplay}>{p.children}</Text>;
     const kind = c.includes("markdown-alert") ? alertKindFromClass(c) : null;
     if (kind) {
-      const t = theme.alerts[kind];
-      return (
-        <View style={[s.alert, { borderLeftColor: t.bar, backgroundColor: t.bg }]}>{elementChildren(p.children)}</View>
-      );
+      return <View style={ALERT_STYLE[kind]}>{elementChildren(p.children)}</View>;
     }
     // Mermaid or any other div: a plain container.
     return <View style={s.block}>{elementChildren(p.children)}</View>;
+  };
+
+  const Ul = makeList(false);
+  const Ol = makeList(true);
+
+  // ---- keyed OPEN-block renderers (blockData channel) -----------------------
+  // While a List/Table/Blockquote/Alert is OPEN it gets a fresh block ref every
+  // patch, so the whole-html path re-tokenizes the ENTIRE block each tick — O(n²)
+  // over a long streaming block. These render from block.kind.data instead: each
+  // sub-part (item / cell / nested child) tokenizes via htmlToReact separately and
+  // is memoized by (index, html), so React reconciles by key and only the growing
+  // tail re-tokenizes. Inner content routes through the MERGED `components` (so
+  // inline tag overrides still apply); structural wrappers use the defaults, so
+  // the keyed path is disabled when the caller overrides a structural tag (below).
+  const alertTitleHtml = (html: string): string => {
+    const m = html.match(/<p class="markdown-alert-title"[^>]*>[\s\S]*?<\/p>/);
+    return m ? m[0] : "";
+  };
+
+  const KeyedFragment = memo(function KeyedFragment(props: { html: string; components: Components }): ReactNode {
+    // Memoized per (html, components): a committed sub-part never re-tokenizes.
+    return useMemo(() => htmlToReact(props.html, props.components), [props.html, props.components]) as ReactNode;
+  });
+
+  const KeyedListItem = memo(function KeyedListItem(props: { html: string; marker: string; components: Components }) {
+    const nodes = useMemo(() => htmlToReact(props.html, props.components), [props.html, props.components]);
+    return createElement(Li, { __marker: props.marker, children: nodes });
+  });
+
+  const KeyedList = (props: { block: Block; components: Components }) => {
+    const data = props.block.kind.data as ListData | undefined;
+    const items = data?.items ?? [];
+    const ordered = !!data?.ordered;
+    const start = ordered && typeof data?.start === "number" ? data.start : 1;
+    return (
+      <View style={s.list}>
+        {items.map((it, i) => (
+          <KeyedListItem key={i} html={it.html} marker={ordered ? `${start + i}.` : "•"} components={props.components} />
+        ))}
+      </View>
+    );
+  };
+
+  const KeyedCell = memo(function KeyedCell(props: { header: boolean; html: string; components: Components }) {
+    const nodes = useMemo(() => htmlToReact(props.html, props.components), [props.html, props.components]);
+    return createElement(props.header ? Th : Td, { children: nodes });
+  });
+
+  const KeyedTable = (props: { block: Block; components: Components }) => {
+    const data = props.block.kind.data as TableData | undefined;
+    if (!data || !Array.isArray(data.rows)) return null;
+    return (
+      <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+        <View style={s.table}>
+          <View>
+            <View style={s.tr}>
+              {data.headers.map((c, j) => (
+                <KeyedCell key={j} header html={c.html} components={props.components} />
+              ))}
+            </View>
+          </View>
+          {data.rows.length > 0 && (
+            <View>
+              {data.rows.map((row, i) => (
+                <View key={i} style={s.tr}>
+                  {row.map((c, j) => (
+                    <KeyedCell key={j} header={false} html={c.html} components={props.components} />
+                  ))}
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      </ScrollView>
+    );
+  };
+
+  const KeyedBlockquote = (props: { block: Block; components: Components }) => {
+    const nested = (props.block.kind.data as { nested?: NestedBlock[] } | undefined)?.nested ?? [];
+    return (
+      <View style={s.blockquote}>
+        {nested.map((n, i) => (
+          <KeyedFragment key={i} html={n.html} components={props.components} />
+        ))}
+      </View>
+    );
+  };
+
+  const KeyedAlert = (props: { block: Block; components: Components }) => {
+    const data = props.block.kind.data as { kind?: AlertKind; nested?: NestedBlock[] } | undefined;
+    const kind = (data?.kind ?? "note") as AlertKind;
+    const nested = data?.nested ?? [];
+    const title = alertTitleHtml(props.block.html);
+    return (
+      <View style={ALERT_STYLE[kind]}>
+        {title ? <KeyedFragment key="title" html={title} components={props.components} /> : null}
+        {nested.map((n, i) => (
+          <KeyedFragment key={i} html={n.html} components={props.components} />
+        ))}
+      </View>
+    );
+  };
+
+  // Dispatcher used by the renderer for OPEN blocks (attached under a symbol so it
+  // survives the `{...defaults, ...userOverrides}` merge without colliding with any
+  // tag key). Returns the keyed tree, or null to fall back to the whole-html path
+  // (closed blocks, blockData off, or a structural tag override present).
+  const renderOpenBlock: OpenBlockRenderer = (block, components) => {
+    if (!block.open) return null;
+    const kind = block.kind.type;
+    const overridden = (tags: string[]) => tags.some((t) => components[t] !== map[t]);
+    if (kind === "List") {
+      const data = block.kind.data as ListData | undefined;
+      if (Array.isArray(data?.items) && data.items.length > 0 && !overridden(["ul", "ol", "li"])) {
+        return <KeyedList block={block} components={components} />;
+      }
+    } else if (kind === "Table") {
+      const data = block.kind.data as TableData | undefined;
+      if (
+        data &&
+        Array.isArray(data.headers) &&
+        Array.isArray(data.rows) &&
+        !overridden(["table", "thead", "tbody", "tr", "th", "td"])
+      ) {
+        return <KeyedTable block={block} components={components} />;
+      }
+    } else if (kind === "Blockquote") {
+      const nested = (block.kind.data as { nested?: NestedBlock[] } | undefined)?.nested;
+      if (Array.isArray(nested) && !overridden(["blockquote"])) {
+        return <KeyedBlockquote block={block} components={components} />;
+      }
+    } else if (kind === "Alert") {
+      const nested = (block.kind.data as { nested?: NestedBlock[] } | undefined)?.nested;
+      if (Array.isArray(nested) && !overridden(["div"])) {
+        return <KeyedAlert block={block} components={components} />;
+      }
+    }
+    return null;
   };
 
   const map: Components = {
@@ -351,8 +534,8 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
     blockquote: Blockquote,
     div: Div,
     span: Span,
-    ul: makeList(false),
-    ol: makeList(true),
+    ul: Ul,
+    ol: Ol,
     li: Li,
     input: Input,
     label: Label,
@@ -377,5 +560,8 @@ export function createComponents(primitives: RnPrimitives, theme: Theme): Compon
     const w = map[t];
     if (typeof w === "function") (w as unknown as { __inline?: boolean }).__inline = true;
   }
+  // Attach the keyed open-block dispatcher (symbol key → survives merge, no tag
+  // collision). The renderer reads it via `RENDER_OPEN_BLOCK`.
+  (map as Record<symbol, OpenBlockRenderer>)[RENDER_OPEN_BLOCK] = renderOpenBlock;
   return map;
 }

@@ -9,6 +9,7 @@ import {
   memo,
   useEffect,
   useMemo,
+  useRef,
   useState,
   useSyncExternalStore,
   type ComponentType,
@@ -17,7 +18,7 @@ import {
 import { htmlToReact } from "flux-md/html-to-react";
 import type { FluxClient } from "flux-md/client";
 import type { Block, Components, ParserConfig } from "flux-md/types";
-import { createComponents, type RnPrimitives } from "./components";
+import { createComponents, RENDER_OPEN_BLOCK, type OpenBlockRenderer, type RnPrimitives } from "./components";
 import { resolveTheme, type Theme } from "./theme";
 import { createFluxClient } from "./native-pool";
 
@@ -34,9 +35,14 @@ export interface FluxMarkdownProps {
   /** Opt-in structured `kind.data`. Default `true`. */
   blockData?: boolean;
   /** Per-tag component overrides merged over the built-in map (e.g. custom
-   *  `components.Cite` for an inline component tag, or a replacement `code`). */
+   *  `components.Cite` for an inline component tag, or a replacement `code`).
+   *  CAUTION: keep this identity STABLE — hoist it to module scope or wrap it in
+   *  `useMemo`. A fresh object each render rebuilds the whole renderer and
+   *  re-tokenizes every block on every patch (dev warns once). */
   components?: Components;
-  /** Partial theme override, merged over the resolved light/dark base. */
+  /** Partial theme override, merged over the resolved light/dark base.
+   *  CAUTION: keep this identity STABLE (hoist / `useMemo`). A fresh object each
+   *  render rebuilds the renderer and re-tokenizes every block per patch. */
   theme?: Partial<Theme>;
   /** Force a color scheme, bypassing the injected `useColorScheme`. */
   colorScheme?: "light" | "dark";
@@ -61,11 +67,54 @@ export function useFluxMarkdown(client: FluxClient): Block[] {
   return useSyncExternalStore(client.subscribe, client.getSnapshot, client.getSnapshot);
 }
 
-// One block, rendered through htmlToReact. Memoized on the block reference (the
-// store keeps committed blocks reference-stable) and the components map identity,
-// so committed blocks render exactly once and only the active tail re-renders.
+const warnedUnstable = new Set<string>();
+
+/** Test-only: reset the one-time unstable-prop warning latch. Not public API. */
+export function __resetUnstableWarnings(): void {
+  warnedUnstable.clear();
+}
+
+// Dev-only tripwire (mirrors flux-md's React renderer): warns once if `components`
+// or `theme` changes identity across renders. A fresh identity each render rebuilds
+// the whole component map, which busts every block's memo and re-tokenizes every
+// block on every patch — the classic inline-object footgun. No-op in production and
+// when the value is undefined/stable. Always calls the hook (Rules of Hooks).
+function useUnstablePropWarning(name: string, value: unknown): void {
+  const ref = useRef(value);
+  if (ref.current !== value) {
+    const prevDefined = ref.current !== undefined && ref.current !== null;
+    const nextDefined = value !== undefined && value !== null;
+    ref.current = value;
+    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    if (prevDefined && nextDefined && !warnedUnstable.has(name) && (!env || env.NODE_ENV !== "production")) {
+      warnedUnstable.add(name);
+      // eslint-disable-next-line no-console
+      console.warn(
+        `<FluxMarkdown>: the \`${name}\` prop changed identity between renders. ` +
+          `Hoist it to module scope or wrap it in useMemo — a fresh identity each ` +
+          `render rebuilds the renderer and re-tokenizes every block on every patch.`,
+      );
+    }
+  }
+}
+
+// One block. Memoized on the block reference (the store keeps committed blocks
+// reference-stable) and the components map identity, so committed blocks render
+// exactly once and only the active tail re-renders.
+//
+// For an OPEN List/Table/Blockquote/Alert with structured data, the keyed
+// dispatcher (attached to the components map under RENDER_OPEN_BLOCK) renders from
+// block.kind.data so only the growing tail sub-part re-tokenizes each patch —
+// instead of re-tokenizing the whole block's html every tick (O(n²)). Closed
+// blocks (and the blockData-off / structural-override cases) take the single
+// whole-html path, which runs once.
 const BlockView = memo(
   function BlockView({ block, components }: { block: Block; components: Components }): ReactNode {
+    if (block.open) {
+      const keyed = (components as unknown as Record<symbol, OpenBlockRenderer | undefined>)[RENDER_OPEN_BLOCK];
+      const tree = typeof keyed === "function" ? keyed(block, components) : null;
+      if (tree != null) return tree;
+    }
     return htmlToReact(block.html, components) as ReactNode;
   },
   (a, b) => a.block === b.block && a.components === b.components,
@@ -84,6 +133,10 @@ export function makeFluxMarkdown(deps: FluxMarkdownDeps): ComponentType<FluxMark
   function FluxMarkdown(props: FluxMarkdownProps): ReactNode {
     const deviceScheme = useScheme();
     const scheme = props.colorScheme ?? (deviceScheme === "dark" ? "dark" : "light");
+    // Dev warning: an inline `components`/`theme` object rebuilds the renderer each
+    // render and re-tokenizes every block on every patch. Hoist or useMemo them.
+    useUnstablePropWarning("components", props.components);
+    useUnstablePropWarning("theme", props.theme);
 
     // Internally-owned client, created once from the FIRST props (config is
     // immutable per stream). Constructing it is inert — no native module loads

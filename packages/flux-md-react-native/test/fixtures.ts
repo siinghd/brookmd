@@ -100,6 +100,26 @@ export function chunk(s: string, size: number): string[] {
   return out;
 }
 
+/**
+ * Feed `doc` to a fresh parser in `chunkSize` chunks and capture the FULL block
+ * set (`allBlocks`) after each append plus the final finalize — the sequence of
+ * snapshots a streaming renderer would see. Lets a test drive the keyed vs
+ * whole-html render paths deterministically over a block as it grows.
+ */
+export function parseStates(Ctor: AnyParser, doc: string, chunkSize: number, config?: ParserConfig): WireBlock[][] {
+  const p = new Ctor();
+  applyConfig(p, config);
+  const states: WireBlock[][] = [];
+  for (const ch of chunk(doc, chunkSize)) {
+    p.append(ch);
+    states.push(JSON.parse(p.allBlocks()) as WireBlock[]);
+  }
+  p.finalize();
+  states.push(JSON.parse(p.allBlocks()) as WireBlock[]);
+  p.free();
+  return states;
+}
+
 /** Drain queued microtasks/macrotasks so the in-process shim's patches land. */
 export async function settle(times = 10): Promise<void> {
   for (let i = 0; i < times; i++) await new Promise((r) => setTimeout(r, 0));

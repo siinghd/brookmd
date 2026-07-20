@@ -29,3 +29,19 @@ flux-md-core = { path = "../flux-md-core", default-features = false }
 # bundled bindgen must be the same version (method checksums changed in 0.31), so
 # this version is locked to ubrn's. Upgrade ubrn and this pin together.
 uniffi = "=0.31.0"
+
+# This crate is its own workspace root, so core's tuned profile does NOT apply
+# here — without this section every device build (cargo-ndk .so, iOS staticlib)
+# ships cargo's default release: opt=3/no-lto/cu16/unstripped, a 1.22MB .so.
+# Measured on host aarch64 (2026-07-20): this profile → 856KB .so (-29.5%) at
+# unchanged parse throughput. opt-level stays 3, NOT "z": z costs 1.15-1.9x
+# parse speed (worst on typical mixed markdown) for only -131KB more.
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Keep "unwind" (do NOT copy core's WASM abort posture): uniffi wraps every
+# exported call in catch_unwind and surfaces panics as JS errors. With abort, a
+# parser panic SIGABRTs the host app before uniffi can catch it. Costs ~64KB.
+panic = "unwind"

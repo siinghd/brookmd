@@ -83,8 +83,14 @@ class NativeWorker implements WorkerLike {
   }
 
   private deliver(msg: FromWorker): void {
-    // Snapshot: a listener could (in principle) mutate the set.
-    for (const l of [...this.listeners]) l({ data: msg });
+    // The pool attaches exactly one listener per worker (the always case), so skip
+    // the defensive array snapshot then. Snapshot only when there are 2+, where a
+    // listener could (in principle) mutate the set mid-iteration.
+    if (this.listeners.size === 1) {
+      for (const l of this.listeners) l({ data: msg });
+    } else {
+      for (const l of [...this.listeners]) l({ data: msg });
+    }
   }
 }
 
