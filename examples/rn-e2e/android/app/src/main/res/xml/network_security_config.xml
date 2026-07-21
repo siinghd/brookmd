@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  e2e fixture only. The React Native gradle plugin forces
+  usesCleartextTraffic=false for RELEASE builds; a per-domain rule here overrides
+  that just for 10.0.2.2 (the Android emulator's alias for the host loopback) so
+  the app can POST its pass/fail beacon to the CI listener. Everything else keeps
+  the platform default (cleartext blocked).
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

@@ -2,12 +2,24 @@
 // template. New-architecture (TurboModule) library. Pending on-device validation
 // (see .github/workflows/rn-build.yml — device builds are CI's job).
 buildscript {
+  // The buildscript is evaluated before getExtOrDefault is defined, so read the
+  // Kotlin version straight off rootProject.ext (the host app sets it) with a
+  // project-property fallback for standalone builds.
+  def kotlin_version = rootProject.ext.has("kotlinVersion") ? rootProject.ext.get("kotlinVersion") : project.properties["BrookMdReactNative_kotlinVersion"]
+
   repositories {
     google()
     mavenCentral()
   }
   dependencies {
     classpath "com.android.tools.build:gradle:8.1.1"
+    // The module sources are Kotlin (BrookMdReactNativePackage.kt / *Module.kt).
+    // Without the Kotlin Android plugin they are never compiled, so the class the
+    // app's generated PackageList.java references (BrookMdReactNativePackage)
+    // never lands on the classpath ("cannot find symbol"). Mirrors ubrn's
+    // build.kt.gradle template (this module was scaffolded from the Java one).
+    // noinspection DifferentKotlinGradleVersion
+    classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
   }
 }
 
@@ -16,6 +28,7 @@ def isNewArchitectureEnabled() {
 }
 
 apply plugin: "com.android.library"
+apply plugin: "kotlin-android"
 if (isNewArchitectureEnabled()) {
   apply plugin: "com.facebook.react"
 }
@@ -99,6 +112,7 @@ repositories {
 dependencies {
   //noinspection GradleDynamicVersion
   implementation "com.facebook.react:react-native:+"
+  implementation "org.jetbrains.kotlin:kotlin-stdlib:${getExtOrDefault('kotlinVersion')}"
 }
 
 if (isNewArchitectureEnabled()) {

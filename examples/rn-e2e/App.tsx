@@ -17,7 +17,7 @@
  * <detail>`. CI polls the device log for these markers.
  */
 import { useEffect, useState } from 'react';
-import { ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 
 // The renderer + public client surface. Importing the package entry also wires
 // the native parser factory into the shared pool (registerNativeParser).
@@ -70,6 +70,21 @@ function runNativeWireCheck(): CheckResult {
 
 const DOC = CHUNKS.join('');
 
+// Deterministic result channel for CI: an HTTP beacon to a listener on the host.
+// os_log/logcat capture proved flaky, so the beacon is the PRIMARY signal (the
+// console.log markers stay as a secondary/local-dev channel). Android emulator ->
+// host via the 10.0.2.2 loopback alias; the iOS simulator shares the host network
+// (127.0.0.1). Fire-and-forget: a beacon failure must never crash the app.
+const BEACON_HOST = Platform.OS === 'android' ? '10.0.2.2' : '127.0.0.1';
+const BEACON_URL = `http://${BEACON_HOST}:8973`;
+
+function sendBeacon(path: string): void {
+  fetch(`${BEACON_URL}/${path}`).catch((e) => {
+    // eslint-disable-next-line no-console
+    console.log('BROOK_E2E beacon post failed: ' + String(e));
+  });
+}
+
 function App() {
   const [status, setStatus] = useState('running…');
 
@@ -85,10 +100,12 @@ function App() {
       setStatus('OK');
       // eslint-disable-next-line no-console
       console.log('BROOK_E2E_OK');
+      sendBeacon('BROOK_E2E_OK');
     } else {
       setStatus('FAIL');
       // eslint-disable-next-line no-console
       console.log('BROOK_E2E_FAIL: ' + result.detail);
+      sendBeacon('BROOK_E2E_FAIL?d=' + encodeURIComponent(result.detail));
     }
   }, []);
 

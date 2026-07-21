@@ -15,15 +15,15 @@ name: rn-e2e
 # The app logs BROOK_E2E_OK on success / BROOK_E2E_FAIL:<detail> on mismatch; CI
 # polls the device log for the marker.
 #
+# Result transport: the app POSTs its pass/fail to a host-side HTTP beacon
+# listener (App.tsx), a DETERMINISTIC channel that replaced flaky os_log/logcat
+# capture. Android emulator -> host via 10.0.2.2; the iOS simulator shares the
+# host network (127.0.0.1). On BOTH jobs the beacon is the must-pass gate:
+# BROOK_E2E_OK = pass, BROOK_E2E_FAIL or no-beacon-within-timeout = fail. logcat /
+# os_log are captured only as failure diagnostics.
 #   android-app — Gradle assembleRelease (standalone APK, JS bundled) + hardware-
-#     accelerated x86_64 emulator (KVM). console.log reaches logcat reliably, so
-#     this is the strong must-pass gate.
-#   ios-app     — xcodebuild (Release, simulator) + simctl launch. Capturing an
-#     app's console.log from the iOS simulator in CI is genuinely finicky (RCTLog
-#     routes through os_log, not stdout), so the marker capture here is BEST-EFFORT:
-#     the job hard-fails only on a build/link failure, an app crash, or an observed
-#     BROOK_E2E_FAIL. A successful build + launch + no-crash with the marker missing
-#     is a PASS-with-warning (the documented downgrade the task allows).
+#     accelerated x86_64 emulator (KVM).
+#   ios-app     — xcodebuild (Release, simulator) + simctl launch.
 on:
   workflow_dispatch:
   pull_request:
@@ -161,28 +161,34 @@ jobs:
           script: |
             set -x
             APK=examples/rn-e2e/android/app/build/outputs/apk/release/app-release.apk
+            # Deterministic result channel: a host-side HTTP beacon listener. The
+            # app POSTs its result to 10.0.2.2:8973 (the emulator's alias for the
+            # host loopback); os_log/logcat capture is kept only as diagnostics.
+            python3 -m http.server 8973 --bind 0.0.0.0 > /tmp/beacon.log 2>&1 &
+            BEACON_PID=$!
             adb install -r "$APK"
             adb logcat -c
             adb shell am start -n com.brooke2e/.MainActivity
-            echo "waiting for BROOK_E2E marker…"
+            echo "waiting for BROOK_E2E beacon…"
             result=""
             deadline=$((SECONDS+120))
             while [ $SECONDS -lt $deadline ]; do
-              if adb logcat -d 2>/dev/null | grep -q "BROOK_E2E_OK"; then result=OK; break; fi
-              if adb logcat -d 2>/dev/null | grep -q "BROOK_E2E_FAIL"; then result=FAIL; break; fi
-              sleep 3
+              if grep -q "BROOK_E2E_OK" /tmp/beacon.log 2>/dev/null; then result=OK; break; fi
+              if grep -q "BROOK_E2E_FAIL" /tmp/beacon.log 2>/dev/null; then result=FAIL; break; fi
+              sleep 2
             done
+            kill $BEACON_PID 2>/dev/null || true
             adb logcat -d > /tmp/logcat-full.txt 2>/dev/null || true
-            echo "=== BROOK_E2E log lines ==="
-            grep -E "BROOK_E2E" /tmp/logcat-full.txt || true
+            echo "=== beacon.log ==="; cat /tmp/beacon.log || true
+            echo "=== BROOK_E2E logcat lines (diagnostics) ==="; grep -E "BROOK_E2E" /tmp/logcat-full.txt || true
             if [ "$result" = OK ]; then
               echo "PASS: native parser produced byte-identical wire and the renderer mounted."
             elif [ "$result" = FAIL ]; then
-              echo "FAIL: app reported BROOK_E2E_FAIL"
+              echo "FAIL: app beaconed BROOK_E2E_FAIL"; grep "BROOK_E2E_FAIL" /tmp/beacon.log || true
               echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
               exit 1
             else
-              echo "TIMEOUT: no BROOK_E2E marker within 120s"
+              echo "TIMEOUT: no BROOK_E2E beacon within 120s"
               echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
               exit 1
             fi
@@ -196,6 +202,7 @@ jobs:
             examples/rn-e2e/android/app/build/outputs/
             examples/rn-e2e/android/app/build/reports/
             /tmp/logcat-full.txt
+            /tmp/beacon.log
           if-no-files-found: warn
 
   ios-app:
@@ -293,13 +300,20 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build 2>&1 | tail -60
 
-      - name: Boot simulator, install, launch, poll (marker best-effort)
+      - name: Boot simulator, install, launch, poll beacon
         working-directory: examples/rn-e2e/ios
         run: |
           set -x
           BUNDLE_ID=org.reactjs.native.example.BrookE2e
           APP="build/Build/Products/Release-iphonesimulator/BrookE2e.app"
           test -d "$APP" || { echo "app bundle not found at $APP"; exit 1; }
+
+          # Deterministic result channel: a host-side HTTP beacon listener. The iOS
+          # simulator shares the host network, so the app POSTs to 127.0.0.1:8973.
+          # This is the PRIMARY gate (os_log capture proved unreliable and is kept
+          # only as failure diagnostics); no beacon within the timeout => FAIL.
+          python3 -m http.server 8973 --bind 0.0.0.0 > /tmp/beacon.log 2>&1 &
+          BEACON_PID=$!
 
           # Pick the first AVAILABLE iPhone simulator the image ships (Xcode 16 →
           # iPhone 16 family / iOS 18; don't hardcode a device name that may not
@@ -314,44 +328,29 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b || true
 
           xcrun simctl install "$UDID" "$APP"
-
-          # Start os_log capture BEFORE launch (RCTLog routes JS console.log here).
+          # os_log capture kept only as failure diagnostics (the beacon is the gate).
           xcrun simctl spawn "$UDID" log stream --level debug --style compact > /tmp/simlog.txt 2>&1 &
           LOGPID=$!
-          sleep 2
-          # Launch with a console pty too (some log paths surface on stdout).
-          xcrun simctl launch --console-pty "$UDID" "$BUNDLE_ID" > /tmp/applaunch.txt 2>&1 &
-          LAUNCHPID=$!
+          xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
 
           result=""
           deadline=$((SECONDS+150))
           while [ $SECONDS -lt $deadline ]; do
-            if grep -qs "BROOK_E2E_OK" /tmp/simlog.txt /tmp/applaunch.txt; then result=OK; break; fi
-            if grep -qs "BROOK_E2E_FAIL" /tmp/simlog.txt /tmp/applaunch.txt; then result=FAIL; break; fi
-            sleep 3
+            if grep -q "BROOK_E2E_OK" /tmp/beacon.log 2>/dev/null; then result=OK; break; fi
+            if grep -q "BROOK_E2E_FAIL" /tmp/beacon.log 2>/dev/null; then result=FAIL; break; fi
+            sleep 2
           done
-          kill $LOGPID $LAUNCHPID 2>/dev/null || true
+          kill $BEACON_PID $LOGPID 2>/dev/null || true
 
-          echo "=== captured BROOK_E2E lines ==="
-          grep -hs "BROOK_E2E" /tmp/simlog.txt /tmp/applaunch.txt || true
-
-          # Crash check: any diagnostic report naming the app => hard fail.
-          CRASH=$(ls "$HOME/Library/Logs/DiagnosticReports/" 2>/dev/null | grep -i "BrookE2e" || true)
+          echo "=== beacon.log ==="; cat /tmp/beacon.log || true
+          echo "=== BROOK_E2E in os_log (diagnostics) ==="; grep -hs "BROOK_E2E" /tmp/simlog.txt || true
 
           if [ "$result" = OK ]; then
-            echo "PASS: native parser produced byte-identical wire and the renderer mounted (marker observed)."
+            echo "PASS: native parser produced byte-identical wire and the renderer mounted."
           elif [ "$result" = FAIL ]; then
-            echo "FAIL: app reported BROOK_E2E_FAIL"; grep -hs "BROOK_E2E_FAIL" /tmp/simlog.txt /tmp/applaunch.txt; exit 1
-          elif [ -n "$CRASH" ]; then
-            echo "FAIL: app crashed on the simulator: $CRASH"
-            cat "$HOME/Library/Logs/DiagnosticReports/"*BrookE2e* 2>/dev/null | tail -80 || true
-            exit 1
+            echo "FAIL: app beaconed BROOK_E2E_FAIL"; grep "BROOK_E2E_FAIL" /tmp/beacon.log || true; exit 1
           else
-            # Documented downgrade: build + link + launch + no-crash succeeded, but
-            # the JS marker wasn't captured from os_log within the window. Treat as a
-            # pass-with-warning rather than a flaky red gate (see job header).
-            echo "::warning title=iOS e2e marker not captured::App built, linked the native module, launched, and did not crash, but BROOK_E2E_OK was not observed in the simulator log within 150s. Native-parser correctness is still asserted by the android-app job and the device-validate.yml XCTest wire goldens."
-            echo "PASS (downgraded: build+launch+no-crash)."
+            echo "TIMEOUT: no BROOK_E2E beacon within 150s"; tail -100 /tmp/simlog.txt || true; exit 1
           fi
 
       - name: Upload xcresult + sim logs
@@ -362,5 +361,5 @@ jobs:
           path: |
             examples/rn-e2e/ios/build/Logs/
             /tmp/simlog.txt
-            /tmp/applaunch.txt
+            /tmp/beacon.log
           if-no-files-found: warn
