@@ -1,4 +1,6 @@
-//! Wire-format golden stability tests — **wire contract v1.1.0** (see `../WIRE.md`).
+//! Wire-format golden stability tests — the DEFAULT wire shape of **contract
+//! v1.2.0** (delta mode off), byte-identical to v1.1.0 (see `../WIRE.md`; the
+//! opt-in delta shape is pinned in `wire_delta.rs`).
 //!
 //! Each string below is the EXACT JSON the `WirePatch` envelope serializes to for
 //! the fixed document + chunking in [`CHUNKS`], captured from live parser output

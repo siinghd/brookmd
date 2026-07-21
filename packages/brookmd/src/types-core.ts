@@ -192,9 +192,30 @@ export interface Block {
   speculative: boolean;
 }
 
+/**
+ * Wire delta mode (WIRE.md §11): the splice an active block carries in place
+ * of `html` when it was already emitted in the previous patch. Reconstruct
+ * with `prev.slice(0, keep_units) + append` (JS strings are UTF-16, so
+ * `keep_units` is the right offset here; `keep_bytes` is the same prefix for
+ * byte-oriented consumers).
+ */
+export interface WireHtmlDelta {
+  keep_bytes: number;
+  keep_units: number;
+  append: string;
+}
+
+/**
+ * An `active` array entry as serialized: a full {@link Block}, or (wire delta
+ * mode only) every Block field except `html` plus an `html_delta` splice.
+ * {@link applyPatch} reconstructs deltas into full Blocks — nothing past the
+ * store ever sees this union.
+ */
+export type WireActiveBlock = Block | (Omit<Block, "html"> & { html_delta: WireHtmlDelta });
+
 export interface Patch {
   newly_committed: Block[];
-  active: Block[];
+  active: WireActiveBlock[];
 }
 
 /**

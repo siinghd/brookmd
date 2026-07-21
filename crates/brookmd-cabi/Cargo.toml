@@ -1,6 +1,6 @@
 [package]
 name = "brookmd-cabi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Plain C-ABI wrapper over brookmd-core, for Flutter/Dart (dart:ffi) and any C consumer"
 license = "MIT"

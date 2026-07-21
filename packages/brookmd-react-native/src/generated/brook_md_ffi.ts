@@ -142,7 +142,15 @@ export type BrookConfig = {
     /**
      * Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
      */
-    blockData: boolean
+    blockData: boolean,
+    /**
+     * Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+     * appends serialize as verified `html_delta` splices against their
+     * previous emit instead of full `html`. A consumer that enables this MUST
+     * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
+     * layer does). Off by default — wire bytes identical to contract v1.1.0.
+     */
+    wireDelta: boolean
 }
 
 /**
@@ -162,7 +170,8 @@ export const BrookConfig = (() => {
         inlineComponentTags: undefined,
         htmlAllowlist: undefined,
         dropHtmlTags: undefined,
-        blockData: false
+        blockData: false,
+        wireDelta: false
     });
     const create = (() => {
         return uniffiCreateRecord<BrookConfig, ReturnType<typeof defaults>>(defaults);
@@ -191,7 +200,8 @@ const FfiConverterTypeBrookConfig = (() => {
                 inlineComponentTags: FfiConverterOptionalSequenceString.read(from), 
                 htmlAllowlist: FfiConverterOptionalSequenceString.read(from), 
                 dropHtmlTags: FfiConverterOptionalSequenceString.read(from), 
-                blockData: FfiConverterBool.read(from)
+                blockData: FfiConverterBool.read(from), 
+                wireDelta: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -208,6 +218,7 @@ const FfiConverterTypeBrookConfig = (() => {
             FfiConverterOptionalSequenceString.write(value.htmlAllowlist, into);
             FfiConverterOptionalSequenceString.write(value.dropHtmlTags, into);
             FfiConverterBool.write(value.blockData, into);
+            FfiConverterBool.write(value.wireDelta, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.gfmAutolinks) +
@@ -222,7 +233,8 @@ const FfiConverterTypeBrookConfig = (() => {
              FfiConverterOptionalSequenceString.allocationSize(value.inlineComponentTags) +
              FfiConverterOptionalSequenceString.allocationSize(value.htmlAllowlist) +
              FfiConverterOptionalSequenceString.allocationSize(value.dropHtmlTags) +
-             FfiConverterBool.allocationSize(value.blockData);
+             FfiConverterBool.allocationSize(value.blockData) +
+             FfiConverterBool.allocationSize(value.wireDelta);
             
         }
     };
@@ -550,28 +562,28 @@ function uniffiEnsureInitialized() {
     if (bindingsContractVersion !== scaffoldingContractVersion) {
         throw new UniffiInternalError.ContractVersionMismatch(scaffoldingContractVersion, bindingsContractVersion);
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_constructor_brooksession_new() !== 5260) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_constructor_brooksession_new() !== 2220) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_constructor_brooksession_new");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_constructor_brooksession_new_with_config() !== 9386) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_constructor_brooksession_new_with_config() !== 3151) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_constructor_brooksession_new_with_config");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_all_blocks() !== 61667) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_all_blocks() !== 46557) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_all_blocks");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_append() !== 678) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_append() !== 15626) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_append");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_buffer_len() !== 39786) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_buffer_len() !== 7914) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_buffer_len");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_finalize() !== 837) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_finalize() !== 60540) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_finalize");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_reset() !== 43300) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_reset() !== 39920) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_reset");
     }
-    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_retained_bytes() !== 44189) {
+    if (nativeModule().ubrn_uniffi_brook_md_ffi_checksum_method_brooksession_retained_bytes() !== 8193) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_brook_md_ffi_checksum_method_brooksession_retained_bytes");
     }
 

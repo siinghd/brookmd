@@ -133,6 +133,38 @@ class WireGoldenTest {
         assertEquals(onAppend0, after[0], "post-reset config still emits blockData wire")
     }
 
+    // -- Wire delta mode ON (WIRE.md S11, contract v1.2.0) -------------------
+    // Goldens copied verbatim from crates/brookmd-core/tests/wire_delta.rs.
+
+    private val deltaChunk0 = "A steady opening sentence that easily clears the minimum kept prefix"
+    private val deltaChunk1 = " and then keeps growing"
+
+    private val deltaAppend0 =
+        """{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":68,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix</p>","open":true,"speculative":true}]}"""
+    private val deltaAppend1 =
+        """{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html_delta":{"keep_bytes":71,"keep_units":71,"append":" and then keeps growing</p>"},"open":true,"speculative":true}]}"""
+    private val deltaFinalize =
+        """{"newly_committed":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix and then keeps growing</p>","open":false,"speculative":false}],"active":[]}"""
+
+    @Test
+    fun goldenWireDeltaMode() {
+        val session = BrookSession.newWithConfig(libDefaultConfig(false).copy(wireDelta = true))
+        val a0 = session.append(deltaChunk0)
+        val a1 = session.append(deltaChunk1)
+        val f = session.finalize()
+        assertEquals(deltaAppend0, a0, "delta append[0] wire drifted (contract v1.2.0)")
+        assertEquals(deltaAppend1, a1, "delta append[1] wire drifted (contract v1.2.0)")
+        assertEquals(deltaFinalize, f, "delta finalize wire drifted (contract v1.2.0)")
+    }
+
+    @Test
+    fun wireDeltaDefaultOff() {
+        // The record default keeps the v1 wire: no html_delta anywhere.
+        for (w in stream(BrookSession())) {
+            assertTrue("html_delta" !in w, "delta leaked into default wire: " + w)
+        }
+    }
+
     @Test
     fun metricsTrackInput() {
         val session = BrookSession()

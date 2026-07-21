@@ -63,6 +63,9 @@ struct Opts {
     /// future `@` legitimately binds an alnum run right-to-left, so with
     /// autolinks on the commit cut is semantically pinned).
     no_autolinks: bool,
+    /// Wire delta mode (`WIRE.md` §11): active re-emits count only their
+    /// `append` tails toward `emitted`. See `wire_delta_emitted_is_linear`.
+    wire_delta: bool,
 }
 
 struct Shape {
@@ -95,7 +98,8 @@ fn measure(md: &str, chunk: usize, o: Opts) -> Work {
         .with_gfm_math(true)
         .with_gfm_footnotes(o.footnotes)
         .with_block_data(o.block_data)
-        .with_unsafe_html(o.unsafe_html);
+        .with_unsafe_html(o.unsafe_html)
+        .with_wire_delta(o.wire_delta);
     if !o.component_tags.is_empty() {
         p = p.with_component_tags(o.component_tags.iter().map(|s| s.to_string()).collect());
     }
@@ -1260,6 +1264,43 @@ fn streaming_complexity_gate() {
 /// run of link-reference definitions used to stall `committed_offset`, so the
 /// whole growing def run re-scanned every append (235 KB @ chunk 256 = 59 s).
 /// The fix made it linear; this guards it deterministically.
+/// Wire delta mode retires the emitted-bytes re-emit floor: for shapes whose
+/// active-block html grows prefix-stably (fences, lists, tables, quotes —
+/// the realistic long-block streams), `emitted` must now scale LINEARLY.
+/// This is the gate for `WIRE.md` §11's whole reason to exist; before delta
+/// mode these shapes' emitted ratio tracked span² (the documented floor).
+/// Shapes whose rendered html legitimately rewrites its prefix mid-stream
+/// (late delimiter resolution) are excluded — for them full re-emits are the
+/// verified-correct behavior, not a regression.
+#[test]
+fn wire_delta_emitted_is_linear() {
+    let shapes: [(&str, fn(usize) -> String); 7] = [
+        ("unclosed_fence", unclosed_fence),
+        ("big_code", big_code),
+        ("big_list", big_list),
+        ("big_table", big_table),
+        ("big_blockquote", big_blockquote),
+        ("many_paragraphs", many_paragraphs),
+        ("mixed", mixed),
+    ];
+    let opts = Opts { wire_delta: true, ..Opts::default() };
+    let mut failures = Vec::new();
+    for (name, gen) in shapes {
+        let w_small = measure(&gen(SMALL), CHUNK, opts);
+        let w_large = measure(&gen(LARGE), CHUNK, opts);
+        let span = (LARGE / SMALL) as f64;
+        let ratio = w_large.emitted as f64 / w_small.emitted as f64;
+        println!("wire-delta emitted  {name:20} ratio {ratio:>7.1} (span x{span})");
+        if ratio > linear_limit(span) {
+            failures.push(format!(
+                "{name}: emitted {ratio:.1}x for {span}x input (limit {:.0}x)",
+                linear_limit(span)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "wire-delta emitted regression(s):\n  {}", failures.join("\n  "));
+}
+
 #[test]
 fn ref_def_run_is_linear() {
     let small = measure(&ref_heavy(250), CHUNK, Opts::default());

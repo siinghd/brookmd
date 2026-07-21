@@ -281,3 +281,48 @@ test.skipIf(!haveWasm)("real WASM: a block component tag used inline does not ea
   expect(blocks.some((b) => b.kind.type === "Table")).toBe(true);
   expect(blocks.some((b) => b.kind.type === "Component")).toBe(false);
 });
+
+test.skipIf(!haveWasm)("real WASM: setWireDelta emits html_delta splices that reconstruct byte-identically", () => {
+  // Two parsers, same stream: one delta-on (reconstructed via keep_units, the
+  // JS offset), one delta-off (ground truth). Every patch must reconstruct to
+  // the same active html — the end-to-end tripwire for WIRE.md §11 over the
+  // REAL compiled boundary.
+  const on = new BrookParser();
+  on.setWireDelta(true);
+  const off = new BrookParser();
+  const chunks = [
+    "A steady opening sentence that easily clears the minimum kept prefix",
+    " and then keeps growing",
+    " with one more tail",
+  ];
+  const prev = new Map<number, string>();
+  let sawDelta = false;
+  for (const c of chunks) {
+    const pOn = JSON.parse(on.append(c));
+    const pOff = JSON.parse(off.append(c));
+    const next = new Map<number, string>();
+    for (let i = 0; i < pOn.active.length; i++) {
+      const e = pOn.active[i];
+      let html: string;
+      if ("html_delta" in e) {
+        sawDelta = true;
+        const base = prev.get(e.id);
+        expect(base).toBeDefined();
+        html = base!.slice(0, e.html_delta.keep_units) + e.html_delta.append;
+      } else {
+        html = e.html;
+      }
+      expect(html).toBe(pOff.active[i].html);
+      next.set(e.id, html);
+    }
+    prev.clear();
+    for (const [k, v] of next) prev.set(k, v);
+  }
+  expect(sawDelta).toBe(true);
+  // Finalize commits with FULL html — identical on both parsers.
+  const fOn = JSON.parse(on.finalize());
+  const fOff = JSON.parse(off.finalize());
+  expect(fOn).toEqual(fOff);
+  on.free();
+  off.free();
+});

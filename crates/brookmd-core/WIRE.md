@@ -1,6 +1,6 @@
 # brookmd-core wire contract
 
-**Wire contract version: 1.1.0**
+**Wire contract version: 1.2.0**
 
 This document specifies the JSON wire format produced by `brookmd-core` and
 consumed by any renderer. It is the stable, versioned boundary between the
@@ -9,7 +9,7 @@ layer in any language. The current JavaScript renderer is one consumer; native
 consumers (for example a React Native, Swift, or Kotlin binding) can implement
 against this document alone.
 
-Covered releases: **npm `brookmd` 0.22.0** and **crate `brookmd-core` 0.22.0**.
+Covered releases: **npm `brookmd` 0.23.0** and **crate `brookmd-core` 0.23.0**.
 
 The contract version tracks the *wire shape*, not the library version. It changes
 independently: a library release that leaves every shape below byte-identical
@@ -86,6 +86,11 @@ final size. This floor is documented at `src/lib.rs:41-45`. Committed blocks do
 not participate in it (they are emitted exactly once). A consumer that needs to
 bound work should key its render on block `id` + `html` identity so unchanged
 committed blocks are never re-rendered.
+
+**The floor is retired by the opt-in wire delta mode (§11):** with
+`setWireDelta(true)`, a re-emitted active block serializes as a verified splice
+against its previous emit, and total emitted bytes become `O(n)`. The default
+(delta off) keeps the exact v1 behavior and bytes described above.
 
 ---
 
@@ -385,6 +390,11 @@ out in release notes.
 
 **Version history:**
 
+- **1.2.0** — opt-in **wire delta mode** (§11): with `setWireDelta(true)`,
+  active blocks re-emitted across appends may carry `html_delta` (a verified
+  splice against their previous emit) instead of full `html`, retiring the §2
+  re-emit floor. Additive: with the mode off (default) the wire is
+  byte-identical to 1.1.0, and consumers that never enable it are unaffected.
 - **1.1.0** — rendered-HTML pending-link marker renamed `data-flux-pending` →
   `data-brook-pending` with the project rename; envelope structure unchanged.
 - **1.0.0** — initial published wire contract.
@@ -416,6 +426,95 @@ A renderer implemented against this contract should:
       unique only within one instance).
 - [ ] Render `html` as-is when raw HTML is disabled (default); it is already
       sanitized. Do not re-sanitize destructively.
+- [ ] **Only if enabling wire delta mode** (§11): reconstruct active `html`
+      from `html_delta` splices against the previous patch's active region, in
+      patch order, before doing anything else with the block.
+
+---
+
+## 11. Wire delta mode (opt-in)
+
+`setWireDelta(true)` (`StreamParser::set_wire_delta` on the native API) retires
+the §2 re-emit floor: an `active` block that was present (same `id`) in the
+**immediately preceding patch's `active` array** may serialize as a **splice**
+against that previous emit instead of carrying its full `html`. Everything else
+is unchanged — `newly_committed` blocks always carry full `html`, `allBlocks()`
+always returns full `html`, and with the mode off (the default) the wire is
+byte-identical to contract v1.1.0.
+
+### 11.1 The delta entry
+
+A delta entry has every `Block` field of §3 **except `html`**, with an
+`html_delta` object in `html`'s position (field order preserved):
+
+```json
+{
+  "id": 0,
+  "kind": { "type": "Paragraph" },
+  "start": 0,
+  "end": 91,
+  "html_delta": { "keep_bytes": 71, "keep_units": 71, "append": " and then keeps growing</p>" },
+  "open": true,
+  "speculative": true
+}
+```
+
+Exactly one of `html` / `html_delta` is present on any active entry. A consumer
+reconstructs:
+
+```
+html = previous_html[0 .. keep] + append
+```
+
+where `previous_html` is the block's html as of the previous patch (whether that
+arrived full or was itself reconstructed from a delta), and `keep` is expressed
+twice so every language slices in its native unit:
+
+- **`keep_bytes`** — prefix length in **UTF-8 bytes** (Rust/C/byte-oriented
+  consumers).
+- **`keep_units`** — the same prefix in **UTF-16 code units** (JavaScript,
+  Kotlin/JVM, and other UTF-16-string consumers: `previous.slice(0, keep_units)
+  + append`).
+
+Both always describe the identical prefix and both always fall on character
+boundaries; `append` is a complete replacement for everything after the kept
+prefix (there is no suffix-reuse form).
+
+### 11.2 Emission rule (deterministic)
+
+The parser emits a delta for an active entry **iff** all of:
+
+1. delta mode is enabled;
+2. a block with the same `id` was in the previous patch's `active` array;
+3. the byte-verified common prefix of the previous and current `html` (backed
+   off to a character boundary) is **at least 64 bytes**.
+
+Otherwise the entry carries full `html`. The kept prefix is established by
+**byte comparison against the previously emitted html**, never by structural
+inference — a delta can therefore never reconstruct bytes that differ from the
+parser's own state. An unchanged re-emit serializes as a delta with
+`append: ""`.
+
+### 11.3 Consumer obligations
+
+- Maintain the active region's reconstructed `html` per block id between
+  patches (the §2 rule — replace the active region wholesale — still applies;
+  "wholesale" now means "after reconstruction").
+- Treat a delta whose base id is missing as a hard protocol error (it cannot
+  occur under rule 2 unless patches were dropped or applied out of order).
+- A consumer that never calls `setWireDelta(true)` needs none of this and
+  continues to read contract-v1 bytes.
+
+### 11.4 Complexity
+
+With delta mode on, total emitted bytes for a block that grows to size *n*
+across any number of appends are `O(n)`: the growth arrives once through
+`append` tails, plus one full `html` when the block commits. The
+`wire_delta_emitted_is_linear` gate in `tests/scaling.rs` pins this for the
+long-block shapes (open fence, list, table, blockquote, paragraph runs). For
+content whose already-emitted prefix legitimately rewrites mid-stream (late
+delimiter resolution rewriting early bytes), rule 3 degrades that patch to a
+full re-emit — correctness always wins over compression.
 
 ---
 

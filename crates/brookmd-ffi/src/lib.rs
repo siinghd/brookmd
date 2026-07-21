@@ -4,7 +4,7 @@
 //!
 //! It exposes the streaming markdown parser as a [`BrookSession`] object whose
 //! `append`/`finalize`/`all_blocks` methods return the **JSON wire strings**
-//! specified in `../../brookmd-core/WIRE.md` (wire contract v1.1.0). Those strings
+//! specified in `../../brookmd-core/WIRE.md` (wire contract v1.2.0). Those strings
 //! are produced through the pure [`brook_md_core::wire`] helpers, so they are
 //! byte-identical to the WASM/JS boundary by construction — a React Native
 //! renderer decodes exactly the same bytes the JavaScript renderer does.
@@ -80,6 +80,13 @@ pub struct BrookConfig {
     /// Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
     #[uniffi(default = false)]
     pub block_data: bool,
+    /// Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+    /// appends serialize as verified `html_delta` splices against their
+    /// previous emit instead of full `html`. A consumer that enables this MUST
+    /// reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
+    /// layer does). Off by default — wire bytes identical to contract v1.1.0.
+    #[uniffi(default = false)]
+    pub wire_delta: bool,
 }
 
 /// Build a [`StreamParser`] from a [`BrookConfig`], applying the same
@@ -107,6 +114,7 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
         config.drop_html_tags.clone().unwrap_or_default(),
     );
     p.set_block_data(config.block_data);
+    p.set_wire_delta(config.wire_delta);
     p
 }
 

@@ -47,6 +47,12 @@ function toBrookConfig(c: ParserConfig | undefined): BrookConfig {
     if (c.dropHtmlTags !== undefined) partial.dropHtmlTags = c.dropHtmlTags;
     if (c.blockData !== undefined) partial.blockData = c.blockData;
   }
+  // Wire delta mode (WIRE.md §11) is always on for OUR session↔client pair,
+  // mirroring the browser worker: active re-emits cross the JSI boundary as
+  // splices instead of full html (O(n) total for a growing block), and the
+  // shared `applyPatch` in brookmd's client reconstructs before anything else
+  // sees the block. Raw `BrookSession` consumers are unaffected (default off).
+  partial.wireDelta = true;
   return BrookConfig.create(partial);
 }
 

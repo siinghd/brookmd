@@ -1,6 +1,6 @@
 [package]
 name = "brookmd-ffi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "uniffi FFI wrapper over brookmd-core, for uniffi-bindgen-react-native (ubrn)"
 license = "MIT"

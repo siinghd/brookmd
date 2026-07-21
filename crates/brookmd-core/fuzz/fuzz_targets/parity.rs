@@ -58,6 +58,49 @@ fn streamed_final(md: &str, chunk: usize) -> String {
     collect(&p)
 }
 
+/// Wire delta mode (`WIRE.md` §11) reconstruction parity: stream with
+/// `wire_delta` on, apply each patch's `html_delta` splices the way a
+/// conforming consumer does (over the previous emit of the same block id),
+/// and assert the reconstruction matches the parser's own html on EVERY
+/// patch. Any divergence, out-of-bounds keep, or non-char-boundary splice
+/// asserts/panics — exactly the corruption class this mode must never have.
+fn delta_reconstruction(md: &str, chunk: usize) {
+    let chars: Vec<char> = md.chars().collect();
+    let mut p = make().with_wire_delta(true);
+    let mut prev: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+    let mut buf = String::new();
+    let mut i = 0usize;
+    let mut step = |p: &mut StreamParser, buf: &str, finalize: bool| {
+        let patch = if finalize { p.finalize() } else { p.append(buf) };
+        let mut next: std::collections::HashMap<u64, String> = std::collections::HashMap::new();
+        assert!(patch.active_deltas.len() == patch.active.len());
+        for (b, d) in patch.active.iter().zip(patch.active_deltas.iter()) {
+            let rebuilt = match d {
+                None => b.html.clone(),
+                Some(d) => {
+                    let base = prev.get(&b.id).expect("delta base was emitted");
+                    assert!(base.is_char_boundary(d.keep_bytes));
+                    format!("{}{}", &base[..d.keep_bytes], &b.html[d.keep_bytes..])
+                }
+            };
+            assert!(rebuilt == b.html, "delta reconstruction diverged (chunk={chunk})");
+            next.insert(b.id, rebuilt);
+        }
+        prev = next;
+    };
+    while i < chars.len() {
+        buf.clear();
+        for _ in 0..chunk.max(1) {
+            if i < chars.len() {
+                buf.push(chars[i]);
+                i += 1;
+            }
+        }
+        step(&mut p, &buf, false);
+    }
+    step(&mut p, "", true);
+}
+
 /// True if the input could contain a link- or footnote-reference DEFINITION,
 /// including a MULTI-LINE one (`[label` on one line, `]: dest` after later
 /// lines). Reference resolution is document-global, so a definition can resolve
@@ -81,6 +124,12 @@ fuzz_target!(|data: &[u8]| {
 
     // No-panic invariant: holds for ALL inputs, including definitions.
     let oneshot = one_shot_final(&md);
+
+    // Wire-delta reconstruction parity holds for ALL inputs too (it is a
+    // per-patch property, chunk-dependence of the CONTENT is irrelevant).
+    delta_reconstruction(&md, 1);
+    delta_reconstruction(&md, 64);
+
     if has_ref_def(&md) {
         let _ = streamed_final(&md, 1);
         let _ = streamed_final(&md, 64);

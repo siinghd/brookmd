@@ -1,5 +1,5 @@
 //! C-ABI wire-contract goldens — proves the `extern "C"` surface emits
-//! **byte-identical** wire (WIRE.md v1.1.0) to `brookmd-core`'s WASM/JS boundary
+//! **byte-identical** wire (WIRE.md v1.2.0; default shape byte-identical to v1.1.0) to `brookmd-core`'s WASM/JS boundary
 //! and to `brookmd-ffi`'s uniffi layer.
 //!
 //! The document, chunking, and golden strings are copied verbatim from
@@ -101,6 +101,44 @@ fn golden_wire_default_via_config() {
     assert_eq!(got[1], OFF_APPEND_1, "append[1] wire drifted via config (contract v1.1.0)");
     assert_eq!(got[2], OFF_APPEND_2, "append[2] wire drifted via config (contract v1.1.0)");
     assert_eq!(got[3], OFF_FINALIZE, "finalize wire drifted via config (contract v1.1.0)");
+    brook_session_free(s);
+}
+
+// ── Wire delta mode ON (WIRE.md §11, contract v1.2.0) ───────────────────────
+// Goldens copied verbatim from `crates/brookmd-core/tests/wire_delta.rs`
+// (`delta_goldens`): the same bytes MUST come out of the C-ABI JSON-config path.
+
+const DELTA_CHUNK_0: &str = "A steady opening sentence that easily clears the minimum kept prefix";
+const DELTA_CHUNK_1: &str = " and then keeps growing";
+
+const DELTA_APPEND_0: &str = r#"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":68,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix</p>","open":true,"speculative":true}]}"#;
+const DELTA_APPEND_1: &str = r#"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html_delta":{"keep_bytes":71,"keep_units":71,"append":" and then keeps growing</p>"},"open":true,"speculative":true}]}"#;
+const DELTA_FINALIZE: &str = r#"{"newly_committed":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix and then keeps growing</p>","open":false,"speculative":false}],"active":[]}"#;
+
+#[test]
+fn golden_wire_delta_mode() {
+    let cfg = CString::new(
+        r#"{"gfm_autolinks":false,"gfm_alerts":false,"wire_delta":true}"#,
+    )
+    .expect("no interior NUL");
+    let s = brook_session_new_with_config(cfg.as_ptr());
+    assert!(!s.is_null(), "valid config JSON must construct a session");
+    let a0 = append(s, DELTA_CHUNK_0);
+    let a1 = append(s, DELTA_CHUNK_1);
+    let f = take_string(brook_session_finalize(s));
+    assert_eq!(a0, DELTA_APPEND_0, "delta append[0] wire drifted (contract v1.2.0)");
+    assert_eq!(a1, DELTA_APPEND_1, "delta append[1] wire drifted (contract v1.2.0)");
+    assert_eq!(f, DELTA_FINALIZE, "delta finalize wire drifted (contract v1.2.0)");
+    brook_session_free(s);
+}
+
+#[test]
+fn wire_delta_default_off() {
+    // The config default keeps the v1 wire: no html_delta anywhere.
+    let s = brook_session_new();
+    for w in stream(s) {
+        assert!(!w.contains("html_delta"), "delta leaked into default cabi wire: {w}");
+    }
     brook_session_free(s);
 }
 
@@ -270,10 +308,10 @@ fn no_interior_nul_in_output() {
 /// The wire-version accessor returns the static contract string and must not be
 /// freed (we only read it).
 #[test]
-fn wire_version_is_1_1_0() {
+fn wire_version_is_1_2_0() {
     let ptr = brook_wire_version();
     assert!(!ptr.is_null());
     // SAFETY: static NUL-terminated string; never freed.
     let v = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
-    assert_eq!(v, "1.1.0", "wire contract version must match WIRE.md");
+    assert_eq!(v, "1.2.0", "wire contract version must match WIRE.md");
 }

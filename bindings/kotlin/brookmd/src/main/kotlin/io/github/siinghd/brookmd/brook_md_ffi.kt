@@ -1615,6 +1615,15 @@ data class BrookConfig (
      * Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
      */
     var `blockData`: kotlin.Boolean = false 
+    , 
+    /**
+     * Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+     * appends serialize as verified `html_delta` splices against their
+     * previous emit instead of full `html`. A consumer that enables this MUST
+     * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
+     * layer does). Off by default — wire bytes identical to contract v1.1.0.
+     */
+    var `wireDelta`: kotlin.Boolean = false 
     
 ){
     
@@ -1644,6 +1653,7 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.read(buf),
             FfiConverterOptionalSequenceString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1660,7 +1670,8 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.allocationSize(value.`inlineComponentTags`) +
             FfiConverterOptionalSequenceString.allocationSize(value.`htmlAllowlist`) +
             FfiConverterOptionalSequenceString.allocationSize(value.`dropHtmlTags`) +
-            FfiConverterBoolean.allocationSize(value.`blockData`)
+            FfiConverterBoolean.allocationSize(value.`blockData`) +
+            FfiConverterBoolean.allocationSize(value.`wireDelta`)
     )
 
     override fun write(value: BrookConfig, buf: ByteBuffer) {
@@ -1677,6 +1688,7 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.write(value.`htmlAllowlist`, buf)
             FfiConverterOptionalSequenceString.write(value.`dropHtmlTags`, buf)
             FfiConverterBoolean.write(value.`blockData`, buf)
+            FfiConverterBoolean.write(value.`wireDelta`, buf)
     }
 }
 

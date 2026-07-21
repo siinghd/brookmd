@@ -53,3 +53,53 @@ test("a no-op patch (no commits, same active refs) yields equal block references
   applyPatch(store, { newly_committed: [], active: [a] }); // identical active reference
   expect(store.snapshot[0]).toBe(first); // unchanged active object → memo skips
 });
+
+// ── Wire delta mode (WIRE.md §11) reconstruction ────────────────────────────
+// The worker always enables setWireDelta, so applyPatch is the one place a
+// delta entry becomes a full Block. JS strings are UTF-16 → keep_units.
+
+function deltaEntry(id: number, keep_units: number, append: string, keep_bytes = keep_units) {
+  return {
+    id,
+    kind: { type: "Paragraph" as const },
+    start: 0,
+    end: 0,
+    html_delta: { keep_bytes, keep_units, append },
+    open: true,
+    speculative: true,
+  };
+}
+
+test("html_delta splices against the previous active emit", () => {
+  const store = emptyBlockStore();
+  applyPatch(store, { newly_committed: [], active: [blk(1, "<p>Hello wor</p>", true)] });
+  applyPatch(store, { newly_committed: [], active: [deltaEntry(1, 12, "ld again</p>")] });
+  expect(store.active[0].html).toBe("<p>Hello world again</p>");
+  // A reconstructed block is a full Block — no html_delta remnant.
+  expect("html_delta" in store.active[0]).toBe(false);
+  // And it becomes the base for the NEXT delta.
+  applyPatch(store, { newly_committed: [], active: [deltaEntry(1, 20, " more</p>")] });
+  expect(store.active[0].html).toBe("<p>Hello world again more</p>");
+});
+
+test("html_delta with keep_units past a surrogate pair splices by UTF-16 units", () => {
+  const store = emptyBlockStore();
+  // "🎉" is 2 UTF-16 units (4 UTF-8 bytes): keep "<p>🎉" = 3 + 2 = 5 units.
+  applyPatch(store, { newly_committed: [], active: [blk(1, "<p>🎉 old</p>", true)] });
+  applyPatch(store, { newly_committed: [], active: [deltaEntry(1, 5, " new</p>", 7)] });
+  expect(store.active[0].html).toBe("<p>🎉 new</p>");
+});
+
+test("empty-append delta re-emits an unchanged block", () => {
+  const store = emptyBlockStore();
+  applyPatch(store, { newly_committed: [], active: [blk(1, "<p>stable</p>", true)] });
+  applyPatch(store, { newly_committed: [], active: [deltaEntry(1, 13, "")] });
+  expect(store.active[0].html).toBe("<p>stable</p>");
+});
+
+test("html_delta without a base throws (protocol corruption must fail loudly)", () => {
+  const store = emptyBlockStore();
+  expect(() =>
+    applyPatch(store, { newly_committed: [], active: [deltaEntry(9, 4, "x")] }),
+  ).toThrow(/without a base/);
+});

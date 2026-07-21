@@ -1,5 +1,5 @@
 //! FFI-layer wire-contract goldens — proves [`BrookSession`] emits **byte-identical**
-//! wire (WIRE.md v1.1.0) to `brookmd-core`'s WASM/JS boundary.
+//! wire (WIRE.md v1.2.0; default shape byte-identical to v1.1.0) to `brookmd-core`'s WASM/JS boundary.
 //!
 //! The document, chunking, and golden strings below are copied verbatim from
 //! `crates/brookmd-core/tests/wire_envelope_golden.rs` (crate 0.20.3). Provenance
@@ -53,6 +53,7 @@ fn lib_default_config(block_data: bool) -> BrookConfig {
         html_allowlist: None,
         drop_html_tags: None,
         block_data,
+        wire_delta: false,
     }
 }
 
@@ -91,6 +92,40 @@ fn golden_wire_block_data() {
     assert_eq!(got[1], ON_APPEND_1, "append[1] blockData wire drifted (contract v1.1.0)");
     assert_eq!(got[2], ON_APPEND_2, "append[2] blockData wire drifted (contract v1.1.0)");
     assert_eq!(got[3], ON_FINALIZE, "finalize blockData wire drifted (contract v1.1.0)");
+}
+
+// ── Wire delta mode ON (WIRE.md §11, contract v1.2.0) ───────────────────────
+// Goldens copied verbatim from `crates/brookmd-core/tests/wire_delta.rs`
+// (`delta_goldens`): the same two-chunk stream MUST produce the same delta
+// bytes through the FFI config path as through the core wire module.
+
+const DELTA_CHUNK_0: &str = "A steady opening sentence that easily clears the minimum kept prefix";
+const DELTA_CHUNK_1: &str = " and then keeps growing";
+
+const DELTA_APPEND_0: &str = r#"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":68,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix</p>","open":true,"speculative":true}]}"#;
+const DELTA_APPEND_1: &str = r#"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html_delta":{"keep_bytes":71,"keep_units":71,"append":" and then keeps growing</p>"},"open":true,"speculative":true}]}"#;
+const DELTA_FINALIZE: &str = r#"{"newly_committed":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix and then keeps growing</p>","open":false,"speculative":false}],"active":[]}"#;
+
+#[test]
+fn golden_wire_delta_mode() {
+    let mut config = lib_default_config(false);
+    config.wire_delta = true;
+    let session = BrookSession::new_with_config(config);
+    let a0 = session.append(DELTA_CHUNK_0.to_string());
+    let a1 = session.append(DELTA_CHUNK_1.to_string());
+    let f = session.finalize();
+    assert_eq!(a0, DELTA_APPEND_0, "delta append[0] wire drifted (contract v1.2.0)");
+    assert_eq!(a1, DELTA_APPEND_1, "delta append[1] wire drifted (contract v1.2.0)");
+    assert_eq!(f, DELTA_FINALIZE, "delta finalize wire drifted (contract v1.2.0)");
+}
+
+#[test]
+fn wire_delta_default_off() {
+    // The config default must keep the v1 wire: no html_delta anywhere.
+    let got = stream(&BrookSession::new_with_config(lib_default_config(false)));
+    for w in got {
+        assert!(!w.contains("html_delta"), "delta leaked into default ffi wire: {w}");
+    }
 }
 
 #[test]

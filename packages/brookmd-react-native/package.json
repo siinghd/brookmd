@@ -1,6 +1,6 @@
 {
   "name": "brookmd-react-native",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Streaming markdown for React Native. Rust core over uniffi (JSI TurboModule), incremental parse, RN-native renderer.",
   "author": "siinghd",
   "license": "MIT",
@@ -50,13 +50,13 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit -p tsconfig.test.json",
-    "ubrn:generate": "cd ../../crates/brookmd-ffi && ubrn generate jsi bindings --library target/release/libbrook_md_ffi.so --crate brook_md_ffi --ts-dir ../../packages/brookmd-react-native/src/generated --cpp-dir ../../packages/brookmd-react-native/cpp/generated",
+    "ubrn:generate": "cd ../../crates/brookmd-ffi && ubrn generate jsi bindings --library target/release/libbrook_md_ffi.a --crate brook_md_ffi --ts-dir ../../packages/brookmd-react-native/src/generated --cpp-dir ../../packages/brookmd-react-native/cpp/generated",
     "build:android": "bash scripts/build-android.sh",
     "build:ios": "bash scripts/build-ios.sh"
   },
   "dependencies": {
     "@ubjs/core": "0.31.0-3",
-    "brookmd": "^0.22.2"
+    "brookmd": "^0.23.0"
   },
   "peerDependencies": {
     "react": ">=18",

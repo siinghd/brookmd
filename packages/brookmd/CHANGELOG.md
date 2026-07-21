@@ -4,6 +4,39 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.23.0 — 2026-07-21
+
+### Added
+
+- **Wire delta mode — the streaming re-emit floor is retired** (wire contract
+  **v1.2.0**, additive). Previously, every `append` re-emitted each open
+  block's full HTML across the WASM→worker→main-thread boundary, making total
+  emitted bytes O(n²/chunk) for a block that grows across many chunks — the
+  documented "re-emit floor". Now the parser can emit a **verified splice**
+  (`html_delta: { keep_bytes, keep_units, append }`) against the block's
+  previous emit instead; splices are established by byte comparison, never by
+  structural inference, so reconstruction is byte-exact by construction.
+
+  Measured at 200 KB / 256-byte chunks: a streaming list's total patch JSON
+  drops **119.6 MB → 0.78 MB (153× less)** with **2.8× faster** end-to-end
+  parse+serialize; an unclosed code fence **80.1 MB → 0.58 MB (137×, 4.9×
+  faster)**. Fast-committing shapes are unchanged (no regression). The curve
+  is now linear, so the gap keeps widening with document size.
+
+  - The npm package enables this **automatically and invisibly** — the worker
+    opts in, and the client reconstructs full blocks before anything else sees
+    them. No API change; `Block.html` is always complete.
+  - `brookmd-react-native` does the same across the JSI boundary.
+  - Raw-boundary consumers (`BrookParser`, native `BrookSession`, C ABI): the
+    mode is **opt-in** (`setWireDelta(true)` / `wire_delta: true`) and the
+    default wire is byte-identical to contract v1.1.0. Enabling it obliges you
+    to reconstruct per [WIRE.md §11](../../crates/brookmd-core/WIRE.md).
+  - Pinned by: reconstruction-parity suites (Rust corpus × chunkings, dual
+    UTF-8/UTF-16 offset verification), wire goldens in all five language
+    surfaces (core, FFI, C-ABI, Kotlin, Swift), a fuzzer extension asserting
+    per-patch reconstruction on arbitrary inputs, and a new scaling-gate test
+    that *fails CI* if delta-mode emitted bytes regress from linear.
+
 ## 0.22.2 — 2026-07-21
 
 ### Performance

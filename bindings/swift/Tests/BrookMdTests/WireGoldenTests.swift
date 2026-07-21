@@ -113,6 +113,35 @@ final class WireGoldenTests: XCTestCase {
         XCTAssertEqual(after[0], onAppend0, "post-reset config still emits blockData wire")
     }
 
+    // -- Wire delta mode ON (WIRE.md S11, contract v1.2.0) -------------------
+    // Goldens copied verbatim from crates/brookmd-core/tests/wire_delta.rs.
+
+    let deltaChunk0 = "A steady opening sentence that easily clears the minimum kept prefix"
+    let deltaChunk1 = " and then keeps growing"
+
+    let deltaAppend0 = #"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":68,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix</p>","open":true,"speculative":true}]}"#
+    let deltaAppend1 = #"{"newly_committed":[],"active":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html_delta":{"keep_bytes":71,"keep_units":71,"append":" and then keeps growing</p>"},"open":true,"speculative":true}]}"#
+    let deltaFinalize = #"{"newly_committed":[{"id":0,"kind":{"type":"Paragraph"},"start":0,"end":91,"html":"<p>A steady opening sentence that easily clears the minimum kept prefix and then keeps growing</p>","open":false,"speculative":false}],"active":[]}"#
+
+    func testGoldenWireDeltaMode() {
+        var cfg = libDefaultConfig(blockData: false)
+        cfg.wireDelta = true
+        let session = BrookSession.newWithConfig(config: cfg)
+        let a0 = session.append(chunk: deltaChunk0)
+        let a1 = session.append(chunk: deltaChunk1)
+        let f = session.finalize()
+        XCTAssertEqual(a0, deltaAppend0, "delta append[0] wire drifted (contract v1.2.0)")
+        XCTAssertEqual(a1, deltaAppend1, "delta append[1] wire drifted (contract v1.2.0)")
+        XCTAssertEqual(f, deltaFinalize, "delta finalize wire drifted (contract v1.2.0)")
+    }
+
+    func testWireDeltaDefaultOff() {
+        // The record default keeps the v1 wire: no html_delta anywhere.
+        for w in stream(BrookSession()) {
+            XCTAssertFalse(w.contains("html_delta"), "delta leaked into default wire: \(w)")
+        }
+    }
+
     func testMetricsTrackInput() {
         let session = BrookSession()
         XCTAssertEqual(session.bufferLen(), 0, "empty session has an empty buffer")

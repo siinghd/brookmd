@@ -7,11 +7,13 @@
 //! wire without pulling in wasm-bindgen.
 //!
 //! The wire shape is versioned independently of the crate version — see
-//! `WIRE.md`; it is currently **wire contract v1.1.0**. The serde field names
+//! `WIRE.md`; it is currently **wire contract v1.2.0**. The serde field names
 //! (`newly_committed` / `active` here, and the [`Block`] fields) ARE the
 //! contract: renaming or reordering them is a breaking change to every consumer.
 
+use crate::parser::HtmlDelta;
 use crate::{Block, Patch};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::Serialize;
 
 /// The patch envelope as it crosses the wire: the blocks that just became
@@ -24,12 +26,70 @@ use serde::Serialize;
 #[derive(Serialize)]
 pub struct WirePatch {
     pub newly_committed: Vec<Block>,
-    pub active: Vec<Block>,
+    pub active: Vec<WireActive>,
+}
+
+/// One entry of the wire `active` array: a full [`Block`], or — in the opt-in
+/// wire delta mode (`WIRE.md` §11) — the same block emitted as a splice
+/// against its previous emit: every `Block` field except `html`, plus
+/// `"html_delta":{"keep_bytes":…,"keep_units":…,"append":"…"}` in `html`'s
+/// position, where `append` is `html[keep_bytes..]`. Consumers detect the
+/// form by which of `html` / `html_delta` is present.
+pub struct WireActive {
+    pub block: Block,
+    pub delta: Option<HtmlDelta>,
+}
+
+impl Serialize for WireActive {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let Some(d) = self.delta else {
+            return self.block.serialize(serializer);
+        };
+        // Field order mirrors `Block` exactly, with `html_delta` where `html`
+        // sits in the full form — part of the pinned wire shape.
+        #[derive(Serialize)]
+        struct DeltaBody<'a> {
+            keep_bytes: usize,
+            keep_units: usize,
+            append: &'a str,
+        }
+        let b = &self.block;
+        let mut s = serializer.serialize_struct("Block", 7)?;
+        s.serialize_field("id", &b.id)?;
+        s.serialize_field("kind", &b.kind)?;
+        s.serialize_field("start", &b.start)?;
+        s.serialize_field("end", &b.end)?;
+        s.serialize_field(
+            "html_delta",
+            &DeltaBody {
+                keep_bytes: d.keep_bytes,
+                keep_units: d.keep_units,
+                append: &b.html[d.keep_bytes..],
+            },
+        )?;
+        s.serialize_field("open", &b.open)?;
+        s.serialize_field("speculative", &b.speculative)?;
+        s.end()
+    }
 }
 
 impl From<Patch> for WirePatch {
     fn from(p: Patch) -> Self {
-        Self { newly_committed: p.newly_committed, active: p.active }
+        // `active_deltas` is either empty (delta mode off) or aligned 1:1 with
+        // `active` (see `Patch`); zip defensively so a length mismatch can only
+        // ever degrade to full emission, never mis-splice.
+        let deltas = if p.active_deltas.len() == p.active.len() {
+            p.active_deltas
+        } else {
+            Vec::new()
+        };
+        let mut deltas = deltas.into_iter();
+        let active = p
+            .active
+            .into_iter()
+            .map(|block| WireActive { block, delta: deltas.next().flatten() })
+            .collect();
+        Self { newly_committed: p.newly_committed, active }
     }
 }
 

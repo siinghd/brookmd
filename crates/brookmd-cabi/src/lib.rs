@@ -4,7 +4,7 @@
 //!
 //! It exposes the streaming markdown parser as an opaque [`BrookSession`] whose
 //! `append`/`finalize`/`all_blocks` functions return the **JSON wire strings**
-//! specified in `../../brookmd-core/WIRE.md` (wire contract v1.1.0). Those strings
+//! specified in `../../brookmd-core/WIRE.md` (wire contract v1.2.0). Those strings
 //! are produced through the pure [`brook_md_core::wire`] helpers, so they are
 //! byte-identical to the WASM/JS boundary and to the uniffi (`brookmd-ffi`) layer
 //! by construction — a native renderer decodes exactly the same bytes.
@@ -53,7 +53,7 @@ use brook_md_core::{Block, StreamParser};
 
 /// Wire contract version this crate emits (see `../../brookmd-core/WIRE.md`).
 /// Returned by [`brook_wire_version`]. A `\0`-terminated static C string.
-const WIRE_VERSION: &CStr = c"1.1.0";
+const WIRE_VERSION: &CStr = c"1.2.0";
 
 /// Per-stream parser configuration, deserialized from the JSON object passed to
 /// [`brook_session_new_with_config`]. Field names are the **snake_case** keys of
@@ -101,6 +101,11 @@ struct BrookConfig {
     drop_html_tags: Option<Vec<String>>,
     /// Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
     block_data: bool,
+    /// Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+    /// appends serialize as verified `html_delta` splices against their
+    /// previous emit instead of full `html`. A consumer that enables this MUST
+    /// reconstruct active html per WIRE.md §11. Off by default (v1 wire bytes).
+    wire_delta: bool,
 }
 
 impl Default for BrookConfig {
@@ -122,6 +127,7 @@ impl Default for BrookConfig {
             html_allowlist: None,
             drop_html_tags: None,
             block_data: false,
+            wire_delta: false,
         }
     }
 }
@@ -151,6 +157,7 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
         config.drop_html_tags.clone().unwrap_or_default(),
     );
     p.set_block_data(config.block_data);
+    p.set_wire_delta(config.wire_delta);
     p
 }
 
@@ -392,7 +399,7 @@ pub extern "C" fn brook_string_free(ptr: *mut c_char) {
     }));
 }
 
-/// The wire contract version string (`"1.1.0"`). Returns a pointer to a **static**
+/// The wire contract version string (`"1.2.0"`). Returns a pointer to a **static**
 /// NUL-terminated string that must **NOT** be freed and lives for the program's
 /// lifetime.
 #[no_mangle]

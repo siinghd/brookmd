@@ -2,7 +2,7 @@
  * brook_md.h — C ABI for brookmd-cabi (a wrapper over brookmd-core).
  *
  * Streaming, incremental markdown parser. Feed chunks with brook_session_append;
- * each call returns a JSON "Patch" string (WIRE.md v1.1.0). This header is
+ * each call returns a JSON "Patch" string (WIRE.md v1.2.0). This header is
  * hand-written and is the source of truth for the exported surface — the Rust
  * crate's `symbol_drift` test tripwires header vs. exports so the two can't drift.
  *
@@ -43,7 +43,7 @@ BrookSession *brook_session_new(void);
 
 /*
  * Create a session from a NUL-terminated UTF-8 JSON object whose keys are
- * BrookConfig's snake_case names (e.g. {"gfm_math":true,"block_data":true}).
+ * BrookConfig's snake_case names (e.g. {"gfm_math":true,"block_data":true,"wire_delta":true}).
  * Unknown keys are ignored; missing keys take defaults (autolinks/alerts ON, the
  * rest off). Returns NULL if config_json is NULL, is not valid UTF-8, or is not a
  * valid JSON object. Free with brook_session_free.
@@ -93,7 +93,7 @@ void brook_session_free(BrookSession *s);
 void brook_string_free(char *ptr);
 
 /*
- * Wire contract version ("1.1.0"). Returns a pointer to a STATIC string — do NOT
+ * Wire contract version ("1.2.0"). Returns a pointer to a STATIC string — do NOT
  * free it.
  */
 const char *brook_wire_version(void);

@@ -392,12 +392,74 @@ pub struct StreamParser {
     /// closer. The unpaired can-open `**` pins the commit cut at 0, so no
     /// [`ParagraphCache`] can arm (see [`Mod3TailCache`]).
     mod3_tail_cache: Option<Mod3TailCache>,
+    /// Opt-in wire delta mode (`WIRE.md` §11): when on, each patch's
+    /// `active_deltas` is populated so re-emitted active blocks serialize as
+    /// verified splices (`html_delta`) against their previous emit instead of
+    /// their full `html`, making total emitted bytes O(n) for a block that
+    /// grows across many appends. Off by default (wire byte-identical to
+    /// pre-delta releases).
+    wire_delta: bool,
+    /// The `active` array as last emitted (id, html, UTF-16 length of html),
+    /// maintained only in `finish_patch` and only when `wire_delta` is on —
+    /// deliberately independent of `active_blocks`, which internal fast paths
+    /// mutate between emits. This is the base the next patch's deltas splice
+    /// against, and mirrors exactly the state a conforming consumer holds.
+    last_wire_active: Vec<(u64, String, usize)>,
 }
 
 #[derive(Default)]
 pub struct Patch {
     pub newly_committed: Vec<Block>,
     pub active: Vec<Block>,
+    /// Wire-delta metadata for `active`, populated only when the parser was
+    /// configured with [`StreamParser::set_wire_delta`]: either empty (delta
+    /// mode off — every active block serializes with its full `html`) or
+    /// exactly `active.len()` entries, where `Some(d)` means entry `i`
+    /// serializes as a splice against the previous emit of the same block id
+    /// (`html_delta` instead of `html` — see `WIRE.md` §11). The parser
+    /// guarantees a `Some` delta's base block id was present in the previous
+    /// patch's `active` array.
+    pub active_deltas: Vec<Option<HtmlDelta>>,
+}
+
+/// A verified splice of an active block's `html` against the previous emit of
+/// the same block id: the first `keep_bytes` bytes (equivalently the first
+/// `keep_units` UTF-16 code units) of the previous `html` are byte-identical
+/// and are kept; everything after is replaced by `html[keep_bytes..]`. Both
+/// counts always fall on character boundaries. Produced by comparison, never
+/// by structural inference, so a delta can never reconstruct wrong bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HtmlDelta {
+    /// Kept prefix length in UTF-8 bytes (for byte-oriented consumers).
+    pub keep_bytes: usize,
+    /// Kept prefix length in UTF-16 code units (for JS/JVM-style consumers).
+    pub keep_units: usize,
+}
+
+/// Length of the shared byte prefix of `a` and `b`, 8 bytes per step (the same
+/// SWAR shape as `scanner::line_end`); the wire delta path runs this over the
+/// previous emit on every append, so it is deliberately word-at-a-time.
+fn common_prefix_bytes(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    let mut i = 0;
+    while i + 8 <= n {
+        let x = u64::from_le_bytes(a[i..i + 8].try_into().unwrap());
+        let y = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let d = x ^ y;
+        if d != 0 {
+            return i + (d.trailing_zeros() >> 3) as usize;
+        }
+        i += 8;
+    }
+    while i < n && a[i] == b[i] {
+        i += 1;
+    }
+    i
+}
+
+/// UTF-16 code-unit length of `s` — the unit JS/JVM consumers slice by.
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
 }
 
 /// How an open fence's closing line is recognized. The cache MUST match the
@@ -1575,6 +1637,8 @@ impl StreamParser {
             alnum_tail_cache: None,
             raw_tag_tail_cache: None,
             mod3_tail_cache: None,
+            wire_delta: false,
+            last_wire_active: Vec::new(),
         }
     }
 
@@ -1692,6 +1756,22 @@ impl StreamParser {
         self.block_data = on;
     }
 
+    /// Enable the opt-in wire delta mode (`WIRE.md` §11): active blocks that
+    /// were emitted in the previous patch serialize as verified `html_delta`
+    /// splices (`{keep_bytes, keep_units, append}`) instead of re-sending
+    /// their full `html`, so a block that grows across many appends emits
+    /// O(size) total wire bytes instead of O(size²/chunk). Off by default —
+    /// when off, the wire is byte-identical to pre-delta releases. A consumer
+    /// that enables this must reconstruct active `html` per `WIRE.md` §11.
+    pub fn with_wire_delta(mut self, on: bool) -> Self {
+        self.wire_delta = on;
+        self
+    }
+
+    pub fn set_wire_delta(&mut self, on: bool) {
+        self.wire_delta = on;
+    }
+
     /// Set the opt-in component-tag allowlist (e.g. `["Thinking", "Callout"]`).
     /// A `<Tag>…</Tag>` whose name is listed renders as a component with markdown
     /// inner content. Names are matched exactly (case-sensitively). Empty = off.
@@ -1745,6 +1825,7 @@ impl StreamParser {
         }
         self.ingest(chunk);
         let patch = self.reparse_tail(false);
+        let patch = self.finish_patch(patch);
         #[cfg(feature = "perf_counters")]
         Self::count_emitted(&patch);
         patch
@@ -1805,20 +1886,83 @@ impl StreamParser {
             self.buffer.push('\n');
         }
         let patch = self.reparse_tail(true);
+        let patch = self.finish_patch(patch);
         #[cfg(feature = "perf_counters")]
         Self::count_emitted(&patch);
         patch
     }
 
+    /// Wire delta mode: compute each active block's verified splice against the
+    /// previous emit of the same block id, and record this patch's `active` as
+    /// the base for the next one. Runs at the single exit shared by every
+    /// internal emit path (`append`/`finalize`), so no fast path can bypass it.
+    /// A no-op (empty `active_deltas`) unless `set_wire_delta(true)`.
+    fn finish_patch(&mut self, mut patch: Patch) -> Patch {
+        if !self.wire_delta {
+            return patch;
+        }
+        // Below this shared-prefix length a delta saves nothing over the full
+        // `html` (the `html_delta` envelope itself costs ~50 bytes). Part of
+        // the deterministic emission rule pinned by the wire goldens.
+        const MIN_KEEP_BYTES: usize = 64;
+        let mut deltas: Vec<Option<HtmlDelta>> = Vec::with_capacity(patch.active.len());
+        let mut next: Vec<(u64, String, usize)> = Vec::with_capacity(patch.active.len());
+        for b in &patch.active {
+            let prev = self.last_wire_active.iter().find(|(id, _, _)| *id == b.id);
+            let delta = prev.and_then(|(_, prev_html, prev_units)| {
+                let mut keep = common_prefix_bytes(prev_html.as_bytes(), b.html.as_bytes());
+                // Back off to a char boundary of the NEW html. Because the
+                // bytes below `keep` are identical in both strings, a boundary
+                // of the new html is necessarily a boundary of the previous
+                // one too (a continuation byte in one would force the same
+                // lead-byte structure, hence a continuation byte, in the
+                // other), so `prev_html[keep..]` below cannot panic.
+                while keep > 0 && !b.html.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                if keep < MIN_KEEP_BYTES {
+                    return None;
+                }
+                // prev[..keep] == new[..keep], so the kept prefix's UTF-16
+                // length is prev's cached total minus its (short) dropped
+                // tail — O(changed bytes), never a rescan of the prefix.
+                let keep_units = prev_units - utf16_len(&prev_html[keep..]);
+                Some(HtmlDelta { keep_bytes: keep, keep_units })
+            });
+            let units = match delta {
+                Some(d) => d.keep_units + utf16_len(&b.html[d.keep_bytes..]),
+                None => utf16_len(&b.html),
+            };
+            next.push((b.id, b.html.clone(), units));
+            deltas.push(delta);
+        }
+        self.last_wire_active = next;
+        patch.active_deltas = deltas;
+        patch
+    }
+
     /// Deterministic complexity probe (feature `perf_counters` only): HTML bytes
-    /// crossing the public patch boundary. Re-emitting the whole open block per
-    /// append is the wire contract, so this is informational — printed by
-    /// `tests/scaling.rs`, never gated.
+    /// crossing the public patch boundary. With wire delta mode off, re-emitting
+    /// the whole open block per append is the wire contract, so this is
+    /// informational; with it on, only each delta's `append` tail counts — the
+    /// linearity `tests/scaling.rs` asserts for delta-mode streams.
     #[cfg(feature = "perf_counters")]
     fn count_emitted(patch: &Patch) {
-        let n: usize =
-            patch.newly_committed.iter().chain(patch.active.iter()).map(|b| b.html.len()).sum();
-        crate::perf::add_emit(n);
+        let committed: usize = patch.newly_committed.iter().map(|b| b.html.len()).sum();
+        let active: usize = if patch.active_deltas.len() == patch.active.len() {
+            patch
+                .active
+                .iter()
+                .zip(&patch.active_deltas)
+                .map(|(b, d)| match d {
+                    Some(d) => b.html.len() - d.keep_bytes,
+                    None => b.html.len(),
+                })
+                .sum()
+        } else {
+            patch.active.iter().map(|b| b.html.len()).sum()
+        };
+        crate::perf::add_emit(committed + active);
     }
 
     /// The retained source, with line endings normalized to `\n` (see
@@ -2641,7 +2785,7 @@ impl StreamParser {
             );
         }
 
-        Patch { newly_committed, active: new_active }
+        Patch { newly_committed, active: new_active, active_deltas: Vec::new() }
     }
 
     /// O(new bytes) extension of a long open code/math fence at the tail. Returns
@@ -2791,7 +2935,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.fence_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a long open indented-code block at the tail.
@@ -2912,7 +3056,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.indented_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a long open raw-HTML block at the tail. Folds
@@ -3009,7 +3153,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.html_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// Inline-render options for a streaming tail render. Reference + footnote
@@ -3158,7 +3302,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.para_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of an open single-`$` inline-math span at the tail
@@ -3218,7 +3362,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.dollar_tail_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of an open pure-ASCII-alphanumeric paragraph at the
@@ -3274,7 +3418,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.alnum_tail_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(1) extension of an open never-closing raw tag whose quoted attribute
@@ -3325,7 +3469,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.raw_tag_tail_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of the open `a**bc* c* …` mod-3 soup at the tail
@@ -3396,7 +3540,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.mod3_tail_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a long open GFM table at the tail. Folds each
@@ -3633,7 +3777,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.table_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of the table's trailing newline-less partial row
@@ -4108,7 +4252,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.container_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of an open structured blockquote / alert at the
@@ -4188,7 +4332,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.container_block_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// Arm the iterative deep-quote staircase cache (see [`DeepQuoteCache`]) for an
@@ -4370,7 +4514,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.deep_quote_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// A recursive nested parser configured to reproduce THIS parser's rendering
@@ -4564,7 +4708,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.component_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// Arm the component-block cache for the open `<Tag>` block at `start`.
@@ -4750,7 +4894,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.heading_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a still-growing thematic-break line at the tail
@@ -4788,7 +4932,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.rule_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a code fence whose opener line (info string) is
@@ -4827,7 +4971,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.fence_info_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// O(new bytes) extension of a long open list at the tail — flat OR nested.
@@ -5201,7 +5345,7 @@ impl StreamParser {
         };
         self.active_blocks = vec![block.clone()];
         self.list_cache = Some(cache);
-        Some(Patch { newly_committed: Vec::new(), active: vec![block] })
+        Some(Patch { newly_committed: Vec::new(), active: vec![block], active_deltas: Vec::new() })
     }
 
     /// Keep the [`OpenItemStream`] in sync with the cache's OPEN item: drop a

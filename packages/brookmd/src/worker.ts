@@ -39,6 +39,11 @@ const core = new WorkerCore({
       c?.dropHtmlTags ?? [],
     );
     p.setBlockData(c?.blockData ?? false);
+    // Wire delta mode (WIRE.md §11) is always on for OUR worker↔client pair:
+    // active re-emits cross the WASM and postMessage boundaries as splices
+    // instead of full html (O(n) total for a growing block), and applyPatch
+    // on the main thread reconstructs before anything else sees the block.
+    p.setWireDelta(true);
     return p;
   },
   post: (msg) => ctx.postMessage(msg),

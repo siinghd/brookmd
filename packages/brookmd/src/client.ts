@@ -60,7 +60,26 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
     if (!store.committed.has(b.id)) store.committedOrder.push(b.id);
     store.committed.set(b.id, b);
   }
-  store.active = patch.active;
+  // Wire delta mode (WIRE.md §11): an active entry may carry an `html_delta`
+  // splice instead of full `html` — reconstruct against the PREVIOUS active
+  // region (still in store.active here) so everything downstream only ever
+  // sees full Blocks. JS strings are UTF-16, so `keep_units` is the offset.
+  // The parser only emits a delta against a block it emitted in the previous
+  // patch; a missing base means dropped/reordered patches — fail loudly (the
+  // caller routes it through the malformed-patch error path).
+  const active: Block[] = new Array(patch.active.length);
+  for (let i = 0; i < patch.active.length; i++) {
+    const entry = patch.active[i];
+    if ("html_delta" in entry) {
+      const { html_delta, ...rest } = entry;
+      const prev = store.active.find((b) => b.id === entry.id);
+      if (!prev) throw new Error(`brookmd: html_delta for block ${entry.id} without a base`);
+      active[i] = { ...rest, html: prev.html.slice(0, html_delta.keep_units) + html_delta.append };
+    } else {
+      active[i] = entry;
+    }
+  }
+  store.active = active;
   // Fresh array each patch (immutable for React reference checks), but the
   // committed entries inside it are the same object references as before.
   const next: Block[] = new Array(store.committedOrder.length + store.active.length);
@@ -954,6 +973,11 @@ export class BrookClient {
         let patch: Patch;
         try {
           patch = JSON.parse(msg.patch) as Patch;
+          // applyPatch is inside the try: a wire-delta reconstruction failure
+          // (a splice without its base — dropped/reordered patches) is the
+          // same protocol-corruption class as unparseable JSON and must
+          // surface via onError, not break the pool's dispatch loop.
+          applyPatch(this.store, patch);
         } catch (e) {
           const message = e instanceof Error ? e.message : String(e);
           if (this.onError) this.onError({ message: `brookmd: malformed patch (${message})` });
@@ -961,7 +985,6 @@ export class BrookClient {
           else console.error("brookmd: malformed patch:", message);
           break;
         }
-        applyPatch(this.store, patch);
         // The reparse behind a preserved divergence view is complete: stop
         // padding with the old document's tail, so a shorter replacement trims
         // to the new length on this very notify. Keyed on msg.final ONLY —

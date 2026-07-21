@@ -19,8 +19,8 @@ mod url;
 pub mod wire;
 
 pub use blocks::{Block, BlockKind};
-pub use parser::{Patch, StreamParser};
-pub use wire::WirePatch;
+pub use parser::{HtmlDelta, Patch, StreamParser};
+pub use wire::{WireActive, WirePatch};
 
 /// Deterministic perf instrumentation — feature `perf_counters`, off by default
 /// and never compiled into the WASM build (no `[features]` flag is set there).
@@ -41,10 +41,11 @@ pub use wire::WirePatch;
 ///   list item bodies, table partial rows, pinned paragraph cuts inside
 ///   containers) shows up here even though it never re-scans.
 /// - `emitted_bytes` — HTML bytes crossing the public `append`/`finalize`
-///   boundary (`patch.newly_committed` + `patch.active`). Informational: full
-///   re-emission of the open block's HTML each append is the current wire
+///   boundary (`patch.newly_committed` + `patch.active`). With wire delta mode
+///   off, full re-emission of the open block's HTML each append is the wire
 ///   contract, so this is inherently O(n²/chunk) for a giant single open block
-///   and is printed, not gated.
+///   (printed, not gated). With `set_wire_delta(true)` (WIRE.md §11) only each
+///   delta's `append` tail counts, and `tests/scaling.rs` GATES linearity.
 ///
 /// All counters count work, not wall-clock time, so a scaling test can gate
 /// deterministically in CI without flaking on noisy shared runners.
@@ -234,6 +235,17 @@ impl BrookParser {
     #[wasm_bindgen(js_name = setBlockData)]
     pub fn set_block_data(&mut self, on: bool) {
         self.inner.set_block_data(on);
+    }
+
+    /// Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+    /// appends serialize as verified `html_delta` splices against their previous
+    /// emit instead of full `html`, making total emitted bytes O(n) for a block
+    /// that grows across many appends. Off by default (wire byte-identical to
+    /// pre-delta releases). A consumer that enables this must reconstruct
+    /// active `html` per WIRE.md §11 — the npm package's client does.
+    #[wasm_bindgen(js_name = setWireDelta)]
+    pub fn set_wire_delta(&mut self, on: bool) {
+        self.inner.set_wire_delta(on);
     }
 
     /// Set the opt-in component-tag allowlist (e.g. `["Thinking", "Callout"]`).

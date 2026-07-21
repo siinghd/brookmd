@@ -846,6 +846,14 @@ public struct BrookConfig: Equatable, Hashable {
      * Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
      */
     public var blockData: Bool
+    /**
+     * Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+     * appends serialize as verified `html_delta` splices against their
+     * previous emit instead of full `html`. A consumer that enables this MUST
+     * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
+     * layer does). Off by default — wire bytes identical to contract v1.1.0.
+     */
+    public var wireDelta: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -891,7 +899,14 @@ public struct BrookConfig: Equatable, Hashable {
          */dropHtmlTags: [String]? = nil, 
         /**
          * Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
-         */blockData: Bool = false) {
+         */blockData: Bool = false, 
+        /**
+         * Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+         * appends serialize as verified `html_delta` splices against their
+         * previous emit instead of full `html`. A consumer that enables this MUST
+         * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
+         * layer does). Off by default — wire bytes identical to contract v1.1.0.
+         */wireDelta: Bool = false) {
         self.gfmAutolinks = gfmAutolinks
         self.gfmAlerts = gfmAlerts
         self.gfmTagfilter = gfmTagfilter
@@ -905,6 +920,7 @@ public struct BrookConfig: Equatable, Hashable {
         self.htmlAllowlist = htmlAllowlist
         self.dropHtmlTags = dropHtmlTags
         self.blockData = blockData
+        self.wireDelta = wireDelta
     }
 
     
@@ -935,7 +951,8 @@ public struct FfiConverterTypeBrookConfig: FfiConverterRustBuffer {
                 inlineComponentTags: FfiConverterOptionSequenceString.read(from: &buf), 
                 htmlAllowlist: FfiConverterOptionSequenceString.read(from: &buf), 
                 dropHtmlTags: FfiConverterOptionSequenceString.read(from: &buf), 
-                blockData: FfiConverterBool.read(from: &buf)
+                blockData: FfiConverterBool.read(from: &buf), 
+                wireDelta: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -953,6 +970,7 @@ public struct FfiConverterTypeBrookConfig: FfiConverterRustBuffer {
         FfiConverterOptionSequenceString.write(value.htmlAllowlist, into: &buf)
         FfiConverterOptionSequenceString.write(value.dropHtmlTags, into: &buf)
         FfiConverterBool.write(value.blockData, into: &buf)
+        FfiConverterBool.write(value.wireDelta, into: &buf)
     }
 }
 
