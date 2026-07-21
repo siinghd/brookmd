@@ -200,10 +200,20 @@ jobs:
 
   ios-app:
     name: ios (app e2e on simulator)
-    runs-on: macos-14
+    # RN 0.86's pods require Xcode >= 16.1; macos-14 ships 15.4. macos-15 ships
+    # Xcode 16.0–16.4 (default 16.4). (device-validate.yml stays on macos-14: its
+    # bare SPM package has no such requirement.)
+    runs-on: macos-15
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+
+      # Pin the newest installed Xcode 16.x for determinism (the image's default
+      # selection has occasionally regressed to an older Xcode).
+      - name: Select latest Xcode 16
+        run: |
+          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | sort -V | tail -1)"
+          xcodebuild -version
 
       - name: Install Node 22
         uses: actions/setup-node@v4
@@ -291,9 +301,16 @@ jobs:
           APP="build/Build/Products/Release-iphonesimulator/BrookE2e.app"
           test -d "$APP" || { echo "app bundle not found at $APP"; exit 1; }
 
-          # Boot a simulator (create a dedicated device to avoid runner state drift).
-          UDID=$(xcrun simctl create brook-e2e "iPhone 15" 2>/dev/null || true)
-          if [ -z "$UDID" ]; then UDID=booted; xcrun simctl boot booted 2>/dev/null || true; else xcrun simctl boot "$UDID"; fi
+          # Pick the first AVAILABLE iPhone simulator the image ships (Xcode 16 →
+          # iPhone 16 family / iOS 18; don't hardcode a device name that may not
+          # exist). Fall back to creating one, then to `booted`.
+          xcrun simctl list devices available || true
+          UDID=$(xcrun simctl list devices available | awk -F'[()]' '/iPhone/{gsub(/^ +| +$/,"",$2); print $2; exit}')
+          if [ -z "$UDID" ]; then
+            RUNTIME=$(xcrun simctl list runtimes available | awk '/iOS/{print $NF; exit}')
+            UDID=$(xcrun simctl create brook-e2e "iPhone 16" "$RUNTIME" 2>/dev/null || true)
+          fi
+          if [ -z "$UDID" ]; then UDID=booted; xcrun simctl boot booted 2>/dev/null || true; else xcrun simctl boot "$UDID" 2>/dev/null || true; fi
           xcrun simctl bootstatus "$UDID" -b || true
 
           xcrun simctl install "$UDID" "$APP"
