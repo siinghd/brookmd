@@ -158,40 +158,10 @@ jobs:
           force-avd-creation: true
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: |
-            set -x
-            APK=examples/rn-e2e/android/app/build/outputs/apk/release/app-release.apk
-            # Deterministic result channel: a host-side HTTP beacon listener. The
-            # app POSTs its result to 10.0.2.2:8973 (the emulator's alias for the
-            # host loopback); os_log/logcat capture is kept only as diagnostics.
-            python3 -m http.server 8973 --bind 0.0.0.0 > /tmp/beacon.log 2>&1 &
-            BEACON_PID=$!
-            adb install -r "$APK"
-            adb logcat -c
-            adb shell am start -n com.brooke2e/.MainActivity
-            echo "waiting for BROOK_E2E beacon…"
-            result=""
-            deadline=$((SECONDS+120))
-            while [ $SECONDS -lt $deadline ]; do
-              if grep -q "BROOK_E2E_OK" /tmp/beacon.log 2>/dev/null; then result=OK; break; fi
-              if grep -q "BROOK_E2E_FAIL" /tmp/beacon.log 2>/dev/null; then result=FAIL; break; fi
-              sleep 2
-            done
-            kill $BEACON_PID 2>/dev/null || true
-            adb logcat -d > /tmp/logcat-full.txt 2>/dev/null || true
-            echo "=== beacon.log ==="; cat /tmp/beacon.log || true
-            echo "=== BROOK_E2E logcat lines (diagnostics) ==="; grep -E "BROOK_E2E" /tmp/logcat-full.txt || true
-            if [ "$result" = OK ]; then
-              echo "PASS: native parser produced byte-identical wire and the renderer mounted."
-            elif [ "$result" = FAIL ]; then
-              echo "FAIL: app beaconed BROOK_E2E_FAIL"; grep "BROOK_E2E_FAIL" /tmp/beacon.log || true
-              echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
-              exit 1
-            else
-              echo "TIMEOUT: no BROOK_E2E beacon within 120s"
-              echo "--- last 200 logcat lines ---"; tail -200 /tmp/logcat-full.txt
-              exit 1
-            fi
+          # The action runs each script LINE as a separate `sh -c`, so shell state
+          # can't persist across lines. Keep it to ONE line invoking a checked-in
+          # bash script (install + launch + beacon poll + logcat dump on failure).
+          script: bash examples/rn-e2e/scripts/android-emulator-run.sh
 
       - name: Upload Gradle + logcat reports
         if: failure()

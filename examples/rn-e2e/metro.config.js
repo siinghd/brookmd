@@ -44,12 +44,15 @@ const config = {
     // Search the app's node_modules for anything not found via the hierarchical
     // walk-up (notably @ubjs/core, requested from the symlinked package source).
     nodeModulesPaths: [appNodeModules],
-    // brookmd ships `exports` with only `types` + `import` conditions (it is
-    // "type": "module"). Make sure `import` is in the condition set so subpaths
-    // like `brookmd/worker-core` resolve. Package exports are on by default in
-    // RN 0.79+/Metro 0.82+, but we set both explicitly for clarity.
+    // Package exports on (default in RN 0.79+/Metro 0.82+). brookmd resolves via
+    // its `default` export condition, which Metro's DEFAULT conditionNames
+    // (["react-native"] + the implicit "default") already match — so DO NOT
+    // override unstable_conditionNames. Adding "import" globally is a trap: it
+    // makes dual packages like @babel/runtime resolve to their ESM variant
+    // (`helpers/esm/*`, whose module namespace is `{default: fn}`, not a bare
+    // function), so `_interopRequireDefault(...)` throws "Object is not a function"
+    // during InitializeCore (setUpPerformance.js) and the release bundle crashes.
     unstable_enablePackageExports: true,
-    unstable_conditionNames: ['react-native', 'import', 'require'],
     resolveRequest: (context, moduleName, platform) => {
       for (const name of SINGLETONS) {
         if (moduleName === name || moduleName.startsWith(name + '/')) {
