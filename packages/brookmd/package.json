@@ -25,6 +25,9 @@
     "./styles.css": "./dist/styles.css",
     "./package.json": "./package.json"
   },
+  "react-native": {
+    "./dist/asset-urls.js": "./dist/asset-urls.native.js"
+  },
   "files": [
     "dist",
     "README.md",

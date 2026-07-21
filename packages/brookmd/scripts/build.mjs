@@ -142,16 +142,18 @@ function processTree(dir) {
 }
 processTree(distDir);
 
-// worker URL rewrite (client.js only): ./worker.ts -> ./worker.js
-const clientPath = path.join(distDir, "client.js");
-let client = readFileSync(clientPath, "utf8");
+// worker URL rewrite (asset-urls.js only): ./worker.ts -> ./worker.js. The literal
+// `new URL("./worker.ts", import.meta.url)` lives in asset-urls.ts (workerUrl());
+// dev/Vite resolve ./worker.ts from src, but the dist must point at ./worker.js.
+const assetUrlsPath = path.join(distDir, "asset-urls.js");
+let assetUrls = readFileSync(assetUrlsPath, "utf8");
 const workerRe = /(new URL\(\s*["'])\.\/worker\.ts(["'])/g;
-const hits = (client.match(workerRe) || []).length;
+const hits = (assetUrls.match(workerRe) || []).length;
 if (hits !== 1) {
-  throw new Error(`client.js: expected exactly 1 './worker.ts' URL, found ${hits}`);
+  throw new Error(`asset-urls.js: expected exactly 1 './worker.ts' URL, found ${hits}`);
 }
-client = client.replace(workerRe, "$1./worker.js$2");
-writeFileSync(clientPath, client);
+assetUrls = assetUrls.replace(workerRe, "$1./worker.js$2");
+writeFileSync(assetUrlsPath, assetUrls);
 
 // --------------------------------------------------------------------------
 // 6. assert the dist contract.
@@ -164,12 +166,30 @@ assert(statSync(path.join(distDir, "styles.css")).isFile(), "styles.css missing"
 assert(statSync(path.join(distDir, "index.d.ts")).isFile(), "index.d.ts missing");
 assert(statSync(path.join(distDir, "client.d.ts")).isFile(), "client.d.ts missing");
 assert(
-  read("client.js").includes('new URL("./worker.js"') ||
-  read("client.js").includes("new URL('./worker.js'"),
-  "worker URL not rewritten to ./worker.js",
+  read("asset-urls.js").includes('new URL("./worker.js"') ||
+  read("asset-urls.js").includes("new URL('./worker.js'"),
+  "worker URL not rewritten to ./worker.js in asset-urls.js",
 );
-assert(!/new URL\(\s*["']\.\/worker\.ts/.test(read("client.js")), "stale ./worker.ts in client.js");
+assert(!/new URL\(\s*["']\.\/worker\.ts/.test(read("asset-urls.js")), "stale ./worker.ts in asset-urls.js");
 assert(read("worker.js").includes("./wasm/brook_md_core_bg.wasm"), "worker wasm ref lost");
+
+// The React Native asset-URL shim. Metro resolves asset-urls.native.js for RN
+// bundles; it MUST exist and MUST contain no `import.meta` (Hermes rejects that
+// syntax at bytecode-compile time even in dead code — the whole point of the
+// shim). client.js must import ./asset-urls EXTENSIONLESS so Metro's platform
+// resolution fires (an explicit `.js` resolves straight to asset-urls.js).
+assert(statSync(path.join(distDir, "asset-urls.native.js")).isFile(), "dist/asset-urls.native.js missing");
+assert(!read("asset-urls.native.js").includes("import.meta"), "asset-urls.native.js must not contain import.meta");
+assert(/\bfrom\s*["']\.\/asset-urls\.js["']/.test(read("client.js")),
+  "client.js must import ./asset-urls.js (Metro redirects it to asset-urls.native.js via the package's react-native field)");
+// The Metro redirect that swaps asset-urls.js -> asset-urls.native.js for RN.
+// Without it, RN bundles keep import.meta (Hermes rejects it). Web/Node ignore the
+// react-native field, so they load the real asset-urls.js.
+const pkgJson = JSON.parse(read("../package.json"));
+assert(
+  pkgJson["react-native"]?.["./dist/asset-urls.js"] === "./dist/asset-urls.native.js",
+  'package.json "react-native" must map "./dist/asset-urls.js" -> "./dist/asset-urls.native.js"',
+);
 // no extensionless relative specifier should survive in the entry barrel:
 assert(!/\bfrom\s*["']\.\/(client|react|hi|html-to-react)["']/.test(read("index.js")),
   "index.js still has an extensionless relative import");

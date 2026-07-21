@@ -1,4 +1,9 @@
 import type { Block, FromWorker, ParserConfig, Patch, ToWorker, WorkerLike } from "./types-core";
+// The `new Worker(new URL(..., import.meta.url))` construction lives in
+// ./asset-urls so React Native can swap it out: the package's `react-native`
+// field (package.json) redirects asset-urls.js -> asset-urls.native.js
+// (import.meta-free, no Web Worker) for Metro. See asset-urls.ts.
+import { createWorker } from "./asset-urls";
 
 /**
  * The ordered-block store backing a stream, extracted as a pure function so
@@ -282,7 +287,7 @@ let defaultPool: BrookPool | null = null;
 export function getDefaultPool(): BrookPool {
   if (!defaultPool) {
     defaultPool = new BrookPool(
-      () => new Worker(new URL("./worker.ts", import.meta.url), { type: "module" }) as unknown as WorkerLike,
+      () => createWorker(),
       poolCap(),
     );
   }
