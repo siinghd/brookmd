@@ -328,10 +328,14 @@ jobs:
           xcrun simctl bootstatus "$UDID" -b || true
 
           xcrun simctl install "$UDID" "$APP"
-          # os_log capture kept only as failure diagnostics (the beacon is the gate).
-          xcrun simctl spawn "$UDID" log stream --level debug --style compact > /tmp/simlog.txt 2>&1 &
+          # Diagnostics only (the beacon is the gate). Two readable channels so the
+          # next failure is debuggable: (1) os_log filtered to the app process, and
+          # (2) the app's own console via --console-pty (blocks → background it).
+          xcrun simctl spawn "$UDID" log stream --level debug --style compact --predicate 'processImagePath CONTAINS "BrookE2e"' > /tmp/simlog.txt 2>&1 &
           LOGPID=$!
-          xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
+          sleep 1
+          xcrun simctl launch --console-pty "$UDID" "$BUNDLE_ID" > /tmp/applaunch.txt 2>&1 &
+          LAUNCHPID=$!
 
           result=""
           deadline=$((SECONDS+150))
@@ -340,17 +344,21 @@ jobs:
             if grep -q "BROOK_E2E_FAIL" /tmp/beacon.log 2>/dev/null; then result=FAIL; break; fi
             sleep 2
           done
-          kill $BEACON_PID $LOGPID 2>/dev/null || true
+          kill $BEACON_PID $LOGPID $LAUNCHPID 2>/dev/null || true
 
           echo "=== beacon.log ==="; cat /tmp/beacon.log || true
-          echo "=== BROOK_E2E in os_log (diagnostics) ==="; grep -hs "BROOK_E2E" /tmp/simlog.txt || true
+          echo "=== app console (applaunch.txt) ==="; cat /tmp/applaunch.txt || true
+          echo "=== BROOK_E2E in os_log (app-filtered) ==="; grep -hs "BROOK_E2E" /tmp/simlog.txt || true
 
           if [ "$result" = OK ]; then
             echo "PASS: native parser produced byte-identical wire and the renderer mounted."
           elif [ "$result" = FAIL ]; then
             echo "FAIL: app beaconed BROOK_E2E_FAIL"; grep "BROOK_E2E_FAIL" /tmp/beacon.log || true; exit 1
           else
-            echo "TIMEOUT: no BROOK_E2E beacon within 150s"; tail -100 /tmp/simlog.txt || true; exit 1
+            echo "TIMEOUT: no BROOK_E2E beacon within 150s"
+            echo "--- app console (tail) ---"; tail -120 /tmp/applaunch.txt || true
+            echo "--- os_log app (tail) ---"; tail -80 /tmp/simlog.txt || true
+            exit 1
           fi
 
       - name: Upload xcresult + sim logs
@@ -361,5 +369,6 @@ jobs:
           path: |
             examples/rn-e2e/ios/build/Logs/
             /tmp/simlog.txt
+            /tmp/applaunch.txt
             /tmp/beacon.log
           if-no-files-found: warn

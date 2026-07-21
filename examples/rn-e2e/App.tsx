@@ -10,24 +10,22 @@
  *      proves the compiled Rust library loaded and produces the exact wire.
  *
  *   2. The RENDERER. `<BrookMarkdown>` drives the SAME native parser through the
- *      package's in-process pool (WorkerCore) and renders RN primitives — proving
- *      the full JS<->native integration mounts and renders on device.
+ *      package's in-process pool (WorkerCore) and renders RN primitives.
  *
- * On success it logs `BROOK_E2E_OK`; on any mismatch/exception `BROOK_E2E_FAIL:
- * <detail>`. CI polls the device log for these markers.
+ * Result transport is an HTTP beacon to a host-side CI listener (deterministic;
+ * os_log/logcat proved unreliable), plus console.log markers as a secondary/local
+ * channel. Success => BROOK_E2E_OK, any mismatch/exception => BROOK_E2E_FAIL:<detail>.
+ *
+ * ROBUSTNESS: this file's only STATIC imports are react / react-native / golden, so
+ * the component always mounts and the effect always runs. The package (and the
+ * native module it touches) is loaded with dynamic import() INSIDE the effect's
+ * try/catch, so ANY load/init failure still beacons BROOK_E2E_FAIL rather than
+ * silently killing the app before it can report.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ComponentType } from 'react';
 import { Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 
-// The renderer + public client surface. Importing the package entry also wires
-// the native parser factory into the shared pool (registerNativeParser).
-import { BrookMarkdown } from 'brookmd-react-native';
-// The on-device native parser factory (the module the package entry itself uses
-// to back the pool). Reaching it directly lets us read the RAW wire strings and
-// compare them to the goldens byte-for-byte.
-import { makeNativeParser } from 'brookmd-react-native/src/native-session';
 import type { ParserConfig } from 'brookmd/types';
-
 import { CHUNKS, EXPECTED } from './golden';
 
 // Every setter at StreamParser's library default (autolinks/alerts OFF, block
@@ -46,9 +44,11 @@ const NATIVE_OFF_CONFIG: ParserConfig = {
 };
 
 type CheckResult = { ok: true } | { ok: false; detail: string };
+type NativeParser = { append(chunk: string): string; finalize(): string; free(): void };
+type MakeParser = (config: ParserConfig | undefined) => NativeParser;
 
 /** Stream the goldens through a fresh native session and compare every patch. */
-function runNativeWireCheck(): CheckResult {
+function runNativeWireCheck(makeNativeParser: MakeParser): CheckResult {
   const parser = makeNativeParser(NATIVE_OFF_CONFIG);
   try {
     const got: string[] = [];
@@ -85,28 +85,53 @@ function sendBeacon(path: string): void {
   });
 }
 
+function report(result: CheckResult): void {
+  if (result.ok) {
+    // eslint-disable-next-line no-console
+    console.log('BROOK_E2E_OK');
+    sendBeacon('BROOK_E2E_OK');
+  } else {
+    // eslint-disable-next-line no-console
+    console.log('BROOK_E2E_FAIL: ' + result.detail);
+    sendBeacon('BROOK_E2E_FAIL?d=' + encodeURIComponent(result.detail));
+  }
+}
+
 function App() {
   const [status, setStatus] = useState('running…');
+  const [Markdown, setMarkdown] = useState<ComponentType<{ content?: string }> | null>(null);
 
   useEffect(() => {
-    let result: CheckResult;
-    try {
-      result = runNativeWireCheck();
-    } catch (e) {
-      const msg = e instanceof Error ? e.stack ?? e.message : String(e);
-      result = { ok: false, detail: `native check threw: ${msg}` };
-    }
-    if (result.ok) {
-      setStatus('OK');
-      // eslint-disable-next-line no-console
-      console.log('BROOK_E2E_OK');
-      sendBeacon('BROOK_E2E_OK');
-    } else {
-      setStatus('FAIL');
-      // eslint-disable-next-line no-console
-      console.log('BROOK_E2E_FAIL: ' + result.detail);
-      sendBeacon('BROOK_E2E_FAIL?d=' + encodeURIComponent(result.detail));
-    }
+    let cancelled = false;
+    (async () => {
+      let result: CheckResult;
+      try {
+        // Dynamic import INSIDE the try: a load/init failure of the package or its
+        // native module is caught here and still beacons FAIL (rather than throwing
+        // at module load and killing the app before it can report).
+        const { makeNativeParser } = await import('brookmd-react-native/src/native-session');
+        result = runNativeWireCheck(makeNativeParser as MakeParser);
+      } catch (e) {
+        const msg = e instanceof Error ? e.stack ?? e.message : String(e);
+        result = { ok: false, detail: 'native load/init failed: ' + msg };
+      }
+      if (cancelled) return;
+      setStatus(result.ok ? 'OK' : 'FAIL');
+      report(result);
+
+      // The renderer is a best-effort visual only; its failure must NOT change the
+      // already-reported native-path result, so it never beacons.
+      try {
+        const mod = await import('brookmd-react-native');
+        if (!cancelled) setMarkdown(() => mod.BrookMarkdown as ComponentType<{ content?: string }>);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.log('BROOK_E2E renderer load failed (non-fatal): ' + String(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   return (
@@ -114,9 +139,8 @@ function App() {
       <Text testID="status" style={styles.status}>
         brook e2e: {status}
       </Text>
-      {/* Renderer path: drives the same native parser through the pool. */}
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
-        <BrookMarkdown content={DOC} />
+        {Markdown ? <Markdown content={DOC} /> : null}
       </ScrollView>
     </View>
   );

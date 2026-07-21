@@ -2,10 +2,13 @@
 // its two native methods (implemented in cpp-adapter.cpp) hand the JSI runtime +
 // call-invoker to the C++ installer, which registers the Rust JSI host object.
 //
-// NOTE: `RNBrookMdReactNativeSpec` is produced by React Native codegen from
-// package.json's `codegenConfig.name` during the Gradle build. It does not exist
-// until codegen runs — this file will not compile standalone. Pending on-device
-// validation.
+// NOTE: `NativeBrookMdReactNativeSpec` is the abstract module base React Native
+// codegen generates (during the Gradle build) from the JS spec file
+// `src/NativeBrookMdReactNative.ts` — the class name is `Native<ModuleName>Spec`,
+// matching the iOS protocol `<NativeBrookMdReactNativeSpec>`. (It is NOT the
+// `codegenConfig.name`, `RNBrookMdReactNativeSpec`, which names the generated
+// C++/JNI codegen artifact, not this base class.) It does not exist until codegen
+// runs — this file will not compile standalone.
 package com.brookmdreactnative
 
 import com.facebook.react.bridge.ReactApplicationContext
@@ -14,7 +17,7 @@ import com.facebook.react.turbomodule.core.interfaces.CallInvokerHolder
 
 @ReactModule(name = BrookMdReactNativeModule.NAME)
 class BrookMdReactNativeModule(reactContext: ReactApplicationContext) :
-  RNBrookMdReactNativeSpec(reactContext) {
+  NativeBrookMdReactNativeSpec(reactContext) {
 
   override fun getName(): String = NAME
 
