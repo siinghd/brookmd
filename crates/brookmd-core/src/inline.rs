@@ -506,6 +506,21 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                 pos += 1;
             }
             _ => {
+                // Bulk plain-text fast path (non-tracking renders only, so the
+                // streaming-boundary bookkeeping below stays byte-exact): every
+                // byte outside INLINE_TEXT_STOP renders as itself, so a whole
+                // run of them is copied with one push_str instead of a per-byte
+                // match dispatch + escape call. `end` always lands on an ASCII
+                // stop byte or EOF, so the slice stays on a char boundary.
+                if !track && !INLINE_TEXT_STOP[b as usize] {
+                    let mut end = pos + 1;
+                    while end < bytes.len() && !INLINE_TEXT_STOP[bytes[end] as usize] {
+                        end += 1;
+                    }
+                    out.push_str(&input[pos..end]);
+                    pos = end;
+                    continue;
+                }
                 // Plain text. Non-whitespace bytes extend the inert run and may
                 // carry a synthetic boundary candidate (see `synth_boundary`);
                 // spaces/tabs never extend a run — space-bearing text gets its
@@ -712,6 +727,23 @@ fn trailing_spaces_before_nl(bytes: &[u8], start: usize) -> bool {
     }
     k - start >= 2 && k < bytes.len() && bytes[k] == b'\n'
 }
+
+/// Bytes that terminate a plain-text bulk run in `render_inline_core`: every
+/// match-arm dispatch byte (`\ & ` < ! [ $ * _ ~ space \n \r`), the bytes the
+/// catch-all arm HTML-escapes (`>` `"`), and the remaining bytes that make the
+/// NEXT position a GFM extended-autolink boundary (`\t` `(` — the others
+/// already dispatch). Everything else — including every non-ASCII byte —
+/// renders byte-for-byte as itself.
+static INLINE_TEXT_STOP: [bool; 256] = {
+    let mut t = [false; 256];
+    let stops = b"\t\n\r !\"$&(*<>[\\_`~";
+    let mut i = 0;
+    while i < stops.len() {
+        t[stops[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 fn push_escaped(b: u8, out: &mut String) {
     match b {

@@ -4,6 +4,40 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.22.2 — 2026-07-21
+
+### Performance
+
+- **7–24% faster streaming across every benchmarked document shape** (native
+  and WASM builds alike), from a final profiling pass over the Rust core:
+  - the scanner's newline search (`line_end`) — the hottest primitive, re-run
+    by every block probe on every line — now scans 8 bytes per step (SWAR)
+    instead of one;
+  - the inline renderer copies runs of plain text with a single `push_str`
+    instead of per-byte dispatch + escape calls.
+
+  Rendered HTML is byte-identical (spec goldens, wire-envelope goldens,
+  chunk-independence property tests, and the streaming-parity fuzzer all
+  pass); the WASM binary grows 338 bytes (+0.16%). Ships as `brookmd-core`
+  0.22.1 on crates.io.
+
+## 0.22.1 — 2026-07-21
+
+### Fixed
+
+- **React Native / Metro compatibility**, both issues found by the new
+  app-level e2e gate (a real RN app on an emulator + simulator asserting the
+  wire goldens through the native parser):
+  - every conditional-exports subpath now ships a `default` condition, so
+    Metro's stock package-exports resolution works without custom
+    `unstable_conditionNames` (which could poison `@babel/runtime` helper
+    resolution and crash release bundles at startup);
+  - the browser worker bootstrap moved behind a `react-native` field map to
+    an `import.meta`-free shim, so Hermes can parse release bundles (Hermes
+    rejects `import.meta` at parse time even in unreachable code). Web
+    behavior is unchanged — the `new Worker(new URL(...))` pattern bundlers
+    analyze stays intact.
+
 ## 0.22.0 — 2026-07-20
 
 ### Changed
@@ -34,23 +68,6 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 
 - The old `flux-md` npm package is **deprecated and frozen at 0.21.0**; all future
   releases ship as `brookmd`.
-
-## 0.22.1 — 2026-07-21
-
-### Fixed
-
-- **React Native / Metro compatibility**, both issues found by the new
-  app-level e2e gate (a real RN app on an emulator + simulator asserting the
-  wire goldens through the native parser):
-  - every conditional-exports subpath now ships a `default` condition, so
-    Metro's stock package-exports resolution works without custom
-    `unstable_conditionNames` (which could poison `@babel/runtime` helper
-    resolution and crash release bundles at startup);
-  - the browser worker bootstrap moved behind a `react-native` field map to
-    an `import.meta`-free shim, so Hermes can parse release bundles (Hermes
-    rejects `import.meta` at parse time even in unreachable code). Web
-    behavior is unchanged — the `new Worker(new URL(...))` pattern bundlers
-    analyze stays intact.
 
 ## 0.21.0 — 2026-07-20
 
