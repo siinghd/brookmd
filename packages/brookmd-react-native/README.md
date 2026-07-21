@@ -2,7 +2,7 @@
 
 Streaming markdown for React Native. The parser is [brookmd](https://github.com/siinghd/brookmd)'s Rust core, compiled to a native library and reached over JSI (uniffi / [uniffi-bindgen-react-native](https://jhugman.github.io/uniffi-bindgen-react-native/)) — no bridge round-trips, no WebView. Markdown is parsed incrementally as tokens arrive and rendered with real React Native primitives (`Text`, `View`, `ScrollView`, …).
 
-> **Status: pre-release (0.1.0).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The native device builds (Android `.so`, iOS XCFramework) are produced by CI (`.github/workflows/rn-build.yml`) and now exercised **app-level end-to-end** by [`.github/workflows/rn-e2e.yml`](../../.github/workflows/rn-e2e.yml): a real RN 0.86 app ([`examples/rn-e2e`](../../examples/rn-e2e)) consumes this package as a `file:` dependency, runs codegen in a real Gradle/CocoaPods build, links the CMake/JSI module against the Rust library, and calls the native parser from JS on an x86_64 Android emulator (KVM) / iOS simulator — asserting byte-identical wire. See [End-to-end validation](#end-to-end-validation). Until that gate is green on the target hardware, treat the native layer as a work in progress.
+> **Status: pre-release (0.1.0).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The native layer is validated **app-level end-to-end in CI** ([`.github/workflows/rn-e2e.yml`](../../.github/workflows/rn-e2e.yml), green on both platforms): a real RN 0.86 app ([`examples/rn-e2e`](../../examples/rn-e2e)) consumes this package, runs codegen in a real Gradle/CocoaPods release build, links the CMake/JSI module against the Rust library, and streams the wire goldens through the native parser on an x86_64 Android emulator (KVM) and an iOS simulator — asserting byte-identical output. See [End-to-end validation](#end-to-end-validation). What CI cannot cover: behavior on physical devices. Pre-1.0, APIs may still move.
 
 New architecture only: React Native **≥ 0.76** with the new architecture (TurboModules) enabled.
 
@@ -14,17 +14,13 @@ npm install brookmd-react-native
 cd ios && pod install
 ```
 
-The generated JSI bindings import the ubrn runtime as `@ubjs/core`. Add a Babel alias so Metro resolves it to the installed `uniffi-bindgen-react-native` package:
+Two [uniffi-bindgen-react-native](https://jhugman.github.io/uniffi-bindgen-react-native/) packages are involved: `@ubjs/core` (the JS runtime the generated bindings import) ships as a regular dependency of this package, and `uniffi-bindgen-react-native` itself (the C++ headers the native build compiles against) is a peer dependency your app must install, version-matched:
 
-```js
-// babel.config.js
-module.exports = {
-  presets: ["module:@react-native/babel-preset"],
-  plugins: [
-    ["module-resolver", { alias: { "@ubjs/core": "uniffi-bindgen-react-native" } }],
-  ],
-};
+```sh
+npm install uniffi-bindgen-react-native@0.31.0-3
 ```
+
+No Babel or Metro configuration is required beyond React Native's defaults — this is exactly the setup the CI end-to-end app builds with.
 
 ## Quick start
 
@@ -140,9 +136,9 @@ npm run build:ios       # → ios/BrookMdFfi.xcframework                        
 
 ## End-to-end validation
 
-[`examples/rn-e2e`](../../examples/rn-e2e) is a minimal RN 0.86 app fixture that consumes this package (and its `brookmd` dependency) as `file:` deps — the realistic consumer path. On mount it streams the wire-golden chunks through the on-device `BrookSession` and asserts every patch is byte-identical to the Rust core's goldens (`examples/rn-e2e/golden.ts`, copied from `crates/brookmd-ffi/tests/wire_golden.rs`), then renders the same content through `<BrookMarkdown>`. It logs `BROOK_E2E_OK` on success. `.github/workflows/rn-e2e.yml` runs it on an Android emulator (the strong, must-pass gate — `console.log` reaches logcat) and an iOS simulator (marker capture best-effort; hard-fails on a build/link failure, crash, or reported failure).
+[`examples/rn-e2e`](../../examples/rn-e2e) is a minimal RN 0.86 app fixture that consumes this package (and its `brookmd` dependency) as `file:` deps — the realistic consumer path. On mount it streams the wire-golden chunks through the on-device `BrookSession` and asserts every patch is byte-identical to the Rust core's goldens (`examples/rn-e2e/golden.ts`, copied from `crates/brookmd-ffi/tests/wire_golden.rs`), then renders the same content through `<BrookMarkdown>`. On success (or failure) it reports the verdict over an HTTP beacon to the CI host — a deterministic gate that doesn't depend on log capture. `.github/workflows/rn-e2e.yml` runs it as a **must-pass release build on both platforms**: an x86_64 Android emulator (KVM) and an iOS simulator.
 
-The fixture resolves the ubrn runtime the generated bindings import (`@ubjs/core`) by installing it directly (`@ubjs/core@0.31.0-3`, pinned to the `uniffi-bindgen-react-native` version) rather than the Babel `module-resolver` alias shown under [Install](#install) — either approach works. Its `metro.config.js` wires the monorepo `file:` deps (watchFolders, `nodeModulesPaths`, and a forced single copy of `react`/`react-native`).
+The fixture installs the ubrn runtime the generated bindings import directly (`@ubjs/core@0.31.0-3`, pinned to the `uniffi-bindgen-react-native` version) — the same resolution a registry consumer gets from this package's dependency on it. Its `metro.config.js` wires the monorepo `file:` deps (watchFolders, `nodeModulesPaths`, and a forced single copy of `react`/`react-native`); none of that is needed outside the monorepo.
 
 Run it locally (JS resolution — the highest-value off-device check; no Android SDK / Xcode needed):
 
