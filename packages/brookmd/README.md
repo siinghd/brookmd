@@ -4,7 +4,7 @@ Zero-dep streaming markdown for the browser. Rust→WASM core, one Web Worker pe
 
 Drop in a streaming-aware renderer — **React, Vue, Svelte, Solid, a framework-agnostic `<brook-markdown>` Web Component, or the vanilla DOM mount** — wire each LLM stream to a `BrookClient`, and the markdown renders incrementally off the main thread, block by block, with stable identities so unchanged blocks never re-reconcile.
 
-Parsing runs entirely **off the main thread** — each stream gets its own pooled Web Worker, so many concurrent LLM responses render without contending for the UI thread. On each token the parser re-parses only the **active tail**, not the whole document, and heavy renderers (syntax highlighting, math, mermaid) are **deferred until a block closes**. The result is low retained memory and a main thread that stays responsive while streaming. See [the live demo](https://md.hsingh.app/).
+Parsing runs entirely **off the main thread** — each stream gets its own pooled Web Worker, so many concurrent LLM responses render without contending for the UI thread. On each token the parser re-parses only the **active tail**, not the whole document; patches cross the worker boundary as **verified splices** (not full re-sends, so emitted bytes stay O(n) even for one giant growing block); and heavy renderers (syntax highlighting, math, mermaid) are **deferred until a block closes**. The result is low retained memory and a main thread that stays responsive while streaming. See [the live demo](https://md.hsingh.app/).
 
 > **Beyond the browser:** the same Rust core also powers experimental React
 > Native, Swift (iOS/macOS), Kotlin/Android, Flutter, and C-ABI bindings —
@@ -1043,6 +1043,26 @@ the regression that prompted each cache; the canonical bench is
 Headline numbers are not durable across machines, but the curve is: chunk size
 shouldn't change the order of magnitude for any shape. If you hit one that does,
 file an issue with the input and chunking — that's the next bench scenario.
+
+### Wire delta mode (automatic)
+
+Parse work was already O(n), but until 0.23.0 the **bytes crossing the
+worker→main-thread boundary** were not: every append re-emitted the open
+block's full HTML, O(n²/chunk) total for one block that grows across many
+chunks (a long streaming list, a big code fence). Since 0.23.0 the parser
+emits **verified splices** instead — `{keep, append}` deltas against the
+block's previous emit, established by byte comparison so reconstruction is
+byte-exact by construction — and the client reassembles full blocks before
+anything else sees them. Zero API change; `Block.html` is always complete.
+
+Measured at a 200 KB document in 256-byte chunks, a streaming list's total
+patch traffic drops from **119.6 MB to 0.78 MB (153× less, 2.8× faster
+end-to-end)**; an unclosed code fence from **80.1 MB to 0.58 MB (137×, 4.9×
+faster)**. Fast-committing prose is unchanged. Emitted bytes are now gated
+linear in CI alongside the parse-work counters. Raw-boundary consumers (the
+WASM `BrookParser`, native bindings, C ABI) keep byte-identical v1 wire by
+default and can opt in with `setWireDelta(true)` — see
+[`WIRE.md` §11](https://github.com/siinghd/brookmd/blob/main/crates/brookmd-core/WIRE.md).
 
 ## Security
 

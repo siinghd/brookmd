@@ -2,7 +2,7 @@
 
 Streaming markdown for React Native. The parser is [brookmd](https://github.com/siinghd/brookmd)'s Rust core, compiled to a native library and reached over JSI (uniffi / [uniffi-bindgen-react-native](https://jhugman.github.io/uniffi-bindgen-react-native/)) — no bridge round-trips, no WebView. Markdown is parsed incrementally as tokens arrive and rendered with real React Native primitives (`Text`, `View`, `ScrollView`, …).
 
-> **Status: pre-release (0.1.0).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The native layer is validated **app-level end-to-end in CI** ([`.github/workflows/rn-e2e.yml`](../../.github/workflows/rn-e2e.yml), green on both platforms): a real RN 0.86 app ([`examples/rn-e2e`](../../examples/rn-e2e)) consumes this package, runs codegen in a real Gradle/CocoaPods release build, links the CMake/JSI module against the Rust library, and streams the wire goldens through the native parser on an x86_64 Android emulator (KVM) and an iOS simulator — asserting byte-identical output. See [End-to-end validation](#end-to-end-validation). What CI cannot cover: behavior on physical devices. Pre-1.0, APIs may still move.
+> **Status: pre-release (0.1.2).** The JavaScript layer — the streaming shim, the client, and the renderer — is covered by host tests that drive the real parser. The native layer is validated **app-level end-to-end in CI** ([`.github/workflows/rn-e2e.yml`](../../.github/workflows/rn-e2e.yml), green on both platforms): a real RN 0.86 app ([`examples/rn-e2e`](../../examples/rn-e2e)) consumes this package, runs codegen in a real Gradle/CocoaPods release build, links the CMake/JSI module against the Rust library, and streams the wire goldens through the native parser on an x86_64 Android emulator (KVM) and an iOS simulator — asserting byte-identical output. See [End-to-end validation](#end-to-end-validation). What CI cannot cover: behavior on physical devices. Pre-1.0, APIs may still move.
 
 New architecture only: React Native **≥ 0.76** with the new architecture (TurboModules) enabled.
 
@@ -115,6 +115,8 @@ BrookClient ──▶ createNativePool ──▶ NativeWorker (in-process)
 ```
 
 The browser build runs each stream's parser in a Web Worker; React Native has no Worker, so `NativeWorker` wraps brookmd's `WorkerCore` (its message/readiness state machine) as a synchronous in-process transport. The `append`/`finalize` calls return the exact JSON wire strings documented in [`crates/brookmd-core/WIRE.md`](../../crates/brookmd-core/WIRE.md) — byte-identical to the WASM boundary — so a native binding decodes the same bytes the JavaScript renderer does.
+
+The session enables the contract-v1.2.0 **wire delta mode** (WIRE.md §11): a block that keeps growing crosses the JSI boundary as a verified `{keep, append}` splice instead of a full re-send, so total emitted bytes stay O(n) even for one giant streaming list or code fence. brookmd's shared client reconstructs full blocks before anything renders — invisible to your code. Raw `BrookSession` consumers keep byte-identical v1 wire unless they opt in via `BrookConfig`.
 
 The renderer is dependency-injected: `createComponents(primitives, theme)` maps every HTML tag the core emits onto an RN primitive, respecting RN's nesting rules (text-bearing tags → `Text`, structural tags → `View`/`ScrollView`, inter-tag whitespace dropped). No tag ever falls through to a raw HTML string.
 

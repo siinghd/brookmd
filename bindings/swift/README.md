@@ -3,15 +3,18 @@
 First-party Swift bindings for the brookmd streaming Markdown parser, generated
 by [uniffi](https://mozilla.github.io/uniffi-rs/) from the `crates/brookmd-ffi`
 crate. `BrookSession` streams Markdown and returns the JSON **wire strings**
-defined in `crates/brookmd-core/WIRE.md` (contract v1.1.0) — byte-identical to
-the WASM/JS boundary.
+defined in `crates/brookmd-core/WIRE.md` (contract v1.2.0) — byte-identical to
+the WASM/JS boundary. Setting `wireDelta: true` on `BrookConfig` opts into the
+v1.2.0 **wire delta mode** (active re-emits arrive as verified `html_delta`
+splices, O(n) total emitted bytes — WIRE.md §11); the default keeps v1 bytes.
 
 > **Status: EXPERIMENTAL.** The bindings compile and pass the wire-golden
 > XCTest suite in CI (`bindings-build.yml`, macOS runner) against a locally
 > built XCFramework, and the same suite runs on an **iOS Simulator** via
 > `xcodebuild test` in CI (`device-validate.yml`, ios-simulator slice). What
-> remains truly device-only is physical-hardware behavior and RN app-level
-> integration. Not yet published.
+> remains truly device-only is physical-hardware behavior. Not yet published to
+> a registry; prebuilt XCFramework zips (SPM `binaryTarget`-ready, with
+> checksums) ship on each [GitHub release](https://github.com/siinghd/brookmd/releases).
 
 ## What's here
 

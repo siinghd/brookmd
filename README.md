@@ -30,7 +30,9 @@ import { BrookMarkdown } from "brookmd/react";
 ## Highlights
 
 - **Off the main thread** — a pooled Web Worker per stream; the parser re-parses
-  only the active tail on each token, and heavy renderers (highlighting, math,
+  only the active tail on each token, patches cross the worker boundary as
+  verified splices (emitted bytes stay O(n) even for one giant growing block —
+  wire delta mode, contract v1.2.0), and heavy renderers (highlighting, math,
   mermaid) defer until a block closes.
 - **SSR-safe** — imports and `renderToString` cleanly on the server across React,
   Vue, Solid, and Svelte; the worker is created lazily on the client.
@@ -57,7 +59,7 @@ per-stream config, framework bindings, security model, and scaling helpers
 | [`crates/brookmd-core`](crates/brookmd-core) | The Rust parser/renderer, published to [crates.io](https://crates.io/crates/brookmd-core); compiled to WASM for the npm package. Emits the versioned JSON [wire contract](crates/brookmd-core/WIRE.md). |
 | [`crates/brookmd-ffi`](crates/brookmd-ffi) | uniffi wrapper over the core for native targets (React Native, Swift, Kotlin). |
 | [`crates/brookmd-cabi`](crates/brookmd-cabi) | Plain C-ABI wrapper (Dart/Flutter and any C FFI consumer). |
-| [`packages/brookmd-react-native`](packages/brookmd-react-native) | React Native renderer over the native core (experimental — not yet on npm). |
+| [`packages/brookmd-react-native`](packages/brookmd-react-native) | React Native renderer over the native core, published as [`brookmd-react-native`](https://www.npmjs.com/package/brookmd-react-native) (experimental). |
 | [`packages/brookmd-flutter`](packages/brookmd-flutter) | Flutter/Dart scaffold over the C ABI (experimental). |
 | [`bindings/kotlin`](bindings/kotlin) | Kotlin/Android bindings (experimental). |
 | [`bindings/swift`](bindings/swift) | Swift package (iOS + macOS) bindings (experimental). |
@@ -73,15 +75,16 @@ pin every binding to byte-identical output.
 |----------|-----|--------|
 | Browser / Node / SSR | [`brookmd`](https://www.npmjs.com/package/brookmd) on npm (React, Vue, Svelte, Solid, Web Component, DOM, server) | **Stable** — published |
 | Rust | [`brookmd-core`](https://crates.io/crates/brookmd-core) on crates.io | **Stable** — published |
-| React Native (iOS + Android) | [`packages/brookmd-react-native`](packages/brookmd-react-native) — native parser via JSI, RN renderer | Experimental — CI-built, pending device validation; not yet on npm |
-| iOS / macOS (Swift) | [`bindings/swift`](bindings/swift) — SPM package `BrookMd` over an XCFramework | Experimental — CI-built and host-tested |
-| Android (Kotlin) | [`bindings/kotlin`](bindings/kotlin) — Android library + JVM-tested uniffi bindings | Experimental — CI-built and host-tested |
+| React Native (iOS + Android) | [`brookmd-react-native`](https://www.npmjs.com/package/brookmd-react-native) on npm — native parser via JSI, RN renderer | Experimental — published; app-level e2e on an Android emulator + iOS simulator in CI; physical-device validation pending |
+| iOS / macOS (Swift) | [`bindings/swift`](bindings/swift) — SPM package `BrookMd` over an XCFramework | Experimental — CI-built; goldens pass on an iOS Simulator; not yet on a registry |
+| Android (Kotlin) | [`bindings/kotlin`](bindings/kotlin) — Android library + uniffi bindings | Experimental — CI-built; instrumented goldens pass on an Android emulator; not yet on Maven |
 | Flutter / Dart | [`packages/brookmd-flutter`](packages/brookmd-flutter) over the C ABI | Experimental — scaffold |
 | Anything with a C FFI | [`crates/brookmd-cabi`](crates/brookmd-cabi) + `include/brook_md.h` | Experimental — tested on host |
 
-Native bindings ship prebuilt from CI (Android `.so` per ABI, Apple
-XCFrameworks with iOS + macOS slices); nothing native is published to a
-package registry yet.
+Swift/Kotlin/C-ABI bindings ship prebuilt from CI as checksummed
+[release assets](https://github.com/siinghd/brookmd/releases) (Android `.so`
+per ABI, Apple XCFrameworks with iOS + macOS slices); the React Native package
+vendors its binaries in the npm tarball.
 
 ## Development
 

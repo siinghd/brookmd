@@ -4,6 +4,15 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.23.1 — 2026-07-21
+
+### Changed
+
+- Documentation only: the README now covers wire delta mode (the 0.23.0
+  headline) — measured numbers, the automatic worker↔client behavior, and the
+  raw-boundary opt-in — plus refreshed platform-status notes across the
+  repository. No code changes; behavior identical to 0.23.0.
+
 ## 0.23.0 — 2026-07-21
 
 ### Added

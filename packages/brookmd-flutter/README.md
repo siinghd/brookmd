@@ -21,7 +21,7 @@ parser. They wrap the plain C ABI in [`crates/brookmd-cabi`](../../crates/brookm
 - `BrookConfig` — per-stream options (GFM autolinks/alerts default on, everything
   else off), serialized to the JSON config the C ABI expects.
 - `BrookSession.wireVersion()` — the wire-contract version string (currently
-  `1.0.0`).
+  `1.2.0`).
 
 `append`/`finalize` return the **JSON wire strings** defined by
 [`WIRE.md`](../../crates/brookmd-core/WIRE.md) — byte-identical to the WebAssembly/JS
