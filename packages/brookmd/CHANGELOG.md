@@ -35,6 +35,23 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 - The old `flux-md` npm package is **deprecated and frozen at 0.21.0**; all future
   releases ship as `brookmd`.
 
+## 0.22.1 — 2026-07-21
+
+### Fixed
+
+- **React Native / Metro compatibility**, both issues found by the new
+  app-level e2e gate (a real RN app on an emulator + simulator asserting the
+  wire goldens through the native parser):
+  - every conditional-exports subpath now ships a `default` condition, so
+    Metro's stock package-exports resolution works without custom
+    `unstable_conditionNames` (which could poison `@babel/runtime` helper
+    resolution and crash release bundles at startup);
+  - the browser worker bootstrap moved behind a `react-native` field map to
+    an `import.meta`-free shim, so Hermes can parse release bundles (Hermes
+    rejects `import.meta` at parse time even in unreachable code). Web
+    behavior is unchanged — the `new Worker(new URL(...))` pattern bundlers
+    analyze stays intact.
+
 ## 0.21.0 — 2026-07-20
 
 ### Added
