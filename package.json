@@ -2,7 +2,10 @@
   "name": "brookmd-workspace",
   "private": true,
   "version": "0.20.0",
-  "workspaces": ["packages/*", "web"],
+  "workspaces": [
+    "packages/*",
+    "web"
+  ],
   "scripts": {
     "build:wasm": "cd crates/brookmd-core && RUSTUP_TOOLCHAIN=nightly CARGO_UNSTABLE_BUILD_STD=std,panic_abort RUSTFLAGS='-Zunstable-options -Cpanic=immediate-abort -C link-arg=-zstack-size=262144' wasm-pack build --target web --release --out-dir ../../packages/brookmd/src/wasm && rm -f ../../packages/brookmd/src/wasm/.gitignore ../../packages/brookmd/src/wasm/package.json",
     "build:wasm:stable": "cd crates/brookmd-core && RUSTFLAGS='-C link-arg=-zstack-size=262144' wasm-pack build --target web --release --out-dir ../../packages/brookmd/src/wasm && rm -f ../../packages/brookmd/src/wasm/.gitignore ../../packages/brookmd/src/wasm/package.json",
@@ -12,7 +15,6 @@
     "test:components": "cd packages/brookmd && bun test",
     "build:web": "cd web && bun run build",
     "deploy": "bun run build:wasm && bun run build:web && sudo rm -rf /var/www/md.hsingh.app/* && sudo cp -r web/dist/. /var/www/md.hsingh.app/ && sudo chown -R caddy:caddy /var/www/md.hsingh.app && echo deployed",
-    "smoke": "cd web && URL=https://md.hsingh.app/ node smoke.mjs",
-    "smoke:mem": "cd web && URL=https://md.hsingh.app/ node smoke-mempanel.mjs"
+    "smoke": "cd web && node data-studio.smoke.mjs"
   }
 }
