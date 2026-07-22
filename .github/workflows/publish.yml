@@ -99,9 +99,14 @@ jobs:
           npm pack --pack-destination "$dest" >/dev/null 2>&1
           tarball="$(echo "$dest"/*.tgz)"
           test -f "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
-          tar -tzf "$tarball" | grep -q '/dist/wasm/brook_md_core_bg\.wasm$' \
+          # List the tarball ONCE into a file, then query the file — piping tar
+          # into `grep -q`/`awk … exit` under pipefail SIGPIPEs tar on large
+          # listings (bit the RN publish workflow; latent here).
+          listing="$dest/listing.txt"
+          tar -tzvf "$tarball" > "$listing"
+          grep -q '/dist/wasm/brook_md_core_bg\.wasm$' "$listing" \
             || { echo "::error::publish tarball is missing dist/wasm/brook_md_core_bg.wasm"; exit 1; }
-          size=$(tar -tzvf "$tarball" | awk '/\/dist\/wasm\/brook_md_core_bg\.wasm$/ { print $3; exit }')
+          size=$(awk '/\/dist\/wasm\/brook_md_core_bg\.wasm$/ { print $3; exit }' "$listing")
           test "${size:-0}" -gt 0 || { echo "::error::WASM artifact is present but empty"; exit 1; }
           echo "OK: tarball ships WASM (${size} bytes)"
           rm -rf "$dest"

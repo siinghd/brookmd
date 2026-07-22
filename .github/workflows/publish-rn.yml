@@ -152,16 +152,21 @@ jobs:
           npm pack --pack-destination "$dest" >/dev/null 2>&1
           tarball="$(echo "$dest"/*.tgz)"
           test -f "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
-          entries="$(tar -tzf "$tarball")"
-          echo "$entries" | grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64/libbrook_md_ffi\.a$' \
+          # List the tarball ONCE into a file, then query the file. Piping tar
+          # into `grep -q`/`awk … exit` under pipefail SIGPIPEs tar on a listing
+          # this large ("tar: stdout: write error") and fails the step even when
+          # the check matched.
+          listing="$dest/listing.txt"
+          tar -tzvf "$tarball" > "$listing"
+          grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64/libbrook_md_ffi\.a$' "$listing" \
             || { echo "::error::tarball is missing the XCFramework device lib (ios-arm64/libbrook_md_ffi.a)"; exit 1; }
-          echo "$entries" | grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64_x86_64-simulator/libbrook_md_ffi\.a$' \
+          grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64_x86_64-simulator/libbrook_md_ffi\.a$' "$listing" \
             || { echo "::error::tarball is missing the XCFramework simulator lib (ios-arm64_x86_64-simulator/libbrook_md_ffi.a)"; exit 1; }
-          echo "$entries" | grep -q '/android/src/main/jniLibs/arm64-v8a/libbrook_md_ffi\.so$' \
+          grep -q '/android/src/main/jniLibs/arm64-v8a/libbrook_md_ffi\.so$' "$listing" \
             || { echo "::error::tarball is missing android arm64-v8a/libbrook_md_ffi.so"; exit 1; }
-          so_size=$(tar -tzvf "$tarball" | awk '/\/android\/src\/main\/jniLibs\/arm64-v8a\/libbrook_md_ffi\.so$/ { print $3; exit }')
+          so_size=$(awk '/\/android\/src\/main\/jniLibs\/arm64-v8a\/libbrook_md_ffi\.so$/ { print $3; exit }' "$listing")
           test "${so_size:-0}" -gt 0 || { echo "::error::android arm64-v8a/libbrook_md_ffi.so is present but empty"; exit 1; }
-          a_size=$(tar -tzvf "$tarball" | awk '/\/ios\/BrookMdFfi\.xcframework\/ios-arm64\/libbrook_md_ffi\.a$/ { print $3; exit }')
+          a_size=$(awk '/\/ios\/BrookMdFfi\.xcframework\/ios-arm64\/libbrook_md_ffi\.a$/ { print $3; exit }' "$listing")
           test "${a_size:-0}" -gt 0 || { echo "::error::XCFramework device lib is present but empty"; exit 1; }
           echo "OK: tarball ships XCFramework device lib (${a_size} B) + android arm64-v8a .so (${so_size} B)"
           rm -rf "$dest"
