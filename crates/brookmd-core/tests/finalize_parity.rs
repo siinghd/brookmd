@@ -47,6 +47,37 @@ fn assert_final_parity(md: &str) {
     assert_eq!(streamed, one, "streamed finalize != one-shot finalize for {md:?}");
 }
 
+/// Stream `md` in fixed-size *character* chunks (mirroring the fuzz target's
+/// chunk-independence check), then finalize.
+fn streamed_final_chunk(md: &str, chunk: usize) -> String {
+    let chars: Vec<char> = md.chars().collect();
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    let mut buf = String::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        buf.clear();
+        for _ in 0..chunk.max(1) {
+            if i < chars.len() {
+                buf.push(chars[i]);
+                i += 1;
+            }
+        }
+        p.append(&buf);
+    }
+    p.finalize();
+    collect(&p)
+}
+
+/// Finalized output must be identical at every chunk split (the exact set the
+/// parity fuzzer uses).
+fn assert_final_parity_all_chunks(md: &str) {
+    let one = one_shot_final(md);
+    for chunk in [1usize, 2, 3, 7, 64] {
+        let streamed = streamed_final_chunk(md, chunk);
+        assert_eq!(streamed, one, "streamed(chunk={chunk}) != one-shot for {md:?}");
+    }
+}
+
 #[test]
 fn lazy_continuation_after_transient_heading_marker() {
     // At buffer "...\n#" the lone '#' is a valid (empty) ATX heading and
@@ -74,6 +105,29 @@ fn lazy_continuation_after_transient_list_marker() {
     assert_final_parity("- First point\n*important* note\n");
     assert_final_parity("- First point\n*important* note");
     assert_final_parity("- a\n-not a bullet\n");
+}
+
+/// A first line made ENTIRELY of non-ASCII Unicode whitespace (form feed
+/// U+000C, vertical tab U+000B, NBSP U+00A0, …) is NOT a CommonMark blank line
+/// (only space/tab count), so it opens a paragraph that a following line lazily
+/// continues. The streaming premature-commit guard used `str::trim` (Unicode-
+/// aware) to test "previous line non-blank", so it wrongly saw such a line as
+/// blank, committed the paragraph before the transient thematic break
+/// (`-- -`) resolved, and could not merge the lazy continuation back — the
+/// streamed finalize permanently diverged (nightly parity-fuzz catch,
+/// 2026-07-22). The final line here (`-- - @`) is a real lazy continuation:
+/// it looks like a thematic break at prefix `-- -` but the `@` dissolves it.
+#[test]
+fn lazy_continuation_after_unicode_whitespace_first_line() {
+    // The exact minimized fuzz artifact: form feed, then a line that transiently
+    // scans as a thematic break before completing into a lazy continuation.
+    assert_final_parity_all_chunks("\u{c}\n-- - @");
+    // Vertical tab has the same non-ASCII-whitespace shape.
+    assert_final_parity_all_chunks("\u{b}\n-- - @");
+    // A no-break space (another `char::is_whitespace` member) too.
+    assert_final_parity_all_chunks("\u{a0}\n-- - @");
+    // With trailing newline, and mixed with an ASCII-blank cousin as a guard.
+    assert_final_parity_all_chunks("\u{c}\n-- - @\n");
 }
 
 #[test]

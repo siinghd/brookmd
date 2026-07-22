@@ -2316,7 +2316,13 @@ impl StreamParser {
         let prev_line_nonblank = final_line_start > 0 && {
             let before = &tail[..final_line_start - 1];
             let prev_start = before.rfind('\n').map_or(0, |i| i + 1);
-            !before[prev_start..].trim().is_empty()
+            // CommonMark blank is ASCII-only (space/tab); `str::trim` is
+            // Unicode-aware and would treat a line of only form feed (U+000C)
+            // or vertical tab (U+000B) as blank, prematurely committing a
+            // paragraph the one-shot parse keeps open for a lazy continuation.
+            !before[prev_start..]
+                .bytes()
+                .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
         };
         let to_commit = if produced.is_empty() {
             0
