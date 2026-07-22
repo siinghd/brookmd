@@ -1,0 +1,207 @@
+name: Publish brookmd-react-native to npm
+
+# Release automation for the React Native package. It VENDORS prebuilt native
+# binaries in the npm tarball (ios/BrookMdFfi.xcframework + android jniLibs/*.so),
+# so a release must rebuild them from the current Rust core before publishing —
+# this workflow does exactly that, then gates on the host tests and publishes via
+# OIDC TRUSTED PUBLISHING — no NPM_TOKEN secret, ever.
+#
+# RN releases are decoupled from the core `brookmd` package: this triggers on
+# `rn-v*` tags (e.g. `rn-v0.1.3`), not the `v*` tags that drive publish.yml.
+#
+# ── ONE-TIME SETUP (npmjs.com) ──────────────────────────────────────────────
+# On npmjs.com → the `brookmd-react-native` package → Settings → Trusted
+# Publishers → add a GitHub Actions publisher:
+#     Organization or user: siinghd
+#     Repository:           brookmd
+#     Workflow filename:    publish-rn.yml     (filename only, with .yml)
+#     Allowed actions:      npm publish
+# After that, every `git tag rn-vX.Y.Z && git push --tags` publishes automatically.
+# No token is generated, stored, or pasted — the publish job authenticates with a
+# short-lived GitHub OIDC token (the `id-token: write` permission below), and npm
+# generates SLSA provenance automatically.
+on:
+  push:
+    tags: ["rn-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + stage + test but do not publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Cross-compile the brookmd-ffi crate for the Android device ABIs and stage each
+  # .so into jniLibs/<abi>/ — identical recipe to rn-build.yml's `android` job.
+  android:
+    name: android (.so per ABI)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + Android targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
+
+      # Hosted ubuntu runners ship an Android NDK; point the build at the latest.
+      - name: Resolve NDK
+        run: echo "ANDROID_NDK_HOME=${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}" >> "$GITHUB_ENV"
+
+      - name: Build device .so for all ABIs
+        working-directory: packages/brookmd-react-native
+        run: bash scripts/build-android.sh
+
+      - name: Upload jniLibs
+        uses: actions/upload-artifact@v4
+        with:
+          name: brookmd-ffi-android-jniLibs
+          path: packages/brookmd-react-native/android/src/main/jniLibs/**/*.so
+          if-no-files-found: error
+
+  # Build the brookmd-ffi crate for iOS device + simulator and assemble the
+  # XCFramework the podspec vendors — identical recipe to rn-build.yml's `ios` job.
+  ios:
+    name: ios (XCFramework)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + iOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Build XCFramework (device + simulator)
+        working-directory: packages/brookmd-react-native
+        run: bash scripts/build-ios.sh
+
+      - name: Upload XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: brookmd-ffi-ios-xcframework
+          path: packages/brookmd-react-native/ios/BrookMdFfi.xcframework
+          if-no-files-found: error
+
+  publish:
+    name: Stage binaries, gate, publish (OIDC trusted publishing + provenance)
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC: lets npm authenticate to the registry + attach provenance
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --locked || curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          # Trusted publishing requires Node >= 22.14.0 and npm >= 11.5.1.
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+      - name: Upgrade npm to a trusted-publishing-capable version (>= 11.5.1)
+        run: |
+          npm install -g npm@latest
+          npm --version
+      - run: bun install --frozen-lockfile
+
+      # The RN host tests drive brookmd's real compiled WASM parser; build it and
+      # brookmd's dist first (exactly as rn-build.yml's `js` job does) so the
+      # streaming-parity suite runs rather than skips.
+      - name: Build brookmd WASM (stable toolchain)
+        run: bun run build:wasm:stable
+      - name: Build brookmd dist
+        working-directory: packages/brookmd
+        run: node scripts/build.mjs
+
+      # Pull the device binaries the android/ios jobs built straight into the exact
+      # paths the npm tarball vendors them from. The android artifact holds the ABI
+      # dirs (arm64-v8a/…, armeabi-v7a/…, x86_64/…) at its root, so it restores into
+      # jniLibs/; the ios artifact holds the XCFramework's contents (Info.plist +
+      # slice dirs) at its root, so it restores into ios/BrookMdFfi.xcframework/.
+      - name: Download android jniLibs
+        uses: actions/download-artifact@v4
+        with:
+          name: brookmd-ffi-android-jniLibs
+          path: packages/brookmd-react-native/android/src/main/jniLibs
+      - name: Download iOS XCFramework
+        uses: actions/download-artifact@v4
+        with:
+          name: brookmd-ffi-ios-xcframework
+          path: packages/brookmd-react-native/ios/BrookMdFfi.xcframework
+
+      # Tripwire against a binary-less publish: pack the tarball and assert it ships
+      # both XCFramework static libs and (at least) the arm64-v8a Android .so, all
+      # non-empty. Pack into a clean temp dir and glob the tarball (don't parse
+      # npm's stdout, which varies by version).
+      - name: Assert the tarball ships the vendored native binaries
+        working-directory: packages/brookmd-react-native
+        run: |
+          set -euo pipefail
+          dest="$(mktemp -d)"
+          npm pack --pack-destination "$dest" >/dev/null 2>&1
+          tarball="$(echo "$dest"/*.tgz)"
+          test -f "$tarball" || { echo "::error::npm pack produced no tarball"; exit 1; }
+          entries="$(tar -tzf "$tarball")"
+          echo "$entries" | grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64/libbrook_md_ffi\.a$' \
+            || { echo "::error::tarball is missing the XCFramework device lib (ios-arm64/libbrook_md_ffi.a)"; exit 1; }
+          echo "$entries" | grep -q '/ios/BrookMdFfi\.xcframework/ios-arm64_x86_64-simulator/libbrook_md_ffi\.a$' \
+            || { echo "::error::tarball is missing the XCFramework simulator lib (ios-arm64_x86_64-simulator/libbrook_md_ffi.a)"; exit 1; }
+          echo "$entries" | grep -q '/android/src/main/jniLibs/arm64-v8a/libbrook_md_ffi\.so$' \
+            || { echo "::error::tarball is missing android arm64-v8a/libbrook_md_ffi.so"; exit 1; }
+          so_size=$(tar -tzvf "$tarball" | awk '/\/android\/src\/main\/jniLibs\/arm64-v8a\/libbrook_md_ffi\.so$/ { print $3; exit }')
+          test "${so_size:-0}" -gt 0 || { echo "::error::android arm64-v8a/libbrook_md_ffi.so is present but empty"; exit 1; }
+          a_size=$(tar -tzvf "$tarball" | awk '/\/ios\/BrookMdFfi\.xcframework\/ios-arm64\/libbrook_md_ffi\.a$/ { print $3; exit }')
+          test "${a_size:-0}" -gt 0 || { echo "::error::XCFramework device lib is present but empty"; exit 1; }
+          echo "OK: tarball ships XCFramework device lib (${a_size} B) + android arm64-v8a .so (${so_size} B)"
+          rm -rf "$dest"
+
+      # Gate the release on the package's own host checks (same ones rn-build.yml
+      # runs), so a tag can never ship a broken build.
+      - name: RN host tests (real parser)
+        working-directory: packages/brookmd-react-native
+        run: bun run test
+      - name: RN typecheck
+        working-directory: packages/brookmd-react-native
+        run: bun run typecheck
+
+      # Skip (green) for a dry-run or a tag whose version is already on npm, so
+      # re-running a tag is a safe no-op. Otherwise publish via OIDC. (Auth needs
+      # NO secret — see the one-time npmjs.com Trusted Publisher setup at the top.)
+      - name: Decide whether to publish
+        id: gate
+        working-directory: packages/brookmd-react-native
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ver="$(node -p "require('./package.json').version")"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::dry_run requested — skipping publish (build + checks ran)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if npm view "brookmd-react-native@${ver}" version >/dev/null 2>&1; then
+            echo "::notice::brookmd-react-native@${ver} is already published — skipping (no-op)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm (OIDC trusted publishing, automatic provenance)
+        if: ${{ steps.gate.outputs.publish == 'true' }}
+        working-directory: packages/brookmd-react-native
+        # No NODE_AUTH_TOKEN: npm >= 11.5.1 authenticates via the GitHub OIDC token
+        # (id-token: write) against the package's configured Trusted Publisher, and
+        # attaches SLSA provenance automatically. If this step errors with an auth
+        # failure, the Trusted Publisher hasn't been configured on npmjs.com yet
+        # (see the one-time setup block at the top of this file).
+        run: npm publish --access public
