@@ -1,0 +1,85 @@
+name: Publish brookmd-core to crates.io
+
+# Release automation for the Rust core, mirroring publish.yml (npm): push a tag
+# (vX.Y.Z) to gate on the test suite and publish to crates.io via TRUSTED
+# PUBLISHING — no long-lived CARGO_REGISTRY_TOKEN secret, ever.
+#
+# ── ONE-TIME SETUP (crates.io) ──────────────────────────────────────────────
+# On crates.io → the `brookmd-core` crate → Settings → Trusted Publishing → add
+# a GitHub Actions publisher:
+#     Repository owner:     siinghd
+#     Repository name:      brookmd
+#     Workflow filename:    publish-crate.yml   (filename only, with .yml)
+#     Environment:          (leave blank)
+# After that, every `git tag vX.Y.Z && git push --tags` publishes automatically.
+# The workflow exchanges a short-lived GitHub OIDC token (the `id-token: write`
+# permission below) for a 30-minute crates.io token via
+# rust-lang/crates-io-auth-action. Nothing is stored or pasted.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Verify only — build + test + package but do not publish"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC: exchanged for a short-lived crates.io publish token
+
+jobs:
+  publish:
+    name: Gate, package, publish (crates.io trusted publishing)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/brookmd-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/brookmd-core
+
+      # Gate the release on the core test suite (includes the CommonMark spec
+      # battery and streaming-parity pins), then prove the crate packages and
+      # compiles from the packaged sources alone.
+      - name: Rust core tests
+        run: cargo test
+      - name: Package verification (dry run)
+        run: cargo publish --dry-run
+
+      # Skip (green) for a dry-run or a tag whose version is already on
+      # crates.io, so re-running a tag is a safe no-op.
+      - name: Decide whether to publish
+        id: gate
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          ver="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "brookmd-core") | .version')"
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "::notice::dry_run requested — skipping publish (build + checks ran)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if curl -fsSL "https://crates.io/api/v1/crates/brookmd-core/${ver}" | jq -e '.version.num' >/dev/null 2>&1; then
+            echo "::notice::brookmd-core@${ver} is already on crates.io — skipping (no-op)."
+            echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate with crates.io (OIDC token exchange)
+        if: ${{ steps.gate.outputs.publish == 'true' }}
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        if: ${{ steps.gate.outputs.publish == 'true' }}
+        # If this step errors with an auth failure, the Trusted Publisher hasn't
+        # been configured on crates.io yet (see the one-time setup block at the
+        # top of this file).
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish

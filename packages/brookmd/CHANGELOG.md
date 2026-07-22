@@ -4,6 +4,21 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.23.2 — 2026-07-22
+
+### Fixed
+
+- **Streaming/one-shot parity: non-ASCII whitespace no longer blanks a line.**
+  The streaming premature-commit guard tested "previous line non-blank" with
+  Unicode-aware trimming, so a line consisting only of form feed (U+000C),
+  vertical tab (U+000B), NBSP, or other non-ASCII whitespace was treated as a
+  blank line. A paragraph opened by such a line could be committed early and a
+  later lazy continuation could never merge back — the streamed output
+  permanently diverged from the one-shot parse (nightly parity-fuzz catch,
+  input `\x0c\n-- - @`). The guard now uses the CommonMark blank-line
+  definition (ASCII space/tab only), matching the one-shot path; regression
+  tests pin the artifact and variants across chunk splits.
+
 ## 0.23.1 — 2026-07-21
 
 ### Changed
