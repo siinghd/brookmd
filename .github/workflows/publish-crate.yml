@@ -64,7 +64,10 @@ jobs:
             echo "::notice::dry_run requested — skipping publish (build + checks ran)."
             echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
-          if curl -fsSL "https://crates.io/api/v1/crates/brookmd-core/${ver}" | jq -e '.version.num' >/dev/null 2>&1; then
+          # crates.io rejects requests without an identifying User-Agent (403),
+          # so the default curl UA would make this check always miss and the
+          # skip path never fire (cargo publish then dies on "already exists").
+          if curl -fsSL -A "brookmd-release-gate (github.com/siinghd/brookmd)" "https://crates.io/api/v1/crates/brookmd-core/${ver}" | jq -e '.version.num' >/dev/null 2>&1; then
             echo "::notice::brookmd-core@${ver} is already on crates.io — skipping (no-op)."
             echo "publish=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
