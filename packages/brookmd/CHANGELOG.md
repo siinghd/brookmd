@@ -4,6 +4,43 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.24.0 — 2026-07-24
+
+### Added
+
+- **Worker load failures are now detected and self-heal.** A worker script
+  that fails to load (e.g. a stale hashed worker URL held by an already-open
+  tab after a redeploy) fires a DOM `error` event instead of ever posting a
+  message; previously nothing listened, so the client waited forever and the
+  container stayed permanently empty with no console output. The pool now
+  listens for `error`/`messageerror`, arms a per-worker boot deadline
+  (default 20s, configurable/disable-able via the `BrookPool` options), and
+  routes every fatal trigger — WASM init failure, load error, deserialization
+  error, deadline — through one idempotent failure path: pending waiters
+  reject, each affected client's `onError` fires, and the dead worker is
+  terminated and evicted so the pool capacity recovers.
+- **One-shot automatic recovery.** A client whose worker dies transiently
+  heals invisibly: the driven document accumulates in a recovery buffer (both
+  `setContent` and `append`/`pipeFrom` modes) and is re-fed once to a fresh
+  worker through the preserved-view swap path, so the rendered view never
+  blanks and in-flight chunks are folded in safely. Recovery re-arms only
+  when the caller advances the content, so a document that deterministically
+  crashes the parser surfaces an error after exactly one retry instead of
+  respawning workers. Opt out with `new BrookClient({ recovery: false })`
+  for memory-sensitive giant documents.
+- **`client.failed: Error | null`** — synchronous getter for terminal worker
+  failure (stays `null` through a successful invisible heal), for rendering a
+  degraded fallback.
+- **React hooks error surface.** `useBrookStream`'s `onError` now also
+  receives worker-level errors (with a `fatal` flag on the `Error`), and
+  `useBrookMarkdownString` gains an `onError` option; both default to
+  `console.error`.
+
+### Fixed
+
+- Fatally failed workers no longer leak their per-stream handler-map entries
+  in the pool.
+
 ## 0.23.2 — 2026-07-22
 
 ### Fixed
