@@ -555,7 +555,9 @@ class BrookClient {
     config?: ParserConfig;
     onError?: (err: { message: string; fatal?: boolean }) => void; // worker/parse + WASM-init errors
     onBlock?: (block: Block) => void;                 // fires once per block as it commits
+    recovery?: boolean;                               // auto-heal a transient worker death (default true)
   });
+  get failed(): Error | null;                       // terminal worker failure, else null (null through heals)
   append(chunk: string): void;                      // queue text for parsing
   pipeFrom(                                         // read → append → finalize
     src: ReadableStream<Uint8Array> | Response | AsyncIterable<string>,
@@ -590,6 +592,16 @@ Pass `onError` to be notified of worker/parse errors and a fatal WASM-init
 failure (`{ fatal: true }`); without it, errors are only `console.error`'d and a
 load failure surfaces as a rejected `whenReady()`. Pass `onBlock` to run a side
 effect each time a block commits (e.g. lazy-highlight a finished code block).
+
+A **transient worker death** heals invisibly by default: if a worker dies
+mid-stream (e.g. a stale hashed worker URL 404s after a redeploy), the client
+buffers the driven document, re-acquires a fresh worker, and re-feeds it once —
+the view stays on screen and `onError` does **not** fire. Only if the replacement
+also dies is the failure terminal (`onError` with `{ fatal: true }`, and
+`client.failed` becomes the `Error`; it is `null` while healthy and through a
+successful heal). Set `recovery: false` to disable the buffer and auto-recovery
+(a fatal death is then immediately terminal) — worth it for memory-sensitive,
+very large documents where retaining the full source is undesirable.
 
 #### Per-stream config
 

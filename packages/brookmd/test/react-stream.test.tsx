@@ -325,6 +325,94 @@ test("useBrookMarkdownString diffs a growing string into appends and finalizes w
   }
 });
 
+const firePatch = (worker: FakeWorker, streamId: number, id: number, html: string) =>
+  worker.fire({
+    type: "patch", streamId,
+    patch: JSON.stringify({
+      newly_committed: [{ id, kind: { type: "Paragraph" }, start: 0, end: 0, html, open: false, speculative: false }],
+      active: [],
+    }),
+    appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
+  });
+
+// FLAGSHIP integration: a transient worker death mid-stream heals invisibly —
+// the view stays on screen, patches keep flowing on the fresh worker, and the
+// caller's onError is NEVER called.
+test("useBrookStream heals a transient worker death mid-stream (no blank, no onError)", async () => {
+  const errors: Error[] = [];
+  let client: BrookClient | null = null;
+  function Probe({ stream }: { stream: AsyncIterable<string> }) {
+    client = useBrookStream(stream, { onError: (e) => errors.push(e) });
+    return createElement("div", null, "ok");
+  }
+  async function* gen() {
+    yield "# Title\n\nbody";
+  }
+  const { root } = await mount(createElement(Probe, { stream: gen() }));
+  await act(async () => {
+    await tick(); // pipeFrom appends the chunk + finalizes (buffers the doc)
+  });
+  const s1 = latestStream();
+  await act(async () => {
+    firePatch(s1.worker, s1.streamId, 1, "<p>body</p>"); // render content
+  });
+  expect(client!.getSnapshot().length).toBeGreaterThan(0);
+
+  // The worker dies — recovery re-feeds the buffered stream to a fresh worker.
+  await act(async () => {
+    s1.worker.fire({ type: "error", streamId: s1.streamId, message: "boom", fatal: true });
+    await Promise.resolve(); // let the recovery microtask acquire + re-drive
+  });
+  expect(client!.getSnapshot().length).toBeGreaterThan(0); // never blanked
+  expect(errors.length).toBe(0); // healed invisibly — onError not called
+  expect(client!.failed).toBeNull();
+
+  // The fresh worker keeps streaming the recovered document.
+  const s2 = latestStream();
+  expect(s2.worker).not.toBe(s1.worker);
+  await act(async () => {
+    firePatch(s2.worker, s2.streamId, 1, "<p>body more</p>");
+  });
+  expect(client!.getSnapshot().length).toBeGreaterThan(0);
+  await act(async () => {
+    root.unmount();
+  });
+});
+
+// A TERMINAL fatal (recovery re-feed's replacement also dies) DOES reach onError,
+// carrying the preserved `fatal` bit.
+test("a terminal worker fatal reaches useBrookStream's onError with the fatal flag set", async () => {
+  const errors: Array<Error & { fatal?: boolean }> = [];
+  function Probe({ stream }: { stream: AsyncIterable<string> }) {
+    useBrookStream(stream, { onError: (e) => errors.push(e) });
+    return createElement("div", null, "ok");
+  }
+  async function* gen() {
+    yield "hello";
+  }
+  const { root } = await mount(createElement(Probe, { stream: gen() }));
+  await act(async () => {
+    await tick();
+  });
+  // First fatal → transparent recovery (heals, no onError yet).
+  const s1 = latestStream();
+  await act(async () => {
+    s1.worker.fire({ type: "error", streamId: s1.streamId, message: "gone 1", fatal: true });
+    await Promise.resolve(); // recovery microtask acquires the replacement
+  });
+  expect(errors.length).toBe(0);
+  // The replacement ALSO dies → terminal → onError fires with the fatal bit.
+  const s2 = latestStream();
+  await act(async () => {
+    s2.worker.fire({ type: "error", streamId: s2.streamId, message: "gone 2", fatal: true });
+  });
+  expect(errors.length).toBe(1); // reported exactly once (not double via pipe catch)
+  expect(errors[0].fatal).toBe(true); // the bridge preserved the fatal bit
+  await act(async () => {
+    root.unmount();
+  });
+});
+
 test("useBrookMarkdownString: omitting `streaming` leaves it open; `streaming:false` finalizes", async () => {
   const finalizeSpy = spyOn(BrookClient.prototype, "finalize");
   try {

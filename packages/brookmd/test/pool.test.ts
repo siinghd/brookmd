@@ -4,31 +4,82 @@ import type { Block, FromWorker, ToWorker, WorkerLike } from "../src/types";
 
 // A synchronous fake worker: records what was posted to it and lets the test
 // fire responses back through the registered listener. No real Worker/WASM.
+// Stores the DOM error / messageerror listeners separately from the message
+// channel (real Workers dispatch per event type) so a test can simulate a
+// script-load failure without disturbing message routing.
 class FakeWorker implements WorkerLike {
   sent: ToWorker[] = [];
   terminated = false;
+  terminateCount = 0;
   private listener: ((ev: { data: FromWorker }) => void) | null = null;
+  private errorListener: ((ev: unknown) => void) | null = null;
+  private messageErrorListener: ((ev: unknown) => void) | null = null;
   postMessage(msg: ToWorker) {
     this.sent.push(msg);
   }
-  addEventListener(_t: "message", l: (ev: { data: FromWorker }) => void) {
-    this.listener = l;
+  addEventListener(t: string, l: (ev: { data: FromWorker }) => void) {
+    if (t === "error") this.errorListener = l as (ev: unknown) => void;
+    else if (t === "messageerror") this.messageErrorListener = l as (ev: unknown) => void;
+    else this.listener = l;
   }
   terminate() {
     this.terminated = true;
+    this.terminateCount++;
   }
   fire(msg: FromWorker) {
     this.listener?.({ data: msg });
   }
+  fireError(ev?: { message?: string }) {
+    this.errorListener?.(ev ?? {});
+  }
+  fireMessageError() {
+    this.messageErrorListener?.({});
+  }
 }
 
-function makePool(cap: number) {
+// Deterministic fake timer machinery for the boot-deadline tests: records armed
+// callbacks and lets the test fire or cancel them by hand.
+function makeFakeTimers() {
+  let nextId = 1;
+  const pending = new Map<number, () => void>();
+  return {
+    setTimeout: (fn: () => void, _ms: number) => {
+      const id = nextId++;
+      pending.set(id, fn);
+      return id;
+    },
+    clearTimeout: (h: unknown) => {
+      pending.delete(h as number);
+    },
+    // Fire every armed timer (the boot deadline elapsing).
+    flush() {
+      const fns = [...pending.values()];
+      pending.clear();
+      for (const fn of fns) fn();
+    },
+    get armed() {
+      return pending.size;
+    },
+  };
+}
+
+function makePool(
+  cap: number,
+  options?: {
+    bootTimeoutMs?: number;
+    setTimeout?: (fn: () => void, ms: number) => unknown;
+    clearTimeout?: (handle: unknown) => void;
+  },
+) {
   const created: FakeWorker[] = [];
+  // Default the boot deadline OFF so plain tests don't arm real unref'd 20s
+  // setTimeouts (harmless but a latent flake); the deadline tests opt back in by
+  // injecting fake timers + a bootTimeoutMs.
   const pool = new BrookPool(() => {
     const w = new FakeWorker();
     created.push(w);
     return w;
-  }, cap);
+  }, cap, { bootTimeoutMs: 0, ...options });
   return { pool, created };
 }
 
@@ -511,4 +562,473 @@ test("reset() drops a straggler patch from the previous generation (no ghost blo
   // A patch from the new generation applies normally.
   w.fire(mkPatch(1, 0, "<p>new</p>"));
   expect(c.getSnapshot().map((b) => b.html)).toEqual(["<p>new</p>"]);
+});
+
+// --------------------------------------------------------------------------
+// Worker-lifecycle failure detection + recovery
+// --------------------------------------------------------------------------
+
+const blk = (id: number, html: string): Block => ({
+  id, kind: { type: "Paragraph" }, start: 0, end: 0, html, open: false, speculative: false,
+});
+const patchMsg = (streamId: number, id: number, html: string): FromWorker => ({
+  type: "patch", streamId, patch: JSON.stringify({ newly_committed: [blk(id, html)], active: [] }),
+  appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
+});
+const appendedTo = (w: FakeWorker) =>
+  w.sent.filter((m): m is Extract<ToWorker, { type: "append" }> => m.type === "append").map((m) => m.chunk).join("");
+// The stream id of a worker's first append — how a test discovers the id the
+// lazily-acquired client bound to.
+const firstSid = (w: FakeWorker) =>
+  (w.sent.find((m) => m.type === "append") as { streamId: number }).streamId;
+
+test("a DOM error event before ready rejects waiters, fires a fatal onError, and reaps the worker", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const got: FromWorker[] = [];
+  const s = pool.acquire((m) => got.push(m));
+  const ready = pool.whenWorkerReady(s.pw);
+  // The browser fires a DOM `error` when `new Worker(staleUrl)`'s script 404s —
+  // never an in-band `message`, so only the pool's error listener catches it.
+  created[0].fireError({ message: "404 not found" });
+  await expect(ready).rejects.toThrow(/failed to load/);
+  expect(got.at(-1)).toMatchObject({ type: "error", fatal: true });
+  expect((got.at(-1) as { message: string }).message).toContain("404 not found");
+  expect(created[0].terminated).toBe(true);
+  expect(pool.workerCount).toBe(0); // reaped
+  // A subsequent acquire lands on a FRESH worker, not the dead one.
+  const s2 = pool.acquire(() => {});
+  expect(s2.pw).not.toBe(s.pw);
+  expect(s2.pw.failed).toBeNull();
+  expect(created.length).toBe(2);
+});
+
+test("a messageerror is handled like a fatal failure (reject, fatal onError, reap)", async () => {
+  const { pool, created } = makePool(1, { bootTimeoutMs: 0 });
+  const got: FromWorker[] = [];
+  const s = pool.acquire((m) => got.push(m));
+  const ready = pool.whenWorkerReady(s.pw);
+  created[0].fireMessageError();
+  await expect(ready).rejects.toThrow(/deserial/);
+  expect(got.at(-1)).toMatchObject({ type: "error", fatal: true });
+  expect(created[0].terminated).toBe(true);
+  expect(pool.workerCount).toBe(0);
+});
+
+test("the boot deadline fails a worker that never reports ready", async () => {
+  const timers = makeFakeTimers();
+  const { pool, created } = makePool(1, {
+    bootTimeoutMs: 5000, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
+  });
+  const got: FromWorker[] = [];
+  const s = pool.acquire((m) => got.push(m));
+  const ready = pool.whenWorkerReady(s.pw);
+  expect(timers.armed).toBe(1); // deadline armed on create
+  timers.flush(); // the deadline elapses with no ready in sight
+  await expect(ready).rejects.toThrow(/did not become ready within 5000ms/);
+  expect(got.at(-1)).toMatchObject({ type: "error", fatal: true });
+  expect(created[0].terminated).toBe(true);
+  expect(pool.workerCount).toBe(0);
+});
+
+test("reporting ready before the deadline cancels the boot timer", () => {
+  const timers = makeFakeTimers();
+  const { pool, created } = makePool(1, {
+    bootTimeoutMs: 5000, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
+  });
+  pool.acquire(() => {});
+  expect(timers.armed).toBe(1);
+  created[0].fire({ type: "ready" });
+  expect(timers.armed).toBe(0); // cancelled on ready
+  timers.flush(); // nothing left to fire — the worker stays live
+  expect(created[0].terminated).toBe(false);
+  expect(pool.workerCount).toBe(1);
+});
+
+test("bootTimeoutMs: 0 disables the boot deadline entirely", () => {
+  const timers = makeFakeTimers();
+  const { pool, created } = makePool(1, {
+    bootTimeoutMs: 0, setTimeout: timers.setTimeout, clearTimeout: timers.clearTimeout,
+  });
+  pool.acquire(() => {});
+  expect(timers.armed).toBe(0); // no timer armed at all
+  timers.flush();
+  expect(created[0].terminated).toBe(false);
+  expect(pool.workerCount).toBe(1);
+});
+
+test("multiple failure triggers (DOM error, fatal message, late deadline) fail the worker exactly once", async () => {
+  // A no-op clearTimeout keeps the deadline callback "live" so we can prove that
+  // firing it AFTER the worker already failed is a no-op (the callback's own
+  // ready/failed guard) — on top of fail()'s first-cause-wins idempotence.
+  const deadlines: Array<() => void> = [];
+  const { pool, created } = makePool(1, {
+    bootTimeoutMs: 5000,
+    setTimeout: (fn) => (deadlines.push(fn), deadlines.length),
+    clearTimeout: () => {},
+  });
+  const got: FromWorker[] = [];
+  const s = pool.acquire((m) => got.push(m));
+  const ready = pool.whenWorkerReady(s.pw);
+  const w = created[0];
+  w.fireError({ message: "first" }); // first cause wins
+  w.fire({ type: "error", streamId: -1, message: "second", fatal: true }); // no-op
+  for (const fn of deadlines) fn(); // late deadline fires — guarded no-op
+  await expect(ready).rejects.toThrow(/failed to load: first/);
+  const fatals = got.filter((m) => m.type === "error" && (m as { fatal?: boolean }).fatal);
+  expect(fatals.length).toBe(1); // onError fired exactly once
+  expect((fatals[0] as { message: string }).message).toContain("first");
+  expect(w.terminateCount).toBe(1); // terminated exactly once
+});
+
+test("a setContent client recovers from a transient worker death by re-feeding the document", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.setContent("# A\n\nbody"); // drives worker A via setContent (retains the doc)
+  const a = created[0];
+  const sidA = firstSid(a);
+  a.fire(patchMsg(sidA, 1, "<p>body</p>")); // A renders content
+  expect(c.getSnapshot().length).toBe(1);
+  const handlersBefore = pool.handlerCount; // one live stream
+
+  a.fireError({ message: "boom" }); // A dies (stale worker URL)
+  expect(a.terminated).toBe(true);
+  expect(pool.workerCount).toBe(0); // A reaped
+  await Promise.resolve(); // let the deferred recovery microtask run
+
+  // A fresh worker B was acquired and re-fed the WHOLE retained document.
+  expect(created.length).toBe(2);
+  const b = created[1];
+  expect(b.sent.map((m) => m.type)).toContain("append");
+  expect(appendedTo(b)).toContain("# A\n\nbody");
+  // The death healed invisibly: no onError, `failed` stayed null.
+  expect(errors.length).toBe(0);
+  expect(c.failed).toBeNull();
+  // The dead worker's handler entry was reaped — the map didn't grow across the
+  // heal (the leak that grew the process-wide default pool unbounded).
+  expect(pool.handlerCount).toBe(handlersBefore);
+
+  // B produces output → the view converges and stays healthy.
+  const sidB = firstSid(b);
+  b.fire(patchMsg(sidB, 1, "<p>body</p>"));
+  expect(c.getSnapshot().length).toBeGreaterThan(0);
+  expect(c.failed).toBeNull();
+});
+
+test("an identical re-fed document terminals after exactly one retry (no infinite recovery loop)", async () => {
+  const { pool, created } = makePool(3, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.setContent("# A\n\nbody");
+  const a = created[0];
+  const sidA = firstSid(a);
+  a.fire(patchMsg(sidA, 1, "<p>body</p>"));
+
+  a.fireError({ message: "die 1" }); // first death → recovery re-feeds the doc
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  const b = created[1];
+  // The re-fed worker produces its append patch (as a finalize()-that-traps doc
+  // would) — this must NOT re-arm recovery.
+  const sidB = firstSid(b);
+  b.fire(patchMsg(sidB, 1, "<p>body</p>"));
+  expect(c.failed).toBeNull(); // healed so far
+
+  // B dies again with UNCHANGED content → terminal, no third worker.
+  b.fireError({ message: "die 2" });
+  await Promise.resolve();
+  expect(created.length).toBe(2); // no worker C — the poison doc didn't loop
+  expect(c.failed).not.toBeNull();
+  expect(errors.some((e) => e.fatal)).toBe(true);
+});
+
+test("a recovered client heals AGAIN once the caller advances the content", async () => {
+  const { pool, created } = makePool(4, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.setContent("# A\n\nbody");
+  const a = created[0];
+  const sidA = firstSid(a);
+  a.fire(patchMsg(sidA, 1, "<p>body</p>"));
+
+  a.fireError({ message: "die 1" }); // death 1 → recover onto B
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  const b = created[1];
+  const sidB = firstSid(b);
+  b.fire(patchMsg(sidB, 1, "<p>body</p>")); // B heals
+
+  // Caller advances the controlled string past the recovered baseline → re-arms.
+  c.setContent("# A\n\nbody more");
+  expect(appendedTo(b)).toContain(" more"); // the delta went to B
+
+  // B now dies too — but because the content advanced, recovery heals AGAIN.
+  b.fireError({ message: "die 2" });
+  await Promise.resolve();
+  expect(created.length).toBe(3); // worker C acquired — healed again
+  expect(appendedTo(created[2])).toContain("# A\n\nbody more"); // full doc re-fed
+  expect(c.failed).toBeNull();
+  expect(errors.length).toBe(0);
+});
+
+test("a setContent client does NOT retry a second time if the replacement worker also dies", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.setContent("# A\n\nbody");
+  const a = created[0];
+  const sidA = firstSid(a);
+  a.fire(patchMsg(sidA, 1, "<p>body</p>"));
+
+  a.fireError({ message: "die 1" }); // first death → recovery
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  const b = created[1];
+
+  // B dies BEFORE producing any patch, so recovery is not re-armed → terminal.
+  b.fireError({ message: "die 2" });
+  await Promise.resolve();
+  expect(created.length).toBe(2); // NO third worker — no infinite retry loop
+  expect(c.failed).not.toBeNull();
+  expect(errors.some((e) => e.fatal)).toBe(true); // surfaced this time
+});
+
+test("`failed` transitions null → Error → null across a terminal failure and a reset", () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  // recovery:false → a fatal is immediately terminal (no buffer, no re-feed),
+  // which is exactly what makes the failed-getter transition observable here.
+  const c = new BrookClient({ pool, recovery: false });
+  c.append("x");
+  expect(c.failed).toBeNull();
+  created[0].fire({ type: "error", streamId: -1, message: "dead", fatal: true });
+  expect(c.failed).not.toBeNull();
+  expect(c.failed?.message).toBe("dead");
+
+  c.reset(); // explicit caller reset clears the failure + re-arms recovery
+  expect(c.failed).toBeNull();
+  c.append("y");
+  expect(created.length).toBe(2); // a fresh worker was acquired
+  const b = created[1];
+  const sidB = firstSid(b);
+  b.fire(patchMsg(sidB, 1, "<p>y</p>"));
+  expect(c.failed).toBeNull();
+  expect(c.getSnapshot().length).toBeGreaterThan(0);
+});
+
+// --------------------------------------------------------------------------
+// Append / pipeFrom-mode recovery (buffer-driven, default-on)
+// --------------------------------------------------------------------------
+
+test("append-mode recovers by re-feeding the accumulated buffer", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.append("# A\n");
+  c.append("body"); // buffer = "# A\nbody"
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>body</p>"));
+
+  a.fireError({ message: "boom" });
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  // The fresh worker got the FULL concatenation as one atomic re-feed.
+  expect(appendedTo(created[1])).toContain("# A\nbody");
+  expect(c.failed).toBeNull();
+  expect(errors.length).toBe(0);
+});
+
+test("append-mode recovery keeps the view on screen (never blanks)", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const c = new BrookClient({ pool });
+  c.append("hello");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>hello</p>"));
+  expect(c.getSnapshot().length).toBe(1);
+
+  a.fireError({ message: "boom" });
+  expect(c.getSnapshot().length).toBe(1); // holds while recovery is pending
+  await Promise.resolve();
+  expect(c.getSnapshot().length).toBe(1); // softReset preserved it across the swap
+  expect(c.failed).toBeNull();
+});
+
+test("append-mode does NOT retry twice when the replacement also dies", async () => {
+  const { pool, created } = makePool(3, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.append("hello");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>hello</p>"));
+
+  a.fireError({ message: "die 1" });
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  created[1].fireError({ message: "die 2" }); // replacement dies before healing
+  await Promise.resolve();
+  expect(created.length).toBe(2); // no third worker
+  expect(c.failed).not.toBeNull();
+  expect(errors.filter((e) => e.fatal).length).toBe(1); // fatal onError exactly once
+});
+
+test("append-mode re-arms recovery once the buffer grows past the recovered length", async () => {
+  const { pool, created } = makePool(4, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.append("hello");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>hello</p>"));
+
+  a.fireError({ message: "die 1" }); // → recover onto B
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  const b = created[1];
+  b.fire(patchMsg(firstSid(b), 1, "<p>hello</p>")); // B heals
+
+  c.append(" more"); // buffer "hello more" grows past recovered length → re-arm
+
+  b.fireError({ message: "die 2" }); // dies again — but re-armed, so heals AGAIN
+  await Promise.resolve();
+  expect(created.length).toBe(3);
+  expect(appendedTo(created[2])).toContain("hello more"); // full grown buffer re-fed
+  expect(c.failed).toBeNull();
+  expect(errors.length).toBe(0);
+});
+
+test("a stray append before the recovery microtask converges (old-epoch patch dropped, no dup)", async () => {
+  const { pool, created } = makePool(3, { bootTimeoutMs: 0 });
+  const c = new BrookClient({ pool });
+  c.append("AB");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>AB</p>"));
+
+  a.fireError({ message: "boom" }); // schedule recovery (not yet run)
+  c.append("C"); // stray pipeFrom chunk lands first, on a fresh worker at the OLD epoch
+  await Promise.resolve(); // now the recovery microtask runs
+
+  const b = created[1];
+  const strayAppend = b.sent.find((m) => m.type === "append" && m.chunk === "C") as
+    | (ToWorker & { epoch?: number; streamId: number })
+    | undefined;
+  const resetMsg = b.sent.find((m) => m.type === "reset");
+  const fullAppend = b.sent.find((m) => m.type === "append" && m.chunk === "ABC") as
+    | (ToWorker & { epoch?: number; streamId: number })
+    | undefined;
+  expect(strayAppend).toBeDefined();
+  expect(resetMsg).toBeDefined();
+  expect(fullAppend).toBeDefined();
+  // Ordering: append(stray) → reset → append(full).
+  expect(b.sent.indexOf(strayAppend!)).toBeLessThan(b.sent.indexOf(resetMsg!));
+  expect(b.sent.indexOf(resetMsg!)).toBeLessThan(b.sent.indexOf(fullAppend!));
+  // The stray rode the pre-reset epoch; the re-feed rode the bumped one.
+  const strayEpoch = strayAppend!.epoch!;
+  const fullEpoch = fullAppend!.epoch!;
+  expect(strayEpoch).toBeLessThan(fullEpoch);
+
+  // The stray's old-epoch patch is dropped; the recovered new-epoch patch lands.
+  const sidB = fullAppend!.streamId;
+  b.fire({
+    type: "patch", streamId: sidB, epoch: strayEpoch,
+    patch: JSON.stringify({ newly_committed: [blk(9, "<p>stray-ghost</p>")], active: [] }),
+    appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
+  });
+  b.fire({
+    type: "patch", streamId: sidB, epoch: fullEpoch, final: true,
+    patch: JSON.stringify({ newly_committed: [blk(1, "<p>ABC</p>")], active: [] }),
+    appendedBytes: 0, parseMicros: 0, retainedBytes: 0, wasmMemoryBytes: 0,
+  });
+  const htmls = c.getSnapshot().map((x) => x.html);
+  expect(htmls).not.toContain("<p>stray-ghost</p>"); // old-epoch straggler dropped
+  expect(htmls).toContain("<p>ABC</p>"); // recovered content present, no missing prefix
+});
+
+test("append-mode death during finalize: one retry re-feeds+re-finalizes, a second trap is terminal", async () => {
+  const { pool, created } = makePool(3, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.append("doc");
+  c.finalize(); // contentDone = true
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>doc</p>"));
+
+  a.fireError({ message: "trap 1" }); // the finalize traps
+  await Promise.resolve();
+  expect(created.length).toBe(2);
+  const b = created[1];
+  expect(appendedTo(b)).toContain("doc"); // re-fed
+  expect(b.sent.some((m) => m.type === "finalize")).toBe(true); // AND re-finalized
+
+  b.fireError({ message: "trap 2" }); // the re-fed finalize traps too
+  await Promise.resolve();
+  expect(created.length).toBe(2); // no third worker
+  expect(c.failed).not.toBeNull();
+  expect(errors.some((e) => e.fatal)).toBe(true);
+});
+
+test("reset() clears the recovery buffer (a later death re-feeds nothing → terminal)", () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const errors: Array<{ message: string; fatal?: boolean }> = [];
+  const c = new BrookClient({ pool, onError: (e) => errors.push(e) });
+  c.append("old");
+  c.reset(); // clears the buffer; the (live) worker A just gets a reset
+  expect(created.length).toBe(1);
+  created[0].fireError({ message: "boom" }); // buffer empty → immediate terminal
+  expect(created.length).toBe(1); // no recovery worker spun up
+  expect(c.failed).not.toBeNull();
+  expect(errors.some((e) => e.fatal)).toBe(true);
+});
+
+test("recovery:false disables buffering + recovery in BOTH modes (immediate terminal)", async () => {
+  // append mode
+  const p1 = makePool(2, { bootTimeoutMs: 0 });
+  const e1: Array<{ fatal?: boolean }> = [];
+  const c1 = new BrookClient({ pool: p1.pool, recovery: false, onError: (e) => e1.push(e) });
+  c1.append("hello");
+  p1.created[0].fire(patchMsg(firstSid(p1.created[0]), 1, "<p>hello</p>"));
+  p1.created[0].fireError({ message: "boom" });
+  await Promise.resolve();
+  expect(p1.created.length).toBe(1); // no re-feed worker
+  expect(c1.failed).not.toBeNull();
+  expect(e1.some((e) => e.fatal)).toBe(true);
+
+  // setContent mode
+  const p2 = makePool(2, { bootTimeoutMs: 0 });
+  const e2: Array<{ fatal?: boolean }> = [];
+  const c2 = new BrookClient({ pool: p2.pool, recovery: false, onError: (e) => e2.push(e) });
+  c2.setContent("# A\n\nbody");
+  p2.created[0].fire(patchMsg(firstSid(p2.created[0]), 1, "<p>body</p>"));
+  p2.created[0].fireError({ message: "boom" });
+  await Promise.resolve();
+  expect(p2.created.length).toBe(1); // no re-feed worker
+  expect(c2.failed).not.toBeNull();
+  expect(e2.some((e) => e.fatal)).toBe(true);
+});
+
+test("destroy() during a pending recovery microtask acquires no worker", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const c = new BrookClient({ pool });
+  c.append("hello");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>hello</p>"));
+
+  a.fireError({ message: "boom" }); // schedules the recovery microtask
+  c.destroy(); // torn down before it runs
+  await Promise.resolve();
+  expect(created.length).toBe(1); // recover() bailed on !attached — no new worker
+});
+
+test("after recovery a setContent client keeps its diff baseline (unchanged setContent is a no-op)", async () => {
+  const { pool, created } = makePool(2, { bootTimeoutMs: 0 });
+  const c = new BrookClient({ pool });
+  c.setContent("# A\n\nbody");
+  const a = created[0];
+  a.fire(patchMsg(firstSid(a), 1, "<p>body</p>"));
+  a.fireError({ message: "boom" });
+  await Promise.resolve();
+  const b = created[1];
+  const appendsBefore = b.sent.filter((m) => m.type === "append").length;
+  // A React re-render passes the SAME string: recovery restored lastContent, so
+  // this diffs to nothing instead of forcing a wasteful whole-document re-feed.
+  c.setContent("# A\n\nbody");
+  const appendsAfter = b.sent.filter((m) => m.type === "append").length;
+  expect(appendsAfter).toBe(appendsBefore);
 });

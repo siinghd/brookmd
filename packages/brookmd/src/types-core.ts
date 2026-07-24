@@ -484,6 +484,19 @@ export type FromWorker =
  */
 export interface WorkerLike {
   postMessage(msg: ToWorker): void;
-  addEventListener(type: "message", listener: (ev: { data: FromWorker }) => void): void;
+  /**
+   * Structural superset of DOM `Worker.addEventListener` for the three channels
+   * the pool listens on: `message` (patches / ready / in-band errors — read via
+   * `ev.data`) plus the out-of-band failure channels `error` (a script that
+   * 404s or throws at load — `ev.message`) and `messageerror` (an
+   * undeserializable posted message). One widened signature keeps the unit-test
+   * fakes that declare only `"message"` compiling — method parameters are
+   * checked bivariantly — while letting the pool attach all three without a
+   * structural cast.
+   */
+  addEventListener(
+    type: "message" | "error" | "messageerror",
+    listener: (ev: { data: FromWorker; message?: string }) => void,
+  ): void;
   terminate(): void;
 }

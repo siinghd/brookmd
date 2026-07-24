@@ -338,8 +338,12 @@ function BrookMarkdownFromClient({
  */
 export function useBrookStream(
   stream: AsyncIterable<string> | ReadableStream<Uint8Array> | Response | null | undefined,
-  options?: { config?: ParserConfig; onError?: (err: Error) => void },
+  options?: { config?: ParserConfig; onError?: (err: Error & { fatal?: boolean }) => void },
 ): BrookClient {
+  // Read onError through a ref so its identity never re-subscribes the stream
+  // (and so the once-created client's error bridge always sees the latest one).
+  const onErrorRef = useRef(options?.onError);
+  onErrorRef.current = options?.onError;
   // One client per hook instance. (React StrictMode double-invokes this
   // initializer in DEV, constructing a throwaway second client whose worker
   // slot isn't reclaimed — a minor dev-only artifact; production runs it once.
@@ -351,10 +355,25 @@ export function useBrookStream(
   // (SSR / tests), and `finalize()` always flushes synchronously so stream
   // completion is never deferred. Callers who own their own BrookClient keep full
   // control of `coalesce`.
-  const [client] = useState(() => new BrookClient({ config: options?.config, coalesce: true }));
-  // Read onError through a ref so its identity never re-subscribes the stream.
-  const onErrorRef = useRef(options?.onError);
-  onErrorRef.current = options?.onError;
+  // Wire the client's onError so a WORKER-level fatal (a stale/404 worker script,
+  // WASM-init failure) reaches the caller via the same `onError` option as a
+  // pipe error, defaulting to console.error. Routed through the ref so a changing
+  // callback identity never recreates the client.
+  const [client] = useState(
+    () =>
+      new BrookClient({
+        config: options?.config,
+        coalesce: true,
+        onError: (err) => {
+          // Carry the `fatal` bit onto the Error so callers can tell a dead
+          // worker (view frozen) from a recoverable per-stream parse error.
+          const e = Object.assign(new Error(err.message), { fatal: err.fatal });
+          if (onErrorRef.current) onErrorRef.current(e);
+          // eslint-disable-next-line no-console
+          else console.error(e);
+        },
+      }),
+  );
   // Track the last stream so we reset() only on a genuine source change — never
   // on a StrictMode replay of the same stream (which would discard its head).
   const prevStream = useRef<typeof stream>(undefined);
@@ -408,11 +427,19 @@ export function useBrookStream(
  * (reattach re-feeds the document). For a true stream source
  * (`Response` / `ReadableStream` / SSE generator) use {@link useBrookStream}
  * instead — it avoids buffering the whole document as a string.
+ *
+ * Pass `onError` to be notified of a terminal worker failure (`err.fatal` set) or
+ * a parse error; defaults to `console.error`. A transient worker death heals
+ * invisibly (see the client's `recovery` option) and does not fire it.
  */
 export function useBrookMarkdownString(
   content: string,
-  options?: { config?: ParserConfig; streaming?: boolean },
+  options?: { config?: ParserConfig; streaming?: boolean; onError?: (err: Error & { fatal?: boolean }) => void },
 ): BrookClient {
+  // Read onError through a ref so its identity never recreates the once-created
+  // client (same pattern as useBrookStream).
+  const onErrorRef = useRef(options?.onError);
+  onErrorRef.current = options?.onError;
   // Coalesce store emits to one notify per frame (rAF) by default — matches the
   // framework-neutral DOM adapter's `batch` default and collapses streaming
   // patch bursts into a single React render per frame (fewer commits under load /
@@ -420,7 +447,22 @@ export function useBrookMarkdownString(
   // (SSR / tests), and `finalize()` always flushes synchronously so stream
   // completion is never deferred. Callers who own their own BrookClient keep full
   // control of `coalesce`.
-  const [client] = useState(() => new BrookClient({ config: options?.config, coalesce: true }));
+  // Wire the client's onError so a TERMINAL worker fatal (one that survives the
+  // setContent auto-recovery) reaches the caller, defaulting to console.error.
+  const [client] = useState(
+    () =>
+      new BrookClient({
+        config: options?.config,
+        coalesce: true,
+        onError: (err) => {
+          // Carry the `fatal` bit onto the Error (see useBrookStream).
+          const e = Object.assign(new Error(err.message), { fatal: err.fatal });
+          if (onErrorRef.current) onErrorRef.current(e);
+          // eslint-disable-next-line no-console
+          else console.error(e);
+        },
+      }),
+  );
 
   // Own the client's pool attachment (StrictMode dev double-mount destroys on the
   // simulated unmount then remounts the SAME instance; reattach re-registers and

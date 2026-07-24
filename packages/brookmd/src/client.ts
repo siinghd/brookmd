@@ -99,12 +99,18 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
 interface PoolWorker {
   worker: WorkerLike;
   ready: boolean;
-  /** Set once WASM init fails; whenWorkerReady rejects with this thereafter. */
+  /** Set once the worker fails fatally (WASM init, a DOM load `error`, a
+   *  `messageerror`, or the boot deadline); whenWorkerReady rejects with this
+   *  thereafter. */
   failed: Error | null;
   streamCount: number;
   /** Live stream ids on this worker — so a fatal failure can notify each one. */
   streamIds: Set<number>;
   readyWaiters: Array<{ resolve: () => void; reject: (e: Error) => void }>;
+  /** Handle for the boot deadline that fails a worker which never reports ready.
+   *  Opaque (a `number` in the browser, a `Timeout` in Node/bun, or a test
+   *  fake's id) — cleared on ready, on failure, and on pool disposal. */
+  bootTimer: unknown;
 }
 
 /**
@@ -125,10 +131,30 @@ export class BrookPool {
   private handlers = new Map<number, (msg: FromWorker) => void>();
   private nextStreamId = 1;
 
+  // Per-worker boot deadline: if a worker reports neither ready nor a fatal
+  // failure within this window it is failed with a clear message — the miss that
+  // otherwise leaves `<div class="brook-md">` permanently empty (a stale hashed
+  // worker URL 404s after a redeploy: the DOM fires `error`, but a browser that
+  // somehow swallowed it would hang forever). `0` / non-finite disables it.
+  private bootTimeoutMs: number;
+  // Timer machinery, injectable so the deadline is testable with fake timers.
+  private startTimer: (fn: () => void, ms: number) => unknown;
+  private cancelTimer: (handle: unknown) => void;
+
   constructor(
     private factory: () => WorkerLike,
     private cap: number,
-  ) {}
+    options: {
+      bootTimeoutMs?: number;
+      setTimeout?: (fn: () => void, ms: number) => unknown;
+      clearTimeout?: (handle: unknown) => void;
+    } = {},
+  ) {
+    this.bootTimeoutMs = options.bootTimeoutMs ?? 20_000;
+    this.startTimer = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
+    this.cancelTimer =
+      options.clearTimeout ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
+  }
 
   /** Reserve a stream id and assign a worker, registering its message handler. */
   acquire(handler: (msg: FromWorker) => void): { streamId: number; pw: PoolWorker } {
@@ -193,6 +219,7 @@ export class BrookPool {
   /** Terminate every worker (test teardown / full shutdown). */
   disposeAll(): void {
     for (const pw of this.workers) {
+      this.clearBootTimer(pw);
       try {
         pw.worker.terminate();
       } catch {
@@ -205,6 +232,13 @@ export class BrookPool {
 
   get workerCount(): number {
     return this.workers.length;
+  }
+
+  /** Live stream→handler registrations. Introspection for tests/diagnostics —
+   *  a fatal failure reaps the dead worker's entries, so this must not grow
+   *  across a worker death + recovery cycle. */
+  get handlerCount(): number {
+    return this.handlers.size;
   }
 
   // Create a new worker while under cap and every live worker is busy; otherwise
@@ -228,53 +262,126 @@ export class BrookPool {
       streamCount: 0,
       streamIds: new Set(),
       readyWaiters: [],
+      bootTimer: null,
     };
+    // Detect a worker that dies BEFORE it can post anything back in-band: a
+    // browser fires a DOM `error` on the Worker object when the script 404s (a
+    // stale hashed URL after a redeploy) and a `messageerror` when a posted
+    // message can't be deserialized — neither of which arrives as a `message`
+    // event, so without these listeners the `ready` promise would hang forever.
+    // Register these BEFORE `message`: (1) real Workers can fire a load error
+    // immediately, and (2) the unit-test fakes store a SINGLE listener slot
+    // regardless of type, so letting the `message` registration land LAST leaves
+    // their routing pointed at the message handler exactly as before. The
+    // try/catch guards keep a fake that lacks these channels from throwing.
+    try {
+      pw.worker.addEventListener("error", (ev) => {
+        const detail = ev.message;
+        this.fail(pw, new Error(`brookmd worker failed to load${detail ? `: ${detail}` : ""}`));
+      });
+    } catch {
+      /* a fake without an error channel */
+    }
+    try {
+      pw.worker.addEventListener("messageerror", () => {
+        this.fail(pw, new Error("brookmd worker message could not be deserialized"));
+      });
+    } catch {
+      /* a fake without a messageerror channel */
+    }
     pw.worker.addEventListener("message", (ev) => this.onMessage(pw, ev.data));
+    // Push BEFORE arming the deadline so a (degenerate) synchronously-firing
+    // injected timer runs fail() with pw already in `workers[]` — otherwise the
+    // reap's indexOf would miss it and leak the slot.
     this.workers.push(pw);
+    this.startBootTimer(pw);
     return pw;
+  }
+
+  // Arm the per-worker boot deadline (no-op when disabled). Uses the injected
+  // timer so tests drive it deterministically, and `.unref()`s the handle (when
+  // present) so a pending deadline never keeps a Node/bun process alive.
+  private startBootTimer(pw: PoolWorker): void {
+    if (!(this.bootTimeoutMs > 0) || !Number.isFinite(this.bootTimeoutMs)) return;
+    const timer = this.startTimer(() => {
+      // The clear paths (ready/failure/dispose) normally cancel us first; this
+      // guard covers a fake timer that fires anyway.
+      if (!pw.ready && !pw.failed) {
+        this.fail(pw, new Error(`brookmd worker did not become ready within ${this.bootTimeoutMs}ms`));
+      }
+    }, this.bootTimeoutMs);
+    (timer as { unref?: () => void } | null)?.unref?.();
+    pw.bootTimer = timer;
+  }
+
+  private clearBootTimer(pw: PoolWorker): void {
+    if (pw.bootTimer !== null) {
+      this.cancelTimer(pw.bootTimer);
+      pw.bootTimer = null;
+    }
   }
 
   private onMessage(pw: PoolWorker, msg: FromWorker): void {
     if (msg.type === "ready") {
       pw.ready = true;
+      this.clearBootTimer(pw);
       const waiters = pw.readyWaiters;
       pw.readyWaiters = [];
       for (const w of waiters) w.resolve();
       return;
     }
     if (msg.type === "error" && msg.fatal) {
-      // A fatal (WASM-init) failure dooms every stream on this worker. Reject
-      // anyone awaiting readiness, then notify each live stream's client so its
-      // onError fires — the message carries no real streamId to route by. The
-      // worker is kept only to reject those waiters; pick() never reuses it.
-      const err = new Error(msg.message);
-      pw.failed = err;
-      const waiters = pw.readyWaiters;
-      pw.readyWaiters = [];
-      for (const w of waiters) {
-        try {
-          w.reject(err);
-        } catch {
-          /* a waiter's rejection handler is the caller's problem, not ours */
-        }
-      }
-      for (const sid of pw.streamIds) this.dispatch(sid, msg);
-      // Evict the dead worker: terminate it and drop it from the pool. A fatally
-      // failed worker (WASM-init failure, or a trap that poisoned the shared
-      // instance) can never parse again, so retaining it would (a) leak an OS
-      // thread per failure and (b) keep counting against `cap` — once `cap`
-      // failures accumulate, pick()'s cap branch dies and it spawns workers
-      // unbounded. Reaping it restores the cap and lets a fresh worker be made.
-      try {
-        pw.worker.terminate();
-      } catch {
-        /* already gone */
-      }
-      const idx = this.workers.indexOf(pw);
-      if (idx !== -1) this.workers.splice(idx, 1);
+      // A fatal (WASM-init) failure dooms every stream on this worker — route it
+      // through the same unified path as a DOM load error / messageerror / boot
+      // deadline so the fan-out, waiter rejection, and reap are identical.
+      this.fail(pw, new Error(msg.message));
       return;
     }
     this.dispatch(msg.streamId, msg);
+  }
+
+  /**
+   * Idempotent fatal-failure handler shared by every trigger: an in-band
+   * `{type:"error",fatal:true}` (WASM init), a DOM load `error`, a
+   * `messageerror`, and the boot deadline. First cause wins; later calls no-op.
+   *
+   * A fatally failed worker dooms every stream on it. Reject anyone awaiting
+   * readiness, then dispatch a synthetic fatal error to each live stream so its
+   * client's `onError` fires exactly as for a WASM-init fatal (the message
+   * carries no real streamId to route by). Finally evict the worker: terminate
+   * it and drop it from the pool — a dead worker can never parse again, so
+   * retaining it would leak an OS thread per failure and keep counting against
+   * `cap` until pick()'s cap branch dies and spawns workers unbounded. Reaping
+   * restores the cap and lets a fresh worker be made.
+   */
+  private fail(pw: PoolWorker, err: Error): void {
+    if (pw.failed) return; // idempotent — first cause wins
+    pw.failed = err;
+    this.clearBootTimer(pw);
+    const waiters = pw.readyWaiters;
+    pw.readyWaiters = [];
+    for (const w of waiters) {
+      try {
+        w.reject(err);
+      } catch {
+        /* a waiter's rejection handler is the caller's problem, not ours */
+      }
+    }
+    const msg: FromWorker = { type: "error", streamId: -1, message: err.message, fatal: true };
+    for (const sid of pw.streamIds) this.dispatch(sid, msg);
+    // Drop the dead worker's handler entries. The worker is terminated and can
+    // never post again, and a recovering client re-acquires a fresh stream id
+    // (ids are never reused), so these entries would otherwise dangle forever —
+    // the process-wide default pool's handler map would grow unbounded across
+    // repeated worker deaths + recoveries.
+    for (const sid of pw.streamIds) this.handlers.delete(sid);
+    try {
+      pw.worker.terminate();
+    } catch {
+      /* already gone */
+    }
+    const idx = this.workers.indexOf(pw);
+    if (idx !== -1) this.workers.splice(idx, 1);
   }
 
   // Route a message to a stream's handler, isolating a throwing client callback
@@ -358,6 +465,42 @@ export class BrookClient {
   private lastContent = "";
   private contentDone = false;
 
+  // --- Worker-failure recovery ---
+  // The terminal fatal error for this client's stream: non-null once its worker
+  // failed AND (if a recovery was attempted) the replacement also failed. Null
+  // while a recovery is in flight / succeeded, and reset by reset(). Surfaced by
+  // the `failed` getter.
+  private failedError: Error | null = null;
+  // Whether auto-recovery (and the buffer that feeds it) is enabled — off by the
+  // `recovery: false` constructor option. When off, nothing is buffered and a
+  // fatal worker death is immediately terminal in BOTH modes.
+  private recovery = true;
+  // The full document driven into this stream so far — accumulated in append()
+  // (so it captures BOTH manual append/pipeFrom AND setContent, which drives via
+  // append(delta)). It is the baseline re-fed after a transient worker death.
+  // resetParser() clears it and the ensuing re-feed rebuilds it, so it stays
+  // exactly equal to the live document on every path.
+  private recoveryBuffer = "";
+  // Buffer length captured at the last completed re-feed. append()'s growth
+  // re-arm compares against it: once the caller drives the buffer PAST this, a
+  // future death may heal again. Set to Infinity while a recovery is pending
+  // (fatal → microtask) so a stray chunk arriving before recover() runs can't
+  // spuriously re-arm; set to the re-fed length once recover() completes. Its
+  // "!== Infinity" also stands in for "a recovery is outstanding" in the
+  // setContent divergence re-arm below.
+  private recoveredLen = Infinity;
+  // One-shot guard: set when a fatal failure schedules an auto-recovery re-feed
+  // so a replacement worker that also dies is NOT retried a second time. Re-armed
+  // (cleared) only when the caller drives NEW content — never on a mere
+  // successful patch, because a finalize()-that-traps document emits an append
+  // patch before it re-traps, and re-arming there would loop the same poison doc
+  // through workers forever. Two complementary re-arm rules clear it: append()'s
+  // buffer-GROWTH check (streaming past the recovered length) and setContent()'s
+  // DIVERGENCE check (content differs from the re-fed buffer — catches a
+  // same-length-or-shorter replacement the growth check misses). Also cleared on
+  // an explicit caller reset().
+  private recoveryAttempted = false;
+
   // Opt-in rAF coalescing (see constructor `coalesce`). When on AND
   // requestAnimationFrame exists, intra-frame emit()s collapse into ONE
   // rAF-scheduled flush to listeners — the React useSyncExternalStore path then
@@ -439,6 +582,14 @@ export class BrookClient {
    *   stream-completion (finalize) patch always flushes synchronously, and a
    *   pending frame is cancelled on `reset()`/`destroy()`. No effect when
    *   `requestAnimationFrame` is unavailable (e.g. SSR) — emits stay synchronous.
+   * @param options.recovery opt-out (default `true`): transparently heal a
+   *   TRANSIENT worker death. The client buffers the full driven document and, on
+   *   a fatal worker failure, re-acquires a fresh worker and re-feeds it exactly
+   *   once — the displayed view stays on screen, so a worker that 404s after a
+   *   redeploy (or otherwise dies mid-stream) recovers invisibly instead of
+   *   freezing the render. If the replacement ALSO dies the error surfaces
+   *   (`failed` / `onError`). Set `false` to disable both the buffering and the
+   *   auto-recovery — a fatal failure then goes straight to terminal.
    */
   constructor(
     options: {
@@ -447,6 +598,7 @@ export class BrookClient {
       onError?: (err: { message: string; fatal?: boolean }) => void;
       onBlock?: (block: Block) => void;
       coalesce?: boolean;
+      recovery?: boolean;
     } = {},
   ) {
     this.pool = options.pool ?? getDefaultPool();
@@ -454,6 +606,7 @@ export class BrookClient {
     this.onError = options.onError;
     this.onBlock = options.onBlock;
     this.coalesce = options.coalesce ?? false;
+    this.recovery = options.recovery ?? true;
   }
 
   /**
@@ -488,6 +641,20 @@ export class BrookClient {
     return this.pw?.ready ?? false;
   }
 
+  /**
+   * The fatal error that killed this client's worker, or `null` if healthy.
+   *
+   * Non-null only once a failure is TERMINAL: a worker that died with recovery
+   * off or nothing buffered to re-feed, or a client (either mode) whose one-shot
+   * auto-recovery re-feed ALSO hit a dying worker. It stays `null` throughout a
+   * successful transient recovery (the death heals invisibly) and is cleared
+   * again by {@link reset}. Pairs with `onError`, which fires on the same
+   * terminal failure.
+   */
+  get failed(): Error | null {
+    return this.failedError;
+  }
+
   whenReady(): Promise<void> {
     const pw = this.ensureAcquired();
     return this.pool.whenWorkerReady(pw);
@@ -505,6 +672,18 @@ export class BrookClient {
   append(chunk: string) {
     const pw = this.ensureAcquired();
     if (this.firstAppendMs === 0) this.firstAppendMs = performance.now();
+    if (this.recovery) {
+      // Accumulate the driven document so a transient worker death can re-feed it
+      // (this also captures setContent, which drives via append(delta)).
+      this.recoveryBuffer += chunk;
+      // Growth re-arm: once the caller streams PAST the last recovered length, a
+      // future death may heal again. Guarded by recoveredLen === Infinity while a
+      // recovery is pending, so a stray chunk between fatal and recover() (or
+      // recover()'s own re-feed) can't spuriously re-arm.
+      if (this.recoveryAttempted && this.recoveryBuffer.length > this.recoveredLen) {
+        this.recoveryAttempted = false;
+      }
+    }
     this.pool.send(pw, { type: "append", streamId: this.streamId, chunk, config: this.firstConfig(), epoch: this.epoch });
   }
 
@@ -513,6 +692,11 @@ export class BrookClient {
     // The terminal patch this triggers must reach subscribers synchronously, not
     // a frame late — mark it so the next emit flushes now even under coalescing.
     this.finalizePending = true;
+    // Record finalized state so append/pipeFrom-mode recovery re-finalizes the
+    // re-fed document (setContent already tracked this itself; resetParser clears
+    // it). Safe under the documented "drive with append() OR setContent, not
+    // both" contract.
+    this.contentDone = true;
     this.pool.send(pw, { type: "finalize", streamId: this.streamId, config: this.firstConfig(), epoch: this.epoch });
   }
 
@@ -618,6 +802,15 @@ export class BrookClient {
    * `components` instead, keeping the source append-only.
    */
   setContent(content: string, opts?: { done?: boolean }) {
+    // DIVERGENCE re-arm (complements append()'s GROWTH re-arm): while a recovery
+    // is outstanding (recoveryAttempted with a finite recoveredLen), a controlled
+    // string that DIFFERS from the re-fed buffer is caller progress, not the
+    // poison doc replaying, so a future death may heal again. This catches a
+    // same-length-or-shorter replacement the growth check misses. recover()'s own
+    // re-feed drives identical content, so it doesn't trip this.
+    if (this.recoveryAttempted && this.recoveredLen !== Infinity && content !== this.recoveryBuffer) {
+      this.recoveryAttempted = false;
+    }
     if (content !== this.lastContent) {
       // Fast path appends the delta into the EXISTING parser — but a parser that
       // was already finalized ({ done: true }) is terminal: the core drops any
@@ -671,6 +864,12 @@ export class BrookClient {
     this.staleSnapshot = null;
     this.staleTrimmed = false;
     this.mergeCache = null;
+    // An explicit caller reset() clears the terminal-failure state and re-arms
+    // recovery: the caller is starting fresh (and resetParser → ensureAcquired
+    // below binds a live worker again). softReset (the recovery re-feed's path)
+    // deliberately does NOT touch these — only an explicit reset() does.
+    this.failedError = null;
+    this.recoveryAttempted = false;
     this.resetParser();
     if (hadContent) this.emit(true); // clear-the-view notify is synchronous
   }
@@ -734,6 +933,13 @@ export class BrookClient {
     this.wasmMemoryBytes = 0;
     this.lastContent = ""; // setContent baseline: the worker drops the parser here
     this.contentDone = false;
+    // Clear the recovery buffer: the worker's parser is being dropped, so the
+    // buffer is re-accumulated by the append(s) that re-feed the fresh parser
+    // (recover()'s refeed rebuilds it to the full doc; a plain reset leaves it
+    // empty until the caller drives new content). recoveredLen resets to the
+    // pending sentinel — recover() overwrites it AFTER its refeed.
+    this.recoveryBuffer = "";
+    this.recoveredLen = Infinity;
     // A frame coalesced from the just-cleared stream is now stale — cancel it so
     // it can't fire a notify referencing content reset() just dropped.
     this.cancelFrame();
@@ -985,6 +1191,10 @@ export class BrookClient {
           else console.error("brookmd: malformed patch:", message);
           break;
         }
+        // NOTE: a successful patch deliberately does NOT re-arm recovery — see
+        // `recoveryAttempted`. Re-arming is driven by caller content advancing in
+        // setContent(), not by the recovered doc's own append patch (which would
+        // loop a finalize()-that-traps document endlessly).
         // The reparse behind a preserved divergence view is complete: stop
         // padding with the old document's tail, so a shorter replacement trims
         // to the new length on this very notify. Keyed on msg.final ONLY —
@@ -1017,15 +1227,100 @@ export class BrookClient {
         }
         break;
       }
-      case "error":
-        if (this.onError) {
-          this.onError({ message: msg.message, fatal: msg.fatal });
-        } else {
-          // eslint-disable-next-line no-console
-          console.error("brookmd worker error:", msg.message);
+      case "error": {
+        // A non-fatal (per-stream parse) error just surfaces — it doesn't kill
+        // the worker, so there is nothing to recover and `failed` stays null.
+        if (!msg.fatal) {
+          this.reportError(msg.message, msg.fatal);
+          break;
         }
+        // A fatal worker death. With recovery on and a buffered document (any
+        // mode — append/pipeFrom AND setContent both accumulate into
+        // recoveryBuffer), a transient death heals invisibly: re-acquire a fresh
+        // worker and re-feed the buffer exactly once. Clients with recovery off,
+        // an empty buffer, or an already-spent one-shot skip to surfacing.
+        if (this.recovery && this.recoveryBuffer.length > 0 && !this.recoveryAttempted) {
+          this.recoveryAttempted = true;
+          // Pending-gate: while the recovery microtask is queued, a stray append
+          // must not trip append()'s growth re-arm — Infinity makes the
+          // `buffer.length > recoveredLen` check impossible until recover() sets
+          // the real length after its re-feed.
+          this.recoveredLen = Infinity;
+          // Defer out of the pool's fatal fan-out: re-acquiring here would mutate
+          // pool state mid-iteration over the failed worker's stream set. The
+          // microtask runs after fail() has fully unwound, reading the buffer at
+          // execution time so a chunk that interleaves ahead of it is included.
+          // `failed` stays null and onError does NOT fire — the heal is invisible.
+          queueMicrotask(() => this.recover());
+          break;
+        }
+        // No recoverable baseline, recovery disabled, or the re-feed's replacement
+        // worker also died: this is terminal. Record it (surfaces via `failed`)
+        // and fire onError just as before.
+        this.failedError = new Error(msg.message);
+        this.reportError(msg.message, msg.fatal);
         break;
+      }
     }
+  }
+
+  // Surface a worker error to the caller's onError, falling back to console.
+  private reportError(message: string, fatal?: boolean): void {
+    if (this.onError) {
+      this.onError({ message, fatal });
+    } else {
+      // eslint-disable-next-line no-console
+      console.error("brookmd worker error:", message);
+    }
+  }
+
+  /**
+   * One-shot self-heal after a transient worker death, for BOTH drive modes.
+   * The dead worker was already evicted, so redriving the buffered document
+   * re-acquires a FRESH worker (ensureAcquired re-acquires because the old
+   * `pw.failed` is set). Reads the buffer at EXECUTION time, so a chunk that
+   * interleaved ahead of this microtask is included. Deliberately does NOT route
+   * through setContent(): that would stamp `lastContent`, flipping an append-mode
+   * client into setContent mode, and a second death would then re-feed a stale
+   * `lastContent` missing post-recovery chunks. `recoveryAttempted` is NOT reset
+   * here — if the replacement also dies before healing, the fatal path sees the
+   * flag still set and surfaces the error instead of looping.
+   */
+  private recover(): void {
+    // The client was torn down between the failure and this deferred re-feed —
+    // don't re-acquire a worker for an unmounted stream.
+    if (!this.attached) return;
+    const doc = this.recoveryBuffer; // execution-time read: folds in any stray chunk
+    const done = this.contentDone;
+    this.refeed(doc, done);
+    // AFTER the refeed (whose resetParser reset recoveredLen to Infinity): the
+    // baseline length a future live append must exceed to re-arm. Until it does,
+    // an identical setContent (content === recoveryBuffer) is treated as the
+    // poison doc replaying (the divergence guard's `!== recoveryBuffer`).
+    this.recoveredLen = doc.length;
+    // refeed's resetParser cleared lastContent; restore it to the re-fed doc so
+    // a setContent-mode client's diff baseline stays accurate (its next
+    // setContent diffs against the doc actually on the worker instead of forcing
+    // a full re-feed). Harmless in append mode — lastContent is read only by
+    // setContent. NOT the same as routing recovery through setContent: the
+    // re-feed above used recoveryBuffer, so no stale-lastContent re-feed bug.
+    this.lastContent = doc;
+  }
+
+  /**
+   * Rebuild the parser onto a fresh worker and re-feed `doc` as one atomic
+   * append (re-accumulating recoveryBuffer). Keeps the displayed view on screen
+   * across the swap by softReset-ing when something is rendered, so the document
+   * never blanks; falls back to a bare resetParser when the store is empty.
+   * Uses resetParser / softReset (NOT reset(), which would clear the one-shot
+   * recovery guards mid-heal). Re-finalizes when the buffered doc was finalized.
+   */
+  private refeed(doc: string, done: boolean): void {
+    const displayed = this.getSnapshot();
+    if (displayed.length > 0) this.softReset(displayed);
+    else this.resetParser();
+    this.append(doc);
+    if (done) this.finalize();
   }
 
   /**
