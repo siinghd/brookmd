@@ -1,8 +1,9 @@
-import { createElement, Fragment, type ReactElement, type ReactNode } from "react";
+import { createElement, Fragment, type ComponentType, type ReactElement, type ReactNode } from "react";
 import type { Components } from "./types";
 import type { Decorator, UrlTransform } from "./types-core";
 import { decorateSegments } from "./decorate";
 import { decodeEntities, safeUrl } from "./url-safety";
+import { warnOnce } from "./warn";
 
 // `decodeEntities` + `safeUrl` now live in the framework-neutral ./url-safety so
 // the DOM renderer can share the EXACT scheme filter; re-exported here for the
@@ -10,6 +11,24 @@ import { decodeEntities, safeUrl } from "./url-safety";
 // users of `decorators` can build XSS-safe links (React does not block
 // `javascript:` hrefs — decorator output is a TRUSTED, un-sanitized surface).
 export { decodeEntities, safeUrl };
+
+// The block-kind override keys (BlockKindTag). A `components` entry under one of
+// these names is registered for the BLOCK contract — the renderer calls it via
+// `blockKindProps`, which always supplies `block`/`html`/`open`/`speculative`.
+//
+// This walker dispatches by *element tag name* into the SAME flat `components`
+// map, with an attributes-only props bag that has no `block`. The core never
+// emits a capitalized element name of its own, but raw-HTML passthrough
+// (`unsafeHtml` / `htmlAllowlist` / `dropHtmlTags`) preserves a tag's original
+// case — so model prose containing a literal `<Table>` or `<Alert>` would
+// otherwise reach the app's block-kind override with the wrong props and throw
+// on `props.block.…`. Refusing these names here is loss-free (they are not real
+// HTML elements) and closes the confused-deputy hole where model output can
+// invoke an arbitrary entry of the app's components map with chosen attributes.
+const BLOCK_KIND_KEYS = new Set([
+  "Paragraph", "Heading", "CodeBlock", "MathBlock", "Mermaid", "List",
+  "Blockquote", "Alert", "Table", "Rule", "Html", "Component",
+]);
 
 // HTML void elements: no closing tag, never have children.
 const VOID = new Set([
@@ -323,6 +342,35 @@ function pushDecoratedText(
   }
 }
 
+/**
+ * Resolve an element tag to its override (or to the plain tag string).
+ *
+ * A block-kind key is never a legitimate HTML element name, so a raw `<Table>`
+ * that survived raw-HTML passthrough must NOT be dispatched to
+ * `components.Table` — that entry expects `BlockComponentProps` (with `block`),
+ * and this path can only supply attributes. Render it as a plain element
+ * instead, and say so once.
+ */
+function resolveTagType(tag: string, components: Components): ComponentType<any> | string {
+  // Hot path: this runs for every element of every parsed block. Block-kind keys
+  // are all capitalized and the core only emits lowercase element names, so one
+  // charCode compare skips the Set probe for essentially all real markup.
+  const c = tag.charCodeAt(0);
+  if (c >= 65 && c <= 90 && BLOCK_KIND_KEYS.has(tag)) {
+    if (components[tag] !== undefined) {
+      warnOnce(
+        "kind-key-as-tag:" + tag,
+        `brookmd: raw <${tag}> in the rendered HTML collides with the block-kind ` +
+          `override key "${tag}". A block-kind override receives \`BlockComponentProps\` ` +
+          `(with \`block\`), which an inline element cannot supply, so the raw tag is ` +
+          `rendered as a plain element instead. Rename the raw tag or the override key.`,
+      );
+    }
+    return tag;
+  }
+  return components[tag] ?? tag;
+}
+
 function nodesToReact(
   nodes: HNode[],
   components: Components,
@@ -342,7 +390,7 @@ function nodesToReact(
       continue;
     }
     const key = keyPrefix + idx;
-    const type = components[n.tag] ?? n.tag;
+    const type = resolveTagType(n.tag, components);
     const props = attrsToProps(n.tag, n.attrs, key, ctx?.urlTransform);
     if (VOID.has(n.tag.toLowerCase())) {
       out.push(createElement(type, props));

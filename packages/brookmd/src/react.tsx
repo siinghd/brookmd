@@ -1,4 +1,5 @@
 import {
+  Component,
   createElement,
   memo,
   useEffect,
@@ -18,6 +19,7 @@ import { CodeBlock } from "./renderers/CodeBlock";
 import { MathBlock } from "./renderers/Math";
 import { Mermaid } from "./renderers/Mermaid";
 import { htmlToReact } from "./html-to-react";
+import { warnOnce } from "./warn";
 
 /**
  * Render a streaming markdown document from a BrookClient. Each block is its
@@ -184,6 +186,42 @@ interface BrookMarkdownProps {
    * concurrent deferral of the visible tail.
    */
   deferTail?: boolean;
+  /**
+   * Called when a single block's render THROWS — almost always from inside a
+   * `components` override, not from brookmd itself.
+   *
+   * Every block is wrapped in its own error boundary, so a throwing override
+   * costs you that one block instead of unmounting the whole document (React's
+   * default for an uncaught render error is to unmount the entire tree — a blank
+   * page). The failed block renders nothing; the rest of the stream keeps going,
+   * and later patches retry it.
+   *
+   * Without this hook the failure still goes to `console.error` with the block
+   * id, kind, override keys, and an HTML excerpt. Wire it to your error reporter
+   * to get the same detail in production.
+   *
+   * **HOIST / memoize this** (same trap as `components` / `onRenderMetrics`): a
+   * fresh closure each render busts every block's memo and re-renders the whole
+   * document on every patch.
+   *
+   * The most common cause by far: an override registered for a *block-kind* or
+   * *component-tag* key reading `props.block.…`, invoked on the tag path (the
+   * same tag nested inside another block, or used inline), where `block` is not
+   * supplied. Guard with `if (!block) return <>{children}</>`.
+   */
+  onBlockError?: (error: Error, info: BlockErrorInfo) => void;
+}
+
+/** Context handed to {@link BrookMarkdownProps.onBlockError}. */
+export interface BlockErrorInfo {
+  /** The block's stable parser-assigned id (also its React key). */
+  blockId: number;
+  /** The block kind that failed, e.g. `"Component"` / `"Table"`. */
+  kind: string;
+  /** The override keys in play — the shortlist of suspects. */
+  componentKeys: string[];
+  /** First 200 chars of the block's rendered HTML, to identify the content. */
+  html: string;
 }
 
 // Stable reference fed to useDeferredValue when deferral is OFF (the default):
@@ -191,6 +229,22 @@ interface BrookMarkdownProps {
 // catch-up pass, so the default path renders exactly once per patch instead of
 // twice. (We can't conditionally call the hook, so we make its input constant.)
 const NO_DEFER_BLOCKS: Block[] = [];
+// Stable empty array so the boundary's `componentKeys` prop keeps its identity
+// when there are no overrides.
+const EMPTY_KEYS: string[] = [];
+
+// A snapshot entry that is null/undefined or carries no `kind` cannot be
+// rendered. The store's invariants say this cannot happen; if it ever does,
+// drop that one position instead of throwing out of the map callback (which
+// would unmount the document).
+function skipBadBlock(index: number): null {
+  warnOnce(
+    "bad-block",
+    `brookmd: snapshot position ${index} has no block kind and was skipped. ` +
+      `This indicates a corrupted block store — please report it.`,
+  );
+  return null;
+}
 
 // Track which prop names have already warned so the tripwire fires at most once
 // per session (a console spam guard). Module-scoped on purpose.
@@ -251,6 +305,7 @@ function BrookMarkdownFromClient({
   deferTail,
   decorators,
   urlTransform,
+  onBlockError,
 }: BrookMarkdownProps & { client: BrookClient }) {
   const blocks = useSyncExternalStore(client.subscribe, client.getSnapshot, client.getSnapshot);
   // Dev-only stability tripwire: an unstable `decorators` / `urlTransform`
@@ -279,6 +334,9 @@ function BrookMarkdownFromClient({
   // renderCount. Memoized on (client, hook) so its identity stays stable across
   // tail patches — a fresh closure would bust every block's memo. When no hook
   // is supplied this stays `undefined` and the whole probe path is skipped.
+  // The override keys, for the boundary's diagnostic. Memoized on [comps] so a
+  // failing block reports the suspects without an Object.keys scan per patch.
+  const componentKeys = useMemo(() => (comps ? Object.keys(comps) : EMPTY_KEYS), [comps]);
   const onMetrics = useMemo<RenderMetricsHook | undefined>(
     () =>
       onRenderMetrics
@@ -304,19 +362,28 @@ function BrookMarkdownFromClient({
       aria-live={ariaLive}
       aria-atomic={ariaAtomic}
     >
-      {rendered.map((b) => (
-        <BlockView
-          key={b.id}
-          block={b}
-          components={comps}
-          virtualize={virtualize}
-          sanitize={sanitize}
-          childMemo={childMemo}
-          onRenderMetrics={onMetrics}
-          decorators={decorators}
-          urlTransform={urlTransform}
-        />
-      ))}
+      {rendered.map((b, i) =>
+        // The guard runs BEFORE `key={b.id}` is evaluated: a malformed entry
+        // must not throw here (it would take the whole document down), and the
+        // store's density invariant is not something a renderer should bet on.
+        b == null || b.kind == null ? (
+          skipBadBlock(i)
+        ) : (
+          <BlockView
+            key={b.id}
+            block={b}
+            components={comps}
+            virtualize={virtualize}
+            sanitize={sanitize}
+            childMemo={childMemo}
+            onRenderMetrics={onMetrics}
+            decorators={decorators}
+            urlTransform={urlTransform}
+            componentKeys={componentKeys}
+            onBlockError={onBlockError}
+          />
+        ),
+      )}
       {stickToBottom && <div aria-hidden="true" style={{ scrollSnapAlign: "end" }} className="brook-bottom-anchor" />}
     </div>
   );
@@ -961,7 +1028,7 @@ const INTRINSIC_PX: Record<string, number> = {
   Component: 120,
 };
 
-function BlockViewImpl(props: {
+interface BlockViewProps {
   block: Block;
   components?: Components;
   virtualize?: boolean;
@@ -970,7 +1037,13 @@ function BlockViewImpl(props: {
   onRenderMetrics?: RenderMetricsHook;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
-}) {
+  /** Diagnostic passthrough for the boundary; derived from `components`, so its
+   *  identity is stable whenever `components` is. */
+  componentKeys?: string[];
+  onBlockError?: (error: Error, info: BlockErrorInfo) => void;
+}
+
+function BlockViewImpl(props: BlockViewProps) {
   const { block, virtualize, onRenderMetrics } = props;
   // Render-churn probe (only when a hook is wired — refs are cheap, but the
   // measurement + hook call below are guarded so the no-hook path is untouched).
@@ -1030,7 +1103,8 @@ function renderBlockContent({
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
 }) {
-  const kind = block.kind.type;
+  const kind = block?.kind?.type;
+  if (kind === undefined) return null;
   // Decorators / urlTransform run on the post-parse node tree, so a block that
   // uses either must take the walk path (htmlToReact via SafeHtml). They also
   // disable the keyed table/list/container streaming fast paths below (those
@@ -1179,9 +1253,14 @@ function renderBlockContent({
 // is what stops a committed block from re-rendering (and thus re-parsing) on
 // every streaming patch.
 export function blocksEqual(
-  prev: { block: Block; components?: Components; virtualize?: boolean; sanitize?: (html: string) => string; childMemo?: boolean; onRenderMetrics?: RenderMetricsHook; decorators?: Decorator[]; urlTransform?: UrlTransform },
-  next: { block: Block; components?: Components; virtualize?: boolean; sanitize?: (html: string) => string; childMemo?: boolean; onRenderMetrics?: RenderMetricsHook; decorators?: Decorator[]; urlTransform?: UrlTransform },
+  prev: BlockViewProps,
+  next: BlockViewProps,
 ): boolean {
+  // A comparator that throws surfaces as a render crash with none of our
+  // components in the stack — the hardest possible thing to diagnose. If either
+  // side is missing, report "not equal" and let BlockViewImpl's own guard (and
+  // the boundary above it) deal with it.
+  if (prev.block == null || next.block == null) return prev.block === next.block;
   return (
     prev.block.id === next.block.id &&
     prev.block.html === next.block.html &&
@@ -1196,8 +1275,132 @@ export function blocksEqual(
     // busts the memo so every committed block re-decorates — the O(n²) footgun
     // the dev warning calls out. A hoisted/memoized value keeps the memo holding.
     prev.decorators === next.decorators &&
-    prev.urlTransform === next.urlTransform
+    prev.urlTransform === next.urlTransform &&
+    // Same identity rule as onRenderMetrics: an inline `onBlockError={() => …}`
+    // is a fresh closure per render and would re-render every block on every
+    // patch. Hoist or memoize it (documented alongside the other hooks).
+    prev.onBlockError === next.onBlockError &&
+    prev.componentKeys === next.componentKeys
   );
 }
 
-const BlockView = memo(BlockViewImpl, blocksEqual);
+// Instrumentation: how many times a per-block boundary has rendered. The
+// boundary sits inside `memo`, so a committed block must not re-render one when
+// the streaming tail patches — this counter is what the linearity test asserts
+// on. Same pattern (and same negligible prod cost) as html-to-react's
+// `getParseCount`.
+let boundaryRenders = 0;
+export function __getBoundaryRenders(): number {
+  return boundaryRenders;
+}
+export function __resetBoundaryRenders(): void {
+  boundaryRenders = 0;
+}
+
+/**
+ * The memoized unit: boundary + block body.
+ *
+ * The boundary sits INSIDE `memo` on purpose. Outside it, the class would
+ * re-render for every block on every patch — O(n) work per patch, O(n^2) over a
+ * stream — because a parent render always rebuilds its children's elements. In
+ * here it is covered by `blocksEqual`, so a committed block skips the boundary
+ * and the body alike, exactly as before containment existed. The cost of
+ * containment is one extra element per ACTUAL render, i.e. the streaming tail.
+ */
+function BlockViewOuter(props: BlockViewProps) {
+  const { block, componentKeys, onBlockError } = props;
+  return (
+    <BlockBoundary
+      blockId={block.id}
+      kind={block.kind.type}
+      html={block.html}
+      componentKeys={componentKeys ?? EMPTY_KEYS}
+      onBlockError={onBlockError}
+    >
+      <BlockViewImpl {...props} />
+    </BlockBoundary>
+  );
+}
+
+const BlockView = memo(BlockViewOuter, blocksEqual);
+
+/**
+ * Per-block error containment.
+ *
+ * React unmounts the WHOLE tree on an uncaught render error, so before this a
+ * single throwing `components` override blanked the entire document. Each block
+ * gets its own boundary instead: the failure costs that one block, the rest of
+ * the stream keeps rendering, and the next patch retries it (a new `html` resets
+ * the boundary, so a transient streaming-tail failure self-heals once the block
+ * settles).
+ *
+ * Deliberately a class component — `getDerivedStateFromError` has no hook form.
+ * It renders `children` untouched on the happy path, so it costs one extra
+ * element per block and nothing else.
+ */
+interface BlockBoundaryProps {
+  blockId: number;
+  kind: string;
+  html: string;
+  componentKeys: string[];
+  onBlockError?: (error: Error, info: BlockErrorInfo) => void;
+  children: ReactNode;
+}
+interface BlockBoundaryState {
+  /** True while this block is being skipped. */
+  caught: boolean;
+  /** The `html` that threw. Cleared once a later patch changes it, so the block
+   *  is retried instead of left permanently blank. */
+  failedHtml: string | null;
+}
+class BlockBoundary extends Component<BlockBoundaryProps, BlockBoundaryState> {
+  state: BlockBoundaryState = { caught: false, failedHtml: null };
+
+  static getDerivedStateFromError(): Partial<BlockBoundaryState> {
+    return { caught: true };
+  }
+
+  /** Retry once the block's HTML moves on. A streaming-tail failure — a
+   *  speculatively-closed tag, a prop that is only transiently absent — then
+   *  heals itself when the block settles, instead of leaving a hole for the rest
+   *  of the session. */
+  static getDerivedStateFromProps(
+    props: BlockBoundaryProps,
+    state: BlockBoundaryState,
+  ): Partial<BlockBoundaryState> | null {
+    if (state.caught && state.failedHtml !== null && state.failedHtml !== props.html) {
+      return { caught: false, failedHtml: null };
+    }
+    return null;
+  }
+
+  componentDidCatch(error: Error) {
+    const info: BlockErrorInfo = {
+      blockId: this.props.blockId,
+      kind: this.props.kind,
+      componentKeys: this.props.componentKeys,
+      html: this.props.html.slice(0, 200),
+    };
+    this.setState({ failedHtml: this.props.html });
+    if (this.props.onBlockError) {
+      this.props.onBlockError(error, info);
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.error(
+      `brookmd: block ${info.blockId} (${info.kind}) failed to render and was skipped. ` +
+        `This is almost always a \`components\` override throwing. If the override is ` +
+        `registered for a block-kind or component-tag key, note that the SAME key is also ` +
+        `dispatched for a matching element nested inside a block's HTML — that call gets ` +
+        `attributes + children only, with no \`block\` prop. Guard with ` +
+        `\`if (!block) return <>{children}</>\`.`,
+      { componentKeys: info.componentKeys, html: info.html },
+      error,
+    );
+  }
+
+  render(): ReactNode {
+    boundaryRenders++;
+    return this.state.caught ? null : this.props.children;
+  }
+}

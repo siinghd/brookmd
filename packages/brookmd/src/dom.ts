@@ -233,9 +233,15 @@ export function mountBrookMarkdown(
     const nextOrder: number[] = new Array(snapshot.length);
     const seen = new Set<number>();
 
+    let w = 0;
     for (let i = 0; i < snapshot.length; i++) {
       const b = snapshot[i];
-      nextOrder[i] = b.id;
+      // Parity with the React renderer: a malformed entry is skipped, never
+      // dereferenced. The store's invariants say this cannot happen; a thrown
+      // TypeError here would abort the whole reconcile mid-way and leave the
+      // container in a half-updated state.
+      if (b == null || b.kind == null) continue;
+      nextOrder[w++] = b.id;
       seen.add(b.id);
       const existing = mounted.get(b.id);
       if (!existing) {
@@ -350,6 +356,9 @@ export function mountBrookMarkdown(
       }
     }
 
+    // Only ever shorter when a malformed entry was skipped above; `order` must
+    // not carry trailing holes into reconcileChildren.
+    if (w !== nextOrder.length) nextOrder.length = w;
     order = nextOrder;
     reconcileChildren();
   }

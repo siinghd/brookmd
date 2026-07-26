@@ -766,6 +766,33 @@ block. The component receives [`BlockComponentProps`](#types): `{ block, html,
 open, speculative }`, plus `text`/`language` for code/math blocks (the alert
 type is at `block.kind.data.kind`).
 
+> **One map, two prop contracts — the single biggest footgun.** The keys above
+> are looked up by TWO dispatchers. The block-kind dispatcher passes
+> `BlockComponentProps` (with `block`); the element dispatcher, which is what
+> makes `a` / `code` / `table` overrides work, passes **the element's attributes
+> and `children` only — no `block`**. The same name can hit both: an
+> `inlineComponentTags` chip, or a `componentTags` tag that lands inside a list
+> item or blockquote (where it is a real *nested* Component block, rendered as an
+> element inside its container's HTML), takes the element path. So an override
+> that reads `props.block.…` throws `can't access property "kind", block is
+> undefined` for those occurrences — intermittently, because it depends on where
+> the model happened to put the tag.
+>
+> Write any override for a name that can appear in both positions defensively:
+>
+> ```tsx
+> const Thinking = ({ block, children }) =>
+>   block ? <Panel data={block.kind.data}>{children}</Panel> : <span>{children}</span>;
+> ```
+>
+> Three things make this survivable rather than fatal: block-kind keys are typed
+> to `BlockComponentProps`, so a mismatched override is a **compile** error; a raw
+> element whose name collides with a block-kind key (`<Table>`, `<Alert>`… — only
+> reachable with raw-HTML passthrough on) is never dispatched to that override;
+> and every block renders inside its own **error boundary**, so a throwing
+> override costs that one block instead of unmounting the document. Wire
+> [`onBlockError`](#onblockerror) to see them.
+
 Rules worth knowing:
 
 - **There is no `node` prop / no hast tree.** Introspect via `className` /
@@ -928,9 +955,23 @@ tags only). It works everywhere inline content does — **including table cells*
 Tag names match **case-sensitively** and dispatch verbatim to `components[tag]`
 (`<tik>`→`components.tik`, `<Cite>`→`components.Cite`). The
 two lists are independent: list a tag under `componentTags` for blocks,
-`inlineComponentTags` for inline, or both for both. An allowlisted tag used in an
-unsupported position degrades **inertly** (escaped) — it never consumes
-surrounding content.
+`inlineComponentTags` for inline, or both for both.
+
+Where an allowlisted tag actually lands:
+
+| Position | Result |
+| --- | --- |
+| Own line, top level | block `Component` — override gets `BlockComponentProps` |
+| Own line inside a list item / blockquote | real **nested** Component block, emitted as an element inside the container's HTML — the override is dispatched by **element name**, so it gets attributes + `children` and **no `block`** |
+| Mid-paragraph, listed in `inlineComponentTags` | inline element — attributes + `children`, no `block` |
+| Mid-paragraph, NOT listed in `inlineComponentTags` | escaped text |
+| Inside a table cell | escaped text (cells are inline-only) |
+
+An allowlisted tag in a position that is not supported degrades **inertly**
+(escaped) — it never consumes surrounding content. But note rows 2 and 3: those
+DO render, through the element path, which is why an override that reads
+`props.block` must guard for its absence (see [the two prop
+contracts](#custom-components--overrides)).
 
 > **Link-bridge alternative.** Before `inlineComponentTags`, the way to get an
 > inline custom element was the link bridge: emit `[$AAPL](tik://AAPL)` and
@@ -1268,6 +1309,33 @@ re-snapping during streaming, so treat smooth following there as best-effort.
 > **Metrics note:** because workers are shared, `getMetrics().wasmMemoryBytes`
 > is the *shared* worker's heap — clients on the same worker report the same
 > value. Aggregate with `Math.max`, not a sum.
+
+<a id="onblockerror"></a>
+
+### When a block fails to render — `onBlockError`
+
+Every block renders inside its own error boundary. React's default response to
+an uncaught render error is to unmount the **entire** tree, so before this a
+single throwing `components` override blanked the whole document. Now the
+failure costs that one block: the rest of the stream keeps rendering, and the
+block is retried as soon as its HTML changes (so a streaming-tail failure heals
+itself when the block settles).
+
+```tsx
+<BrookMarkdown
+  client={client}
+  components={components}
+  onBlockError={(err, { blockId, kind, componentKeys, html }) => {
+    reportToSentry(err, { blockId, kind, componentKeys, html });
+  }}
+/>
+```
+
+`componentKeys` is the override map's keys — the shortlist of suspects — and
+`html` is the first 200 chars of the block that failed. Without the hook the same
+detail goes to `console.error`. The overwhelmingly common cause is an override
+reading `props.block.…` on the element path, where there is no `block`; see [the
+two prop contracts](#custom-components--overrides).
 
 ## Architecture
 

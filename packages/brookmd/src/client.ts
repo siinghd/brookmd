@@ -1,3 +1,4 @@
+import { warnOnce } from "./warn";
 import type { Block, FromWorker, ParserConfig, Patch, ToWorker, WorkerLike } from "./types-core";
 // The `new Worker(new URL(..., import.meta.url))` construction lives in
 // ./asset-urls so React Native can swap it out: the package's `react-native`
@@ -82,13 +83,35 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
   store.active = active;
   // Fresh array each patch (immutable for React reference checks), but the
   // committed entries inside it are the same object references as before.
+  // INVARIANT (lines above): every id pushed to committedOrder is `set` in the
+  // same iteration, and nothing in the package ever deletes from the map — so no
+  // lookup can miss. Belt-and-braces anyway: if that invariant ever breaks, DROP
+  // the orphan rather than publish a hole. A hole reaches `key={b.id}` in the
+  // React renderer and `b.id` in the DOM renderer, and takes down the whole
+  // document; one missing block is survivable, a blank page is not.
   const next: Block[] = new Array(store.committedOrder.length + store.active.length);
+  let w = 0;
   for (let i = 0; i < store.committedOrder.length; i++) {
-    next[i] = store.committed.get(store.committedOrder[i])!;
+    const b = store.committed.get(store.committedOrder[i]);
+    if (b === undefined) {
+      warnOnce(
+        "orphan-committed",
+        `brookmd: committed block ${store.committedOrder[i]} is missing from the store and was dropped. ` +
+          `This is a bug in brookmd — please report it.`,
+      );
+      continue;
+    }
+    next[w++] = b;
   }
   for (let i = 0; i < store.active.length; i++) {
-    next[store.committedOrder.length + i] = store.active[i];
+    const b = store.active[i];
+    if (b === undefined) {
+      warnOnce("orphan-active", `brookmd: active block at index ${i} is undefined and was dropped.`);
+      continue;
+    }
+    next[w++] = b;
   }
+  if (w !== next.length) next.length = w; // only ever runs in the broken case
   store.snapshot = next;
 }
 
@@ -454,6 +477,9 @@ export class BrookClient {
   private streamId = 0;
   private config?: ParserConfig;
   private configSent = false;
+  /** Set when ensureAcquired rebound this stream onto a fresh worker+parser
+   *  after a fatal failure; consumed by the next content-bearing op. */
+  private pendingRebind = false;
   private listeners = new Set<() => void>();
   private store: BlockStore = emptyBlockStore();
   private onError?: (err: { message: string; fatal?: boolean }) => void;
@@ -543,6 +569,9 @@ export class BrookClient {
   // reads between notifies must return the SAME reference — the
   // useSyncExternalStore cached-snapshot contract.
   private mergeCache: { base: Block[]; trimmed: boolean; view: Block[] } | null = null;
+  /** Set by mergeStale when it had to compact a hole out of the view, so
+   *  getSnapshot skips caching a view whose indices no longer track `base`. */
+  private mergeDropped = false;
 
   // Perf
   private appendedBytes = 0;
@@ -630,11 +659,52 @@ export class BrookClient {
     // trap that poisoned the shared instance) was evicted from the pool; drop the
     // stale reference and re-acquire so this stream can recover onto a fresh
     // worker (the caller already received the fatal onError).
+    const rebinding = this.pw !== null;
     this.pw = null;
     const { streamId, pw } = this.pool.acquire((msg) => this.onMessage(msg));
     this.streamId = streamId;
     this.pw = pw;
+    if (rebinding) {
+      // The worker keeps parser config per streamId, so a DIFFERENT worker (or
+      // even the same one under a new streamId) has never seen ours. Without
+      // this the healed parser is rebuilt with library defaults — gfmMath,
+      // componentTags, blockData and the whole `kind.data` structured channel
+      // silently disappear for the rest of the session.
+      this.configSent = false;
+      // The fresh parser numbers blocks from 0 again while our store still holds
+      // the dead generation's blocks. Merging the two would collide ids, so the
+      // next content-bearing op starts a clean generation instead. Deferred (not
+      // done here) because resetParser() calls back into ensureAcquired().
+      this.pendingRebind = true;
+    }
     return pw;
+  }
+
+  /**
+   * A worker rebind left the store holding a dead generation's blocks while the
+   * fresh parser restarts ids at 0. Called by the ops that actually feed the
+   * parser, before they do. Recovery's re-feed handles this itself (it re-parses
+   * the whole document over a preserved view) and clears the flag; this is the
+   * path where recovery is off or already spent, where the honest outcome is a
+   * clean restart rather than two generations interleaved under colliding ids.
+   */
+  private settleRebind(): void {
+    if (!this.pendingRebind) return;
+    // Only a TERMINAL failure gets here. While the one-shot recovery microtask is
+    // queued, `failedError` is still null and the re-feed owns the rebuild — it
+    // re-parses the whole buffered document over a preserved view. Restarting
+    // underneath it would clear `recoveryBuffer` and heal the wrong document.
+    if (this.failedError === null) return;
+    this.pendingRebind = false;
+    if (this.store.snapshot.length === 0 && !this.staleSnapshot) return;
+    warnOnce(
+      "rebind-reset",
+      "brookmd: the parser was rebuilt on a new worker after a fatal failure, so the " +
+        "document restarted. Blocks rendered before the failure were dropped because the " +
+        "fresh parser renumbers from zero. Enable `recovery` (the default) to re-feed and " +
+        "heal invisibly instead.",
+    );
+    this.resetParser();
   }
 
   get ready(): boolean {
@@ -671,6 +741,7 @@ export class BrookClient {
 
   append(chunk: string) {
     const pw = this.ensureAcquired();
+    this.settleRebind();
     if (this.firstAppendMs === 0) this.firstAppendMs = performance.now();
     if (this.recovery) {
       // Accumulate the driven document so a transient worker death can re-feed it
@@ -689,6 +760,7 @@ export class BrookClient {
 
   finalize() {
     const pw = this.ensureAcquired();
+    this.settleRebind();
     // The terminal patch this triggers must reach subscribers synchronously, not
     // a frame late — mark it so the next emit flushes now even under coalescing.
     this.finalizePending = true;
@@ -870,6 +942,7 @@ export class BrookClient {
     // deliberately does NOT touch these — only an explicit reset() does.
     this.failedError = null;
     this.recoveryAttempted = false;
+    this.pendingRebind = false; // this reset IS the fresh generation
     this.resetParser();
     if (hadContent) this.emit(true); // clear-the-view notify is synchronous
   }
@@ -1010,7 +1083,12 @@ export class BrookClient {
     // Reuse the previous merge's decisions only within the same trim phase —
     // a trim changes the rules, so it clears the cache and recomputes once.
     const view = this.mergeStale(base, cache && cache.trimmed === this.staleTrimmed ? cache : null);
-    this.mergeCache = { base, trimmed: this.staleTrimmed, view };
+    if (this.mergeDropped) {
+      this.mergeDropped = false;
+      this.mergeCache = null; // indices are compacted; not a valid decision table
+    } else {
+      this.mergeCache = { base, trimmed: this.staleTrimmed, view };
+    }
     return view;
   };
 
@@ -1042,6 +1120,7 @@ export class BrookClient {
     const stale = this.staleSnapshot!;
     const len = this.staleTrimmed ? base.length : Math.max(base.length, stale.length);
     const view: Block[] = new Array(len);
+    let dropped = false;
     for (let i = 0; i < len; i++) {
       const nb = i < base.length ? base[i] : undefined;
       if (nb !== undefined && prev !== null && i < prev.base.length && prev.base[i] === nb) {
@@ -1050,7 +1129,15 @@ export class BrookClient {
       }
       const ob = i < stale.length ? stale[i] : undefined;
       if (!nb) {
-        view[i] = ob!;
+        // Unreachable given `len` above: !nb means i >= base.length, which when
+        // untrimmed implies i < stale.length, and when trimmed cannot happen at
+        // all (len === base.length). If the length rule ever changes, drop the
+        // position instead of publishing a hole into the rendered view.
+        if (ob === undefined) {
+          dropped = true;
+          continue;
+        }
+        view[i] = ob;
         continue;
       }
       if (ob) {
@@ -1078,6 +1165,13 @@ export class BrookClient {
         continue;
       }
       view[i] = { ...nb, id: this.idNamespace + nb.id };
+    }
+    if (dropped) {
+      warnOnce("merge-hole", "brookmd: the stale-merge produced an empty position — compacting.");
+      // Compacted indices no longer line up with `base`, so the caller must not
+      // cache this view as a per-index decision table for the next merge.
+      this.mergeDropped = true;
+      return view.filter((b): b is Block => b !== undefined);
     }
     return view;
   }
@@ -1319,6 +1413,10 @@ export class BrookClient {
     const displayed = this.getSnapshot();
     if (displayed.length > 0) this.softReset(displayed);
     else this.resetParser();
+    // The reset above IS the new generation (softReset even preserves the view
+    // across it), so the pending-rebind restart must not fire again inside the
+    // append below and blank what we just preserved.
+    this.pendingRebind = false;
     this.append(doc);
     if (done) this.finalize();
   }

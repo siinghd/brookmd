@@ -186,6 +186,93 @@ fn block_tag_used_inline_does_not_eat_following_blocks() {
     assert!(!kinds.iter().any(|k| k == "Component"), "no block component opened: {kinds:?}");
 }
 
+fn tagged(tags: &[&str]) -> StreamParser {
+    StreamParser::new().with_component_tags(tags.iter().map(|s| s.to_string()).collect())
+}
+
+/// Feed `md` in `size`-byte chunks, returning every block HTML observed on every
+/// tick (the intermediate views a consumer actually renders), then the settled
+/// (post-finalize) document HTML.
+fn ticks(md: &str, tags: &[&str], size: usize) -> (Vec<String>, String) {
+    let mut p = tagged(tags);
+    let mut seen = Vec::new();
+    let mut fed = 0usize;
+    while fed < md.len() {
+        let end = (fed + size).min(md.len());
+        p.append(&md[fed..end]);
+        fed = end;
+        seen.extend(p.all_blocks().map(|b| b.html.to_string()));
+    }
+    p.finalize();
+    (seen, collect(&p))
+}
+
+#[test]
+fn streaming_never_emits_a_component_open_tag_it_retracts() {
+    // Convergence property: an open tag only opens a component block when its
+    // line is KNOWN to be whole. Mid-stream, `<Tag>` at the end of the fed bytes
+    // could still turn out to be `<Tag>x</Tag> …` (an inline occurrence, which
+    // degrades to escaped text) — so rendering it as a component for one tick
+    // and reverting forever after mounts a real component in the consumer's tree
+    // with a prop shape that is then retracted. No tick may emit a raw tag that
+    // the settled output does not contain.
+    let cases: &[(&str, &[&str])] = &[
+        ("> <Thinking>x</Thinking>\n\ndone\n", &["Thinking"]),
+        ("<tik>AAPL</tik> is up today.\n", &["tik"]),
+        ("- <Thinking>\n  reasoning\n  </Thinking>\n", &["Thinking"]),
+        ("<Thinking>\nbody\n</Thinking>\n", &["Thinking"]),
+    ];
+    for (md, tags) in cases {
+        for size in 1..=8usize {
+            let (seen, settled) = ticks(md, tags, size);
+            // Raw markers the settled document does NOT contain are the ones a
+            // tick would have to retract. (When the tag legitimately settles as a
+            // component, its raw markers ARE in the settled HTML and are fine.)
+            let retracted: Vec<String> = tags
+                .iter()
+                .flat_map(|t| [format!("<{t}"), format!("</{t}")])
+                .filter(|m| !settled.contains(m.as_str()))
+                .collect();
+            for html in &seen {
+                for m in &retracted {
+                    assert!(
+                        !html.contains(m.as_str()),
+                        "chunk size {size}: tick html {html:?} emits {m:?}, \
+                         which the settled html {settled:?} does not contain (input {md:?})"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_open_still_settles_as_a_component() {
+    // The convergence gate above must only DEFER the decision, never lose it:
+    // both supported block shapes still settle as real component containers, and
+    // a whole-line open tag still opens while streaming (once a following line
+    // proves the boundary) rather than waiting for finalize.
+    let nested = "- <Thinking>\n  reasoning\n  </Thinking>\n";
+    for size in 1..=8usize {
+        let (_, settled) = ticks(nested, &["Thinking"], size);
+        assert!(
+            settled.contains("<li>") && settled.contains("<Thinking>") && settled.contains("reasoning"),
+            "chunk size {size}: nested component survives: {settled}"
+        );
+    }
+    let top = "<Thinking>\nbody\n</Thinking>\n";
+    for size in 1..=8usize {
+        let (_, settled) = ticks(top, &["Thinking"], size);
+        assert!(settled.contains("<Thinking>"), "chunk size {size}: component settles: {settled}");
+    }
+    // Mid-stream (no finalize) the component is already open once its first line
+    // is complete and a following line has begun.
+    let mut p = tagged(&["Thinking"]);
+    p.append("<Thinking>\nb");
+    let kinds: Vec<_> = p.all_blocks().map(|b| b.kind.tag().to_string()).collect();
+    assert!(kinds.iter().any(|k| k == "Component"), "opens mid-stream: {kinds:?}");
+}
+
 fn p_kinds(md: &str, tags: &[&str]) -> Vec<String> {
     let mut p = StreamParser::new()
         .with_gfm_autolinks(true)

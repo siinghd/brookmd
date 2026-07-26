@@ -27,7 +27,11 @@ import type { Block, Components, ParserConfig } from "./types";
 // renderers (Mermaid; client-side code highlighting) — those activate on the
 // client after hydration. Kept in step with react.tsx's renderBlockContent.
 function renderStaticBlock(block: Block, components?: Components): ReactNode {
-  const kind = block.kind.type;
+  // Parity with the client renderer's guard. No error boundary here on purpose:
+  // RSC forbids class components, and `renderToString` does not run boundaries
+  // anyway — so the client path is where containment lives.
+  const kind = block?.kind?.type;
+  if (kind === undefined) return null;
   if (components) {
     if (kind === "Component") {
       const tag = (block.kind.data as { tag?: string } | undefined)?.tag;

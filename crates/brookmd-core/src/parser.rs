@@ -4720,9 +4720,11 @@ impl StreamParser {
     /// Arm the component-block cache for the open `<Tag>` block at `start`.
     /// Returns `None` (no cache → full reparse) when the open-tag line is still
     /// incomplete (more bytes could dissolve the block — `<Chart>x` is no
-    /// component — and the attrs aren't frozen), or on any feed BAIL over the
-    /// body already present. The first feed processes every body byte present;
-    /// later appends fold only new bytes.
+    /// component — and the attrs aren't frozen), when the body is still empty
+    /// (`render_component` DEFERS the wrapper for exactly that state, so the
+    /// cache's `<Tag …>` assembly would not match the full rescan), or on any
+    /// feed BAIL over the body already present. The first feed processes every
+    /// body byte present; later appends fold only new bytes.
     fn build_component_block_cache(
         &self,
         start: usize,
@@ -4735,6 +4737,15 @@ impl StreamParser {
         let first_nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
         let first_line_end = start + first_nl;
         if bytes[start..first_line_end].contains(&b'\r') {
+            return None;
+        }
+        // Nothing past the open-tag line yet: the open tag could still turn out
+        // not to be alone on its line, so `render_component` renders it as
+        // literal text for this tick. Arming here would emit the wrapper on the
+        // next (possibly empty) append and break mid-stream/one-shot parity. The
+        // body is empty, so there is no re-render work to save either. One
+        // append later — the moment there IS a body — the cache arms as before.
+        if first_line_end + 1 >= end {
             return None;
         }
         // Wrapper opener, byte-identical to `render_component`.
