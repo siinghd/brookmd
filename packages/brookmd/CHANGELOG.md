@@ -4,6 +4,23 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## brookmd-react-native 0.1.4 — 2026-07-26
+
+### Fixed
+
+- **The native transport shim routes worker listeners by event type.** brookmd
+  0.24.0 taught `BrookPool` to listen on `error` / `messageerror` (the browser's
+  out-of-band worker-failure channels). `NativeWorker.addEventListener` ignored
+  its `type` argument and registered every listener in one set, so the pool's
+  fatal handler received the ordinary `ready` / `patch` envelopes and read the
+  first as `brookmd worker failed to load`, killing every stream before it
+  started. Neither channel can fire for an in-process shim — there is no script
+  URL to fetch and no structured-clone step — so they are now accepted and never
+  fired. This was latent: the package pinned `brookmd` to `^0.23.0`, which
+  predates those listeners, so it only surfaced when the range moved.
+- `brookmd` dependency range corrected `^0.23.0` → `^0.25.0`; vendored native
+  binaries rebuilt against `brookmd-core` 0.24.0.
+
 ## 0.25.0 — 2026-07-26
 
 Fixes a crash class where a `components` override could be invoked with the

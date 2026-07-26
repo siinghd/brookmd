@@ -102,3 +102,35 @@ describe("native transport shim", () => {
     client.destroy();
   });
 });
+
+// REGRESSION: the shim MUST route listeners by event type.
+//
+// brookmd 0.24.0 taught BrookPool to also listen on `error` / `messageerror`,
+// the browser's out-of-band worker-failure channels. This shim used to add every
+// listener to one set regardless of type, so the pool's fatal handler received
+// the ordinary `ready` / `patch` envelopes and read the first one as "brookmd
+// worker failed to load" — killing every stream before it started. It stayed
+// hidden only because this package pinned `brookmd` to ^0.23.0, which predates
+// those listeners; the moment the range moved, all native transport broke.
+test("the native worker delivers messages ONLY to `message` listeners", async () => {
+  const pool = createNativePool({ makeParser: fakeMakeParser() });
+  const messages: unknown[] = [];
+  const errors: unknown[] = [];
+  const messageErrors: unknown[] = [];
+
+  // Reach the underlying WorkerLike the way the pool does.
+  const { pw } = pool.acquire(() => {});
+  const worker = (pw as unknown as { worker: {
+    addEventListener(t: "message" | "error" | "messageerror", l: (ev: unknown) => void): void;
+  } }).worker;
+
+  worker.addEventListener("message", (ev) => messages.push(ev));
+  worker.addEventListener("error", (ev) => errors.push(ev));
+  worker.addEventListener("messageerror", (ev) => messageErrors.push(ev));
+
+  await settle();
+
+  expect(messages.length).toBeGreaterThan(0); // the ready envelope at minimum
+  expect(errors).toEqual([]); // never the out-of-band failure channel
+  expect(messageErrors).toEqual([]);
+});

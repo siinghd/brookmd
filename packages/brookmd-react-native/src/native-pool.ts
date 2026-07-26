@@ -74,8 +74,19 @@ class NativeWorker implements WorkerLike {
     this.core.handle(msg);
   }
 
-  addEventListener(_type: "message", listener: (ev: { data: FromWorker }) => void): void {
-    this.listeners.add(listener);
+  addEventListener(
+    type: "message" | "error" | "messageerror",
+    listener: (ev: { data: FromWorker }) => void,
+  ): void {
+    // MUST route by type. The pool also attaches `error` / `messageerror`
+    // handlers for the out-of-band browser failure channels (a worker script
+    // that 404s, an undeserializable posted message). Neither can happen to an
+    // in-process shim — there is no script URL to fetch and no structured-clone
+    // step — so they are accepted and never fired. Registering them alongside
+    // the message listener instead would deliver every `ready`/`patch` envelope
+    // straight into the pool's fatal path, which reads it as "worker failed to
+    // load" and kills the stream before it starts.
+    if (type === "message") this.listeners.add(listener);
   }
 
   terminate(): void {
