@@ -4,6 +4,73 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.25.0 — 2026-07-26
+
+Fixes a crash class where a `components` override could be invoked with the
+wrong prop shape and take the entire document down with it. If you pass
+`components` and read `props.block` in any of them, upgrade.
+
+### Fixed
+
+- **A `components` override no longer receives two incompatible prop shapes
+  without warning.** The map is consulted by two dispatchers: the block-kind
+  dispatcher (which supplies `BlockComponentProps`, including `block`) and the
+  element-name walker that powers `a`/`code`/`table` overrides (which supplies
+  attributes + `children` and **no `block`**). The same key reaches both — an
+  `inlineComponentTags` chip, or a `componentTags` tag nested inside a list item
+  or blockquote — so an override reading `props.block.…` threw
+  `can't access property "kind", block is undefined`, intermittently, depending
+  on where the model put the tag. Three defenses now apply: block-kind keys are
+  typed to `BlockComponentProps` (a mismatched override is a compile error), a
+  raw element whose name collides with a block-kind key is never dispatched to
+  that override, and every block renders inside its own error boundary.
+- **A throwing override costs one block, not the document.** React unmounts the
+  whole tree on an uncaught render error, so a single bad override blanked the
+  page. Each block now has its own boundary; the failed block is skipped and
+  retried as soon as its HTML changes, so a streaming-tail failure heals itself
+  when the block settles.
+- **The parser no longer emits a component tag it will retract.** A component
+  open tag was recognized as soon as it looked whole-line, but during streaming
+  end-of-buffer is not end-of-line — so `> <Thinking>x</Thinking>` rendered a
+  raw `<Thinking>` element for one tick before settling to escaped text. That
+  transient raw element is what reached overrides with the wrong props. A
+  component tag now opens a block only once its line is known to be complete.
+- **Recovery no longer loses the parser config.** The worker keeps config per
+  stream id, so the one-shot recovery re-feed landed on a worker that had never
+  seen it while `configSent` stayed latched — the healed parser was silently
+  rebuilt with library defaults, dropping `componentTags`, `blockData`,
+  `gfmMath` and the whole `kind.data` structured channel for the rest of the
+  session.
+- **A terminal worker failure no longer corrupts the document.** The store kept
+  the dead generation's blocks while the fresh parser renumbered from zero, so
+  the next append merged two generations under colliding ids (duplicate React
+  keys, silently overwritten blocks, a shrinking document). The generation now
+  restarts cleanly, with a one-time warning. Transient failures still heal
+  invisibly through recovery, unchanged.
+- **Per-block error containment is free for committed blocks.** The boundary
+  lives inside the per-block memo, so a settled document re-renders no
+  boundaries when the streaming tail patches — a new React-side complexity gate
+  (`test/boundary-linearity.test.tsx`) pins this, counting work rather than
+  timing it, mirroring the Rust `scaling` gate.
+- `applyPatch` and the stale-view merge now drop a malformed entry rather than
+  publishing a hole into the snapshot, and both renderers skip a block with no
+  `kind` instead of dereferencing it.
+
+### Added
+
+- **`onBlockError`** on `<BrookMarkdown>` — fires when a block's render throws,
+  with `{ blockId, kind, componentKeys, html }`. Without it the same detail goes
+  to `console.error`.
+
+### Changed
+
+- `Components` is now a mapped type: block-kind keys (`CodeBlock`, `Table`,
+  `Alert`, …) are typed to `BlockComponentProps`; every other key stays
+  permissive. Type-only, but it will surface existing mismatches at compile time.
+- Requires `brookmd-core` 0.24.0 (the streaming component-tag fix above).
+- `onBlockError` is identity-sensitive like `components` / `onRenderMetrics` —
+  hoist or memoize it, or every block re-renders on every patch.
+
 ## 0.24.0 — 2026-07-24
 
 ### Added
