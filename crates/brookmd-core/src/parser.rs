@@ -1506,6 +1506,19 @@ struct ComponentBlockCache {
     /// Whether the outer parser has footnotes on (then a `[^` body marker BAILS,
     /// since the nested parser runs with footnotes off).
     footnotes: bool,
+    /// SETTLED twin of `inner`: the same body with the same flags, but with
+    /// `force_open_tail` OFF, so every block IT froze at commit time froze with
+    /// `open_tail = false`. Serves the appends where the outer buffer ends on a
+    /// blank line — there the full rescan renders the open component, and all
+    /// its sub-blocks, settled, which `inner`'s forced-open commits can never
+    /// match. Built and fed LAZILY, only on the appends that actually read it,
+    /// so each catch-up feed spans just the bytes since the previous
+    /// blank-ending append and the pair costs O(body) over the whole stream.
+    /// Stays `None` for a body that never contains a blank line.
+    settled: Option<Box<StreamParser>>,
+    /// Absolute outer-buffer offset already fed to `settled`. Starts at the body
+    /// start, like `fed_upto`, and lags it between blank-ending appends.
+    settled_fed: usize,
 }
 
 /// Incremental render state for a still-growing single-line ATX heading at the
@@ -4554,6 +4567,23 @@ impl StreamParser {
         inner
     }
 
+    /// The SETTLED twin of [`Self::make_nested_parser`]: an identical nested
+    /// parser with `force_open_tail` off, so it applies the ordinary per-block
+    /// `open_tail` gate instead of forcing the flag on for every block.
+    ///
+    /// Every block such a parser COMMITS froze with `open_tail = false`: a
+    /// non-`commit_all` pass never commits the final block (the only one the
+    /// gate can open), the def-run commit cut only fires for a block that does
+    /// NOT abut EOF, and the `commit_all` passes are exactly the blank-ending /
+    /// finalizing ones, where the gate is false anyway. It is read only while
+    /// the buffer ends blank, so its still-active tail renders settled too —
+    /// which is precisely the full rescan's view of an open component's body.
+    fn make_nested_parser_settled(&self) -> Box<StreamParser> {
+        let mut inner = self.make_nested_parser();
+        inner.force_open_tail = false;
+        inner
+    }
+
     /// Arm the structured-container cache for an open blockquote / alert at
     /// `start`. Returns `None` (no cache → full reparse) when the nested parser
     /// could not reproduce the inner byte-for-byte: an incomplete first line (the
@@ -4677,14 +4707,20 @@ impl StreamParser {
         {
             return None;
         }
-        // Parity gate: when the buffer ends with a blank line the full rescan
-        // renders the open component — and ALL its inner sub-blocks — with
-        // `open_tail = false`, but the nested parser's frozen commits rendered
-        // with `force_open_tail = true`. Bail for this append (blank lines are
-        // legal component-body content, unlike in a `>` container).
-        if self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n") {
-            return None;
-        }
+        // Parity reconciliation: when the buffer ends with a blank line the full
+        // rescan renders the open component — and ALL its inner sub-blocks —
+        // with `open_tail = false`, but `cache.inner`'s frozen commits rendered
+        // with `force_open_tail = true`. Those appends are served from the
+        // SETTLED twin instead (see `ComponentBlockCache::settled`), which froze
+        // its own commits with the gate off.
+        //
+        // BAILING here instead — which drops the cache, forcing the full rescan
+        // to re-render the whole open block AND rebuild a fresh nested parser
+        // over the entire body — costs O(body) at EVERY blank line. Blank lines
+        // are legal component-body content (unlike in a `>` container, where one
+        // ends the container), so they arrive once per body paragraph: that bail
+        // is what made an open component block quadratic in its body length.
+        let ends_blank = self.buffer.ends_with("\n\n") || self.buffer.ends_with("\r\n\r\n");
         let delta_start = cache.fed_upto;
         if component_delta_bails(&bytes[delta_start..end], cache.last_fed, cache.footnotes) {
             return None;
@@ -4701,8 +4737,21 @@ impl StreamParser {
             cache.last_fed = Some(bytes[end - 1]);
         }
 
-        let html =
-            assemble_wrapped_body(&cache.wrapper_open, true, &cache.inner, &cache.wrapper_close);
+        // Catch the settled twin up — creating it on first need — only on the
+        // appends that actually read it: O(bytes since the previous blank-ending
+        // append), not O(body). Feeding it one gulp rather than per-append is
+        // safe because a nested parser's `all_blocks()` is chunk-independent.
+        let body: &StreamParser = if ends_blank {
+            let settled = cache.settled.get_or_insert_with(|| self.make_nested_parser_settled());
+            if end > cache.settled_fed {
+                settled.append(&self.buffer[cache.settled_fed..end]);
+                cache.settled_fed = end;
+            }
+            settled
+        } else {
+            &cache.inner
+        };
+        let html = assemble_wrapped_body(&cache.wrapper_open, true, body, &cache.wrapper_close);
         let block = Block {
             id: cache.id,
             kind: cache.kind.clone(),
@@ -4797,6 +4846,8 @@ impl StreamParser {
             in_fence: false,
             last_fed: None,
             footnotes: self.gfm_footnotes,
+            settled: None,
+            settled_fed: start + open_end_rel,
         };
         let delta_start = cache.fed_upto;
         if component_delta_bails(&bytes[delta_start..end], None, cache.footnotes) {

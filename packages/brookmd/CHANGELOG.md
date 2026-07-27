@@ -4,6 +4,58 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.25.2 — 2026-07-27
+
+Performance only. Rendered output is unchanged — byte-identical mid-stream, not
+just at finalize.
+
+### Fixed
+
+- **An open component block no longer re-scans its whole body on every blank
+  line — O(n²) → O(n).** `try_incremental_component` bailed whenever the fed
+  buffer ended on a blank line, and because the cache had already been taken the
+  bail dropped it, forcing a full tail re-scan, a full re-render, and a fresh
+  nested parser over the entire body. Blank lines are legal component-body
+  content, so that fired once per body paragraph.
+
+  The bail existed for a real reason: when the buffer ends blank the full rescan
+  renders the component and all its sub-blocks with `open_tail = false`, which
+  the nested parser's `force_open_tail = true` commits can never match. Rather
+  than work around it with a trigger-byte heuristic (measured: still 3.9×/doubling
+  on any body containing a backtick or bracket — i.e. all real ones), the cache
+  now carries a **settled twin**: a second nested parser with `force_open_tail`
+  off, fed lazily only on the appends that read it, so each catch-up spans just
+  the bytes since the previous blank line. A body with no blank lines never
+  allocates it. The cache now arms once per stream instead of once per paragraph.
+
+  Streaming a 64 KB `<Thinking>` body, scan work and wall time:
+
+  | body | before | after |
+  | --- | --- | --- |
+  | plain paragraphs | 117,333,095 B / 11,954 ms | 229,837 B / **269 ms** |
+  | with inline code | 101,046,887 B / 9,316 ms | 224,977 B / **226 ms** |
+  | with links | 86,362,310 B / 6,837 ms | 220,835 B / **180 ms** |
+  | with `$` and `<` | 117,333,095 B / 7,333 ms | 229,837 B / **388 ms** |
+
+  Scan and render work are now 2.00×/doubling (dead linear); the residual
+  3.3–3.6×/doubling in wall time is a separate, pre-existing cliff —
+  `assemble_wrapped_body` re-materializes an open block's HTML every append —
+  which the already-registered `open-block-html-reemit` shape sits in too.
+
+  **Trade-off:** the twin holds a second copy of an open component's body bytes
+  plus one rendered-HTML set, freed when the block closes. Roughly 2× transient
+  memory for open component blocks *that contain blank lines*; blank-free bodies
+  are unaffected.
+
+### Added
+
+- `tests/scaling.rs` gains `component_multi_para` and `component_multi_para_rich`
+  (backticks, brackets, `$`, `<`), both gated `Linear`. The existing
+  `component_block_open` shape generates no blank lines and so was structurally
+  blind to this: its `scanned` is a flat 249 B from 8 KB to 64 KB. The new shapes
+  measure 252.4× on the pre-fix parser (gate fails) and 16.0× over a 16× span
+  after.
+
 ## 0.25.1 — 2026-07-27
 
 A correction release. 0.25.0 shipped one user-visible regression and a dev-gate
@@ -48,6 +100,15 @@ memory leak on the opt-in `childMemo` path. Upgrade from 0.25.0.
   The boundary's `console.error` keeps everything actionable in production (block
   id, kind, override keys, HTML excerpt, the error) and moves only the
   explanatory prose behind the dev gate.
+
+## brookmd-react-native 0.1.6 — 2026-07-27
+
+### Fixed
+
+- Vendored native binaries rebuilt against `brookmd-core` 0.24.2, which makes an
+  open component block's streaming cost linear in its body. This matters more
+  on-device than in the browser: the pre-fix path spent ~24 s of native CPU on a
+  64 KB token-streamed `<Thinking>` body. No JS changes.
 
 ## brookmd-react-native 0.1.5 — 2026-07-27
 

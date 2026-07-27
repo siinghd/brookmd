@@ -362,6 +362,56 @@ fn component_block_open(target: usize) -> String {
     s // close tag never arrives
 }
 
+/// component-open-blank-line: the blank-line twin of `component_block_open`.
+/// That shape's body is one unbroken run of single lines, so it never ends an
+/// append on a blank line and its `scanned` sits at a constant 249 bytes —
+/// structurally blind to the bail this pins. Here the body is PARAGRAPHS, so
+/// the buffer ends `\n\n` once per paragraph, which is where the open-tail
+/// disagreement between the nested parser's forced-open commits and the full
+/// rescan's settled render lives. That used to drop the cache and rebuild a
+/// fresh nested parser over the whole body every time — O(body) per paragraph.
+///
+/// Each unit is exactly `CHUNK` bytes and ends in the blank line (the header
+/// line is folded into the first unit), so EVERY append boundary is a `\n\n`
+/// boundary and the shape exercises the path deterministically instead of
+/// depending on where the chunk grid happens to fall.
+fn component_multi_para(target: usize) -> String {
+    component_paras(target, |i| format!("para {i} with **bold** and words"))
+}
+
+/// Same shape with the inline constructs a real `<Thinking>` / `<Callout>` body
+/// is full of: backticks, brackets, `$` and `<`. Every one of those is an
+/// `open_tail` TRIGGER byte, so a sensitivity heuristic that latches on the
+/// trigger alone (the `open_item_ot_sensitive` scheme the list cache uses)
+/// leaves this variant quadratic while `component_multi_para` looks fixed.
+fn component_multi_para_rich(target: usize) -> String {
+    component_paras(target, |i| {
+        format!("para {i} `code` [link](https://e.com/p{i}) $x$ and 3 < 4")
+    })
+}
+
+/// Shared body builder for the two shapes above: `<Chart>` that never closes,
+/// then paragraphs padded to exactly `CHUNK` bytes including their blank line.
+fn component_paras(target: usize, body: fn(usize) -> String) -> String {
+    const HEAD: &str = "<Chart>\n";
+    let mut s = String::from(HEAD);
+    let mut i = 0usize;
+    while s.len() < target {
+        // First unit absorbs the open-tag line so the grid starts aligned.
+        let unit = if i == 0 { CHUNK - HEAD.len() } else { CHUNK };
+        let mut para = body(i);
+        para.truncate(unit - 2);
+        // Pad inside the last word — trailing spaces would be a hard break.
+        while para.len() < unit - 2 {
+            para.push('x');
+        }
+        para.push_str("\n\n");
+        s.push_str(&para);
+        i += 1;
+    }
+    s // close tag never arrives
+}
+
 /// A single giant ATX heading line, still growing (no newline) — streams via
 /// HeadingCache (the paragraph cache's settled-prefix scheme in `<hN>`).
 fn heading_words(target: usize) -> String {
@@ -1055,6 +1105,29 @@ fn shapes() -> Vec<Shape> {
         Shape {
             name: "component_block_open",
             gen: component_block_open,
+            opts: chart_tag,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        // component-open-blank-line: FIXED — the blank-ending appends are served
+        // from the cache's SETTLED nested twin instead of dropping the cache, so
+        // the body streams in O(new bytes) whether or not it has blank lines.
+        Shape {
+            name: "component_multi_para",
+            gen: component_multi_para,
+            opts: chart_tag,
+            chunk: CHUNK,
+            small: SMALL,
+            large: LARGE,
+            scanned: Linear,
+            rendered: Linear,
+        },
+        Shape {
+            name: "component_multi_para_rich",
+            gen: component_multi_para_rich,
             opts: chart_tag,
             chunk: CHUNK,
             small: SMALL,

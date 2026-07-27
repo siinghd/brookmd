@@ -1,6 +1,6 @@
 [package]
 name = "brookmd-core"
-version = "0.24.1"
+version = "0.24.2"
 edition = "2021"
 description = "Incremental, streaming-aware markdown parser with speculative closure"
 license = "MIT"
