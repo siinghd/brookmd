@@ -238,11 +238,13 @@ const EMPTY_KEYS: string[] = [];
 // drop that one position instead of throwing out of the map callback (which
 // would unmount the document).
 function skipBadBlock(index: number): null {
-  warnOnce(
-    "bad-block",
-    `brookmd: snapshot position ${index} has no block kind and was skipped. ` +
-      `This indicates a corrupted block store — please report it.`,
-  );
+  if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+    warnOnce(
+      "bad-block",
+      `brookmd: snapshot position ${index} has no block kind and was skipped. ` +
+        `This indicates a corrupted block store — please report it.`,
+    );
+  }
   return null;
 }
 
@@ -261,14 +263,18 @@ function useUnstablePropWarning(name: string, value: unknown): void {
     const prevDefined = ref.current !== undefined && ref.current !== null;
     const nextDefined = value !== undefined && value !== null;
     ref.current = value;
-    // Read NODE_ENV off globalThis (no @types/node dependency); bundlers inline
-    // `process.env.NODE_ENV`, and absence is treated as non-production (dev).
-    const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+    // The gate MUST be the literal `process.env.NODE_ENV` member expression:
+    // bundlers substitute that free identifier and can then fold this whole
+    // branch (and its message) away. `globalThis.process?.env` — what this used
+    // to read — is a different member path that esbuild/Vite/Next all leave
+    // alone, so the branch survived AND evaluated to "dev" in production
+    // browser builds, printing a dev warning to real users. See src/warn.ts.
     if (
       prevDefined &&
       nextDefined &&
       !warnedUnstable.has(name) &&
-      (!env || env.NODE_ENV !== "production")
+      typeof process !== "undefined" &&
+      process.env.NODE_ENV !== "production"
     ) {
       warnedUnstable.add(name);
       // eslint-disable-next-line no-console
@@ -1386,14 +1392,21 @@ class BlockBoundary extends Component<BlockBoundaryProps, BlockBoundaryState> {
       this.props.onBlockError(error, info);
       return;
     }
+    // Production keeps everything ACTIONABLE — id, kind, the override keys and the
+    // HTML excerpt are what identify the culprit — but the explanation of WHY it
+    // usually happens is dev-only prose, and the gate has to sit here (not inside
+    // a helper) or bundlers cannot fold the string away. See src/warn.ts.
+    const hint =
+      typeof process !== "undefined" && process.env.NODE_ENV !== "production"
+        ? ` This is almost always a \`components\` override throwing. If it is registered ` +
+          `for a block-kind or component-tag key, note that the SAME key is also dispatched ` +
+          `for a matching element nested inside a block's HTML — that call gets attributes + ` +
+          `children only, with no \`block\` prop. Guard with ` +
+          `\`if (!block) return <>{children}</>\`.`
+        : "";
     // eslint-disable-next-line no-console
     console.error(
-      `brookmd: block ${info.blockId} (${info.kind}) failed to render and was skipped. ` +
-        `This is almost always a \`components\` override throwing. If the override is ` +
-        `registered for a block-kind or component-tag key, note that the SAME key is also ` +
-        `dispatched for a matching element nested inside a block's HTML — that call gets ` +
-        `attributes + children only, with no \`block\` prop. Guard with ` +
-        `\`if (!block) return <>{children}</>\`.`,
+      `brookmd: block ${info.blockId} (${info.kind}) failed to render and was skipped.${hint}`,
       { componentKeys: info.componentKeys, html: info.html },
       error,
     );

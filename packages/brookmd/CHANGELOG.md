@@ -4,6 +4,60 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.25.1 — 2026-07-27
+
+A correction release. 0.25.0 shipped one user-visible regression and a dev-gate
+that failed open in production; both are fixed here, along with a pre-existing
+memory leak on the opt-in `childMemo` path. Upgrade from 0.25.0.
+
+### Fixed
+
+- **WITHDRAWN: the streaming component-tag deferral from 0.25.0.** That change
+  gated component rendering on `open_tail`, which a container propagates
+  UNCHANGED to every sub-block of every list item. A component tag alone in a
+  **non-last list item** — whose one-line body carries no trailing newline of its
+  own — therefore never satisfied the gate again, and rendered as the literal
+  text `<Thinking>` for the entire rest of the stream instead of mounting the
+  consumer's component. Measured 201/201 ticks affected in a 200-item list, and
+  the deferral bought exactly one tick across the three shapes it was written
+  for. `brookmd-core` is reverted to its pre-0.24.0 behavior here (0.24.1); the
+  convergence property 0.25.0 claimed is withdrawn with it. The one-tick issue it
+  was chasing is already contained by the per-block error boundary.
+- **Dev-only warnings ran in production.** The gate read `globalThis.process?.env`,
+  which is a different member path from the `process.env.NODE_ENV` free
+  identifier that esbuild / Vite / Next substitute — so in every bundled browser
+  production build it evaluated to "development", printed to real users, and
+  prevented dead-code elimination of the message strings. Every gate is now at
+  the call site in the literal form bundlers fold. Verified against a real Vite
+  build: 11 dev-warning strings survived a production bundle before, 0 now.
+  (Note the trade: in a realm with no `process` at all — an unbundled CDN
+  consumer — these six development warnings no longer fire. Error reporting via
+  `onBlockError` / `console.error` is NOT gated and is unaffected.)
+- **`childMemo` retained every intermediate tree on a single-element block**
+  (pre-existing, opt-in path). The cache key embeds the segment text, so a block
+  whose HTML is ONE top-level element — which is every core-emitted block kind —
+  could never hit: each patch wrote an entry that was never read again, and
+  `CHILD_MEMO_CAP` bounds entry count, not bytes. Peak RSS grew 154 MB → 1.65 GB
+  over 800 patches of a streaming table. Such blocks now take the ordinary
+  whole-block walk.
+
+### Changed
+
+- Shipped bundles are smaller than 0.25.0: gzipped, minified, production —
+  `index` 14,232 → 13,407 B, `react` 14,185 → 13,365 B, `client` 4,651 → 4,283 B.
+  The boundary's `console.error` keeps everything actionable in production (block
+  id, kind, override keys, HTML excerpt, the error) and moves only the
+  explanatory prose behind the dev gate.
+
+## brookmd-react-native 0.1.5 — 2026-07-27
+
+### Fixed
+
+- Vendored native binaries rebuilt against `brookmd-core` 0.24.1, so the on-device
+  parser no longer carries the component-tag deferral regression withdrawn in
+  brookmd 0.25.1 (a component tag alone in a non-last list item rendered as
+  literal text for the rest of the stream). No JS changes.
+
 ## brookmd-react-native 0.1.4 — 2026-07-26
 
 ### Fixed

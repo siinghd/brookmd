@@ -94,11 +94,13 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
   for (let i = 0; i < store.committedOrder.length; i++) {
     const b = store.committed.get(store.committedOrder[i]);
     if (b === undefined) {
-      warnOnce(
-        "orphan-committed",
-        `brookmd: committed block ${store.committedOrder[i]} is missing from the store and was dropped. ` +
-          `This is a bug in brookmd — please report it.`,
-      );
+      if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+        warnOnce(
+          "orphan-committed",
+          `brookmd: committed block ${store.committedOrder[i]} is missing from the store and was dropped. ` +
+            `This is a bug in brookmd — please report it.`,
+        );
+      }
       continue;
     }
     next[w++] = b;
@@ -106,7 +108,9 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
   for (let i = 0; i < store.active.length; i++) {
     const b = store.active[i];
     if (b === undefined) {
-      warnOnce("orphan-active", `brookmd: active block at index ${i} is undefined and was dropped.`);
+      if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+        warnOnce("orphan-active", `brookmd: active block at index ${i} is undefined and was dropped.`);
+      }
       continue;
     }
     next[w++] = b;
@@ -697,13 +701,15 @@ export class BrookClient {
     if (this.failedError === null) return;
     this.pendingRebind = false;
     if (this.store.snapshot.length === 0 && !this.staleSnapshot) return;
-    warnOnce(
-      "rebind-reset",
-      "brookmd: the parser was rebuilt on a new worker after a fatal failure, so the " +
-        "document restarted. Blocks rendered before the failure were dropped because the " +
-        "fresh parser renumbers from zero. Enable `recovery` (the default) to re-feed and " +
-        "heal invisibly instead.",
-    );
+    if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+      warnOnce(
+        "rebind-reset",
+        "brookmd: the parser was rebuilt on a new worker after a fatal failure, so the " +
+          "document restarted. Blocks rendered before the failure were dropped because the " +
+          "fresh parser renumbers from zero. Enable `recovery` (the default) to re-feed and " +
+          "heal invisibly instead.",
+      );
+    }
     this.resetParser();
   }
 
@@ -1167,7 +1173,9 @@ export class BrookClient {
       view[i] = { ...nb, id: this.idNamespace + nb.id };
     }
     if (dropped) {
-      warnOnce("merge-hole", "brookmd: the stale-merge produced an empty position — compacting.");
+      if (typeof process !== "undefined" && process.env.NODE_ENV !== "production") {
+        warnOnce("merge-hole", "brookmd: the stale-merge produced an empty position — compacting.");
+      }
       // Compacted indices no longer line up with `base`, so the caller must not
       // cache this view as a per-index decision table for the next merge.
       this.mergeDropped = true;

@@ -357,7 +357,11 @@ function resolveTagType(tag: string, components: Components): ComponentType<any>
   // charCode compare skips the Set probe for essentially all real markup.
   const c = tag.charCodeAt(0);
   if (c >= 65 && c <= 90 && BLOCK_KIND_KEYS.has(tag)) {
-    if (components[tag] !== undefined) {
+    if (
+      components[tag] !== undefined &&
+      typeof process !== "undefined" &&
+      process.env.NODE_ENV !== "production"
+    ) {
       warnOnce(
         "kind-key-as-tag:" + tag,
         `brookmd: raw <${tag}> in the rendered HTML collides with the block-kind ` +
@@ -508,6 +512,17 @@ export function htmlToReact(
       : undefined;
   if (!childMemoMap) return nodesToReact(parseTrustedHtml(html), components, "", ctx, []);
   const segs = topLevelSegments(html);
+  // A block whose HTML is ONE top-level element can never produce a cache hit:
+  // the key embeds the segment text, so every patch that grows the block writes
+  // a new entry that is never read again. That is the common case on core-emitted
+  // markup — Paragraph, Heading, List (nested and loose), Blockquote, Alert,
+  // Table, CodeBlock, MathBlock, footnote and Component blocks all render as a
+  // single top-level element — so childMemo was a pure pessimization there AND
+  // retained every intermediate React tree for the life of the block. CHILD_MEMO_CAP
+  // bounds entry COUNT, not bytes, so it does not save you: a long streamed table
+  // grew peak RSS from 154 MB to 1.65 GB at 800 patches. Fall through to the
+  // ordinary whole-block walk, which is what the no-childMemo path already does.
+  if (segs.length < 2) return nodesToReact(parseTrustedHtml(html), components, "", ctx, []);
   const out: ReactNode[] = [];
   for (let idx = 0; idx < segs.length; idx++) {
     const seg = segs[idx];

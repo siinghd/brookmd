@@ -1,5 +1,5 @@
 import { test, expect, beforeEach } from "bun:test";
-import { createElement, isValidElement, type ReactElement } from "react";
+import { createElement, isValidElement, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   htmlToReact,
@@ -640,4 +640,30 @@ test("terminates on malformed / adversarial markup (no hang)", () => {
     expect(() => parseTrustedHtml(s)).not.toThrow();
     expect(() => render(htmlToReact(s, {}))).not.toThrow();
   }
+});
+
+// REGRESSION: `childMemo` must not retain a tree it can never reuse.
+//
+// The cache key embeds the segment text, so a block whose HTML is ONE top-level
+// element can never hit: every patch that grows the block writes an entry that
+// is never read again, and CHILD_MEMO_CAP bounds entry COUNT, not bytes. On
+// core-emitted markup a single top-level element is the COMMON case (Paragraph,
+// Heading, List, Blockquote, Alert, Table, CodeBlock, MathBlock, Component all
+// render as one), so this was an unbounded retention leak on the opt-in path —
+// peak RSS 154 MB -> 1.65 GB over 800 patches of a streaming table.
+test("childMemo does not cache a single-top-level-element block", () => {
+  const map = new Map<string, ReactNode>();
+  // Simulate an open block growing one token at a time.
+  for (let i = 1; i <= 50; i++) {
+    htmlToReact(`<p>${"word ".repeat(i)}</p>`, {}, map);
+  }
+  expect(map.size).toBe(0); // nothing cached, nothing retained
+
+  // Multi-segment blocks still use the cache, and still hit on a stable prefix.
+  const map2 = new Map<string, ReactNode>();
+  htmlToReact("<p>a</p><p>b</p>", {}, map2);
+  const cached = map2.size;
+  expect(cached).toBeGreaterThan(0);
+  htmlToReact("<p>a</p><p>b</p>", {}, map2);
+  expect(map2.size).toBe(cached); // second pass was all hits, no growth
 });

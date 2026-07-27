@@ -1967,31 +1967,6 @@ fn render_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
 /// is scanned + rendered like a blockquote/alert; nested allowlisted tags are
 /// recognized via `opts.scan_ctx()`.
 fn render_component(slice: &str, tag: &str, terminated: bool, opts: &RenderOpts, out: &mut String) {
-    // Streaming deferral. A component open tag only opens a block when it is
-    // ALONE on its line (`scan_component_block`), and that is not KNOWABLE while
-    // the tag's line is the LAST one of a still-growing tail: `<Thinking>` is one
-    // byte away from `<Thinking>x</Thinking>`, an inline occurrence that settles
-    // as escaped text. Emitting the element for that tick would mount a component
-    // in the consumer's tree and then retract it permanently, so render the
-    // literal text it settles to instead. The element appears as soon as a
-    // following line — or finalize, which clears `open_tail` — proves the open
-    // tag really is alone on its line.
-    //
-    // Classification is deliberately untouched (this is still a ComponentBlock),
-    // so no incremental cache sees a different block kind. The condition depends
-    // only on the slice and `open_tail`, both identical between the streaming and
-    // one-shot paths at the same prefix, so mid-stream/one-shot parity holds. It
-    // is restricted to UNTERMINATED components — those always run to the end of
-    // the slice, so "the open line is the last line" means nothing follows it
-    // even under `force_open_tail` (which sets `open_tail` on inner blocks that
-    // are not at the tail). A trailing newline is not proof of a complete line:
-    // the slice may be derived container content (`blockquote_inner`, a list
-    // item's body) whose unterminated last line the container renderer
-    // newline-terminated.
-    if !terminated && opts.open_tail && line_end(slice.as_bytes(), 0) >= slice.len() {
-        escape_html(slice.trim(), out);
-        return;
-    }
     let open = slice.trim_start_matches([' ', '\t']);
     let attrs = sanitize_attrs(open);
     let (open_end, inner_end) = component_inner_range(slice, tag, terminated);

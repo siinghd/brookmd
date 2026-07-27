@@ -207,66 +207,86 @@ fn ticks(md: &str, tags: &[&str], size: usize) -> (Vec<String>, String) {
     (seen, collect(&p))
 }
 
-#[test]
-fn streaming_never_emits_a_component_open_tag_it_retracts() {
-    // Convergence property: an open tag only opens a component block when its
-    // line is KNOWN to be whole. Mid-stream, `<Tag>` at the end of the fed bytes
-    // could still turn out to be `<Tag>x</Tag> …` (an inline occurrence, which
-    // degrades to escaped text) — so rendering it as a component for one tick
-    // and reverting forever after mounts a real component in the consumer's tree
-    // with a prop shape that is then retracted. No tick may emit a raw tag that
-    // the settled output does not contain.
-    let cases: &[(&str, &[&str])] = &[
-        ("> <Thinking>x</Thinking>\n\ndone\n", &["Thinking"]),
-        ("<tik>AAPL</tik> is up today.\n", &["tik"]),
-        ("- <Thinking>\n  reasoning\n  </Thinking>\n", &["Thinking"]),
-        ("<Thinking>\nbody\n</Thinking>\n", &["Thinking"]),
-    ];
-    for (md, tags) in cases {
-        for size in 1..=8usize {
-            let (seen, settled) = ticks(md, tags, size);
-            // Raw markers the settled document does NOT contain are the ones a
-            // tick would have to retract. (When the tag legitimately settles as a
-            // component, its raw markers ARE in the settled HTML and are fine.)
-            let retracted: Vec<String> = tags
-                .iter()
-                .flat_map(|t| [format!("<{t}"), format!("</{t}")])
-                .filter(|m| !settled.contains(m.as_str()))
-                .collect();
-            for html in &seen {
-                for m in &retracted {
-                    assert!(
-                        !html.contains(m.as_str()),
-                        "chunk size {size}: tick html {html:?} emits {m:?}, \
-                         which the settled html {settled:?} does not contain (input {md:?})"
-                    );
-                }
-            }
-        }
+/// Feed `md` in `size`-byte chunks, returning `(bytes fed, whole-document HTML)`
+/// for every tick — the `fed` prefix tells us what the parser could still know.
+fn ticks_fed(md: &str, tags: &[&str], size: usize) -> Vec<(usize, String)> {
+    let mut p = tagged(tags);
+    let mut seen = Vec::new();
+    let mut fed = 0usize;
+    while fed < md.len() {
+        let end = (fed + size).min(md.len());
+        p.append(&md[fed..end]);
+        fed = end;
+        seen.push((fed, p.all_blocks().map(|b| b.html.to_string()).collect()));
     }
+    seen
 }
 
 #[test]
-fn deferred_open_still_settles_as_a_component() {
-    // The convergence gate above must only DEFER the decision, never lose it:
-    // both supported block shapes still settle as real component containers, and
-    // a whole-line open tag still opens while streaming (once a following line
-    // proves the boundary) rather than waiting for finalize.
-    let nested = "- <Thinking>\n  reasoning\n  </Thinking>\n";
-    for size in 1..=8usize {
-        let (_, settled) = ticks(nested, &["Thinking"], size);
+fn component_alone_in_a_non_last_list_item_mounts_while_streaming() {
+    // An allowlisted tag alone on its line in a list item is a component block,
+    // and once a LATER line exists the item's line can no longer change — so
+    // every tick from then on must mount the real element, never the escaped
+    // literal `&lt;Chart&gt;`. A previous release gated component rendering on
+    // `open_tail`, which a container propagates UNCHANGED to every sub-block of
+    // every item; a one-line item body carries no trailing newline of its own,
+    // so the gate never reopened and the consumer saw literal `<Chart>` text for
+    // the whole rest of the stream instead of its own `Chart` component.
+    let mut flat = String::from("- <Chart>\n");
+    for i in 0..12 {
+        flat.push_str(&format!("- item {i}\n"));
+    }
+    let inside_component = format!("<Thinking>\n{flat}");
+    let mut nested = String::from("- outer\n  - <Chart>\n");
+    for i in 0..12 {
+        nested.push_str(&format!("  - sub {i}\n"));
+    }
+
+    for md in [&flat, &inside_component, &nested] {
+        // The `<Chart>` line is frozen once the buffer holds its newline AND a
+        // byte of the following line — no later byte can join that line.
+        let tag_at = md.find("<Chart>").expect("shape contains the tag");
+        let frozen = md[tag_at..].find('\n').expect("tag line is terminated") + tag_at + 2;
+        let mut checked = 0usize;
+        for size in 1..=8usize {
+            for (fed, html) in ticks_fed(md, &["Chart", "Thinking"], size) {
+                if fed < frozen {
+                    continue;
+                }
+                // Only ticks where the list actually rendered AS a list are in
+                // scope. An unterminated `<Thinking>` still streaming as an
+                // escaped raw-HTML block escapes every `<` in its body — a
+                // separate classification path, not this behavior.
+                if !html.contains("<li>") {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    !html.contains("&lt;Chart&gt;"),
+                    "chunk size {size}, {fed} of {} bytes fed: the `<Chart>` item is \
+                     frozen behind a later line, so it must mount as a component, \
+                     but the tick escaped it as literal text: {html:?}",
+                    md.len()
+                );
+                assert!(
+                    html.contains("<Chart>"),
+                    "chunk size {size}, {fed} of {} bytes fed: expected a mounted \
+                     <Chart> element: {html:?}",
+                    md.len()
+                );
+            }
+        }
+        assert!(checked > 0, "no tick exercised the shape for {md:?}");
+        // And it is still a real component once the document settles.
+        let (_, settled) = ticks(md, &["Chart", "Thinking"], 3);
         assert!(
-            settled.contains("<li>") && settled.contains("<Thinking>") && settled.contains("reasoning"),
-            "chunk size {size}: nested component survives: {settled}"
+            settled.contains("<Chart></Chart>"),
+            "settled document mounts the component: {settled:?}"
         );
     }
-    let top = "<Thinking>\nbody\n</Thinking>\n";
-    for size in 1..=8usize {
-        let (_, settled) = ticks(top, &["Thinking"], size);
-        assert!(settled.contains("<Thinking>"), "chunk size {size}: component settles: {settled}");
-    }
-    // Mid-stream (no finalize) the component is already open once its first line
-    // is complete and a following line has begun.
+
+    // Mid-stream (no finalize) a whole-line open tag is already a Component
+    // block once a following line has begun — it does not wait for finalize.
     let mut p = tagged(&["Thinking"]);
     p.append("<Thinking>\nb");
     let kinds: Vec<_> = p.all_blocks().map(|b| b.kind.tag().to_string()).collect();
