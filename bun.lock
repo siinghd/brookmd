@@ -3,11 +3,11 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "md-streamer",
+      "name": "brookmd-workspace",
     },
     "packages/brookmd": {
       "name": "brookmd",
-      "version": "0.25.0",
+      "version": "0.25.1",
       "devDependencies": {
         "@types/bun": "^1.3.14",
         "@types/react": "^18.3.12",
@@ -36,7 +36,7 @@
     },
     "packages/brookmd-react-native": {
       "name": "brookmd-react-native",
-      "version": "0.1.4",
+      "version": "0.1.5",
       "dependencies": {
         "@ubjs/core": "0.31.0-3",
         "brookmd": "^0.25.0",
