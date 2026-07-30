@@ -57,11 +57,46 @@ fn plain(prefix: &str, n: usize, suffix: &str) -> String {
     s
 }
 
+/// A word-wrapped paragraph: a flush first line, then `n` continuation lines
+/// each prefixed with `indent`. The shape an LLM/chat backend emits when it
+/// wraps prose — and the one that used to yield ZERO commit candidates.
+fn wrapped(indent: &str, n: usize) -> String {
+    let mut s = String::from("intro line of the paragraph\n");
+    for i in 0..n {
+        s.push_str(indent);
+        s.push_str(&format!("continuation {i} of the wrapped prose\n"));
+    }
+    s
+}
+
+/// Per-prefix parity, the strong form: at every streamed prefix the cached
+/// parser's HTML must equal a fresh single-append parse of the same prefix.
+/// Final-state `parity` alone can't see cut bugs — `finalize` skips the
+/// incremental fast paths and re-renders the tail from scratch.
+fn intermediate(md: &str, mk: &dyn Fn() -> StreamParser) {
+    let mut streamed = mk();
+    let mut buf = [0u8; 4];
+    let mut at = 0usize;
+    for ch in md.chars() {
+        let s = ch.encode_utf8(&mut buf);
+        streamed.append(s);
+        at += s.len();
+        let mut oneshot = mk();
+        oneshot.append(&md[..at]);
+        let a: String = streamed.all_blocks().map(|b| b.html.clone()).collect();
+        let b: String = oneshot.all_blocks().map(|b| b.html.clone()).collect();
+        assert_eq!(a, b, "intermediate mismatch at {at} bytes of {:?}", short(md));
+    }
+}
+
 fn default() -> StreamParser {
     StreamParser::new()
 }
 fn autolinks() -> StreamParser {
     StreamParser::new().with_gfm_autolinks(true)
+}
+fn soft() -> StreamParser {
+    StreamParser::new().with_soft_breaks(true)
 }
 fn all_on() -> StreamParser {
     StreamParser::new()
@@ -254,6 +289,150 @@ fn intermediate_prefix_matches_full_render() {
             let b: String = oneshot.all_blocks().map(|b| b.html.clone()).collect();
             assert_eq!(a, b, "intermediate mismatch at {at} bytes of {:?}", short(&md));
         }
+    }
+}
+
+#[test]
+fn indented_continuation_lines() {
+    // `is_boundary`'s indent-led-line rule: the first word of a continuation
+    // line that carries an indent is a commit candidate, exactly as the first
+    // word after a bare `\n` already was. Without it this whole shape produces
+    // no candidates at all (every word start sits after a space whose own
+    // predecessor is a space or the line's `\n`), the cut pins at 0, and every
+    // append re-renders the accumulated paragraph — O(n²).
+    let mks: [&dyn Fn() -> StreamParser; 3] = [&default, &soft, &autolinks];
+    let cases: &[&str] = &[
+        "a\n b\n c\n",
+        "a\n b\n c",
+        "a\n  b\n  c\n",   // 2-space indent
+        "a\n   b\n   c\n", // 3-space (4 would be indented code)
+        "a\n\tb\n\tc\n",   // tab indent
+        "a\n \tb\n\t c\n", // mixed space/tab runs
+        "a\n b\nc\n d\n",  // alternating flush / indented
+        " a\n b\n c\n",    // indented first line too
+        "a\n b *emph across* c\n d `code span` e\n",
+        "a\n b [link](http://x.com/p) c\n d\n",
+    ];
+    for md in cases {
+        for mk in mks {
+            parity(md, mk);
+            intermediate(md, mk);
+        }
+    }
+    // Long generated versions — the sizes where the cache actually carries the
+    // open view for hundreds of appends.
+    for indent in [" ", "   ", "\t"] {
+        let md = wrapped(indent, 200);
+        for mk in mks {
+            parity(&md, mk);
+        }
+        intermediate(&wrapped(indent, 20), &default);
+    }
+}
+
+#[test]
+fn no_cut_where_the_hard_break_lookbehind_would_straddle() {
+    // The `\n` arm's `out.ends_with("  ")` lookbehind reads render STATE, so a
+    // cut whose frozen side ends in a space and whose suffix renders to nothing
+    // (or to one space) makes the two sides disagree: the suffix emits a literal
+    // space where the full render emits `<br>`. Both whitespace-led rules leave
+    // spaces in the frozen segment, so both exclude a candidate byte that may
+    // render to a space (`&`, an entity that can decode to one) or to nothing
+    // (`<`, a token the sanitizer may drop).
+    //
+    // Shipped bug, found while adding the indent-led rule: these diverged
+    // MID-STREAM under the pre-existing single-inter-word-space rule alone, and
+    // only mid-stream — `finalize` skips the incremental path and re-renders the
+    // tail from scratch, so final-state parity never saw it.
+    let cases: &[&str] = &[
+        "a x &#32;\nb tail\n",          // one entity-space: the original reproducer
+        "a &#32; &#32;\nb tail\n",      // the second `&` is the straddling candidate
+        "a &#32;\nb tail\n",
+        "a x &#x20;\nb tail\n",         // hex entity, same decode
+        "a\n  &#32;\nb tail\n",         // indent-led twin
+        "a\n  &#32; &#32;\nb tail\n",
+        "a x &#32; &#32; &#32;\nb\n",
+        // Not affected: the entity is not at the candidate, so no straddle.
+        "a &#32;x\nb tail\n",
+        "a x &amp;\nb tail\n",
+    ];
+    for md in cases {
+        parity(md, &default);
+        intermediate(md, &default);
+        parity(md, &soft);
+        intermediate(md, &soft);
+    }
+    // The `<` half needs the sanitizer engaged, where a comment / dropped tag
+    // renders to nothing at all.
+    let sanitize = || StreamParser::new().with_html_sanitize(true, Vec::new(), Vec::new());
+    for md in [
+        "a &#32; <!--c-->\nb tail\n",
+        "a x <!--c-->\nb tail\n",
+        "a\n  <!--c-->\nb tail\n",
+        "a &#32; <script>x</script>\nb tail\n",
+    ] {
+        parity(md, &sanitize);
+        intermediate(md, &sanitize);
+    }
+}
+
+#[test]
+fn indent_led_cut_does_not_need_the_autolink_guard() {
+    // `synth_boundary` refuses candidate bytes an extended autolink could
+    // contain or start, because a future `@` binds an alnum run right-to-left
+    // across a mid-word cut. Indent-led candidates need no such guard: they sit
+    // right after whitespace, and no extended autolink can span whitespace
+    // backwards (`try_ext_autolink` / `try_ext_email` both stop at it), so a
+    // `www.`/email link containing the candidate must START at it — which the
+    // full render probes too, since `ext_autolink_boundary` is equally true
+    // after a space and at slice start.
+    let cases: &[&str] = &[
+        "a\n www.example.com rest\n",
+        "a\n  www.example.com/path?q=1 rest\n",
+        "a\n foo@bar.example rest\n",
+        "a\n\thttps://example.org/very/long/path rest\n",
+        "a\n www.example.com\n b\n c\n",
+        // The retro-bind shape: the candidate byte starts an alnum run whose
+        // `@` only arrives later.
+        "a\n aaaaaaaa@example.com rest\n",
+    ];
+    for md in cases {
+        parity(md, &autolinks);
+        intermediate(md, &autolinks);
+    }
+}
+
+#[test]
+fn hard_break_then_indented_line() {
+    // A hard break's spaces sit at line END, so the backward walk (which needs a
+    // `\n` terminating the run on its LEFT) can never propose a cut inside one.
+    // The word after the break's `\n` + indent IS proposed, and the `<br>` must
+    // survive in the frozen segment.
+    for md in [
+        "word  \n next line here\n",
+        "word  \n  next line here\n",
+        "first  \n second  \n third\n",
+        "a\n b  \n c\n",
+    ] {
+        parity(md, &default);
+        intermediate(md, &default);
+        parity(md, &soft);
+        intermediate(md, &soft);
+    }
+    let out = run("word  \n next line here\n", 1, &default);
+    assert!(out.contains("<br>"), "hard break must survive the cut: {out}");
+    assert_eq!(out, run("word  \n next line here\n", 64, &default));
+}
+
+#[test]
+fn paragraph_ending_mid_indent_at_eof() {
+    // The indent run abuts EOF: the backward walk runs from no candidate at all
+    // (there is no non-whitespace byte after it yet). Must not panic, must stay
+    // byte-par with one-shot.
+    for md in ["a\n  ", "a\n ", "a\n\t", "a\n   \n  ", " ", "\n ", "a\n b\n  "] {
+        parity(md, &default);
+        intermediate(md, &default);
+        parity(md, &autolinks);
     }
 }
 

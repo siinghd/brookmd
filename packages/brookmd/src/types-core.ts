@@ -110,15 +110,24 @@ export interface HeadingData {
 }
 
 /**
- * A CodeBlock's `kind.data` when {@link ParserConfig.blockData} is on. `lang` is
- * the always-on info-string language (`null` for none); `code` is the opt-in
- * DECODED source inside `<pre><code>…</code></pre>` (only present when `blockData`
- * is on). Build a copy-to-clipboard string / re-highlight from `code` alone — no
- * HTML re-parse, no entity-decode. When `blockData` is off, `code` is absent and
- * `kind.data` is just `{ lang }`, byte-identical to before.
+ * A CodeBlock's `kind.data`. `lang` is the always-on info-string language (`null`
+ * for none) — the info string's first word; `meta` is the always-on REMAINDER of
+ * that same info string, trimmed (```` ```ts title="src/main.ts" ```` ⇒
+ * `lang: "ts"`, `meta: 'title="src/main.ts"'`), absent when the fence carried
+ * none. `code` is the opt-in DECODED source inside `<pre><code>…</code></pre>`
+ * (only present when `blockData` is on). Build a copy-to-clipboard string /
+ * re-highlight from `code` alone — no HTML re-parse, no entity-decode. When
+ * `blockData` is off, `code` is absent and `kind.data` is just `{ lang }` (plus
+ * `meta` if the fence had one), byte-identical to before.
+ *
+ * Both halves are the RAW info-string text (backslash escapes / entity references
+ * left undecoded), and only `lang` appears in the rendered HTML
+ * (`class="language-…" data-lang="…"`) — there is deliberately no `data-meta`
+ * attribute, so a filename header needs a `components.CodeBlock` override.
  */
 export interface CodeBlockData {
   lang: string | null;
+  meta?: string;
   code?: string;
 }
 
@@ -140,6 +149,24 @@ export interface MathBlockData {
  */
 export interface ListItemData {
   html: string;
+  /**
+   * The item's DOCUMENT-ABSOLUTE source byte offset — the index, in the markdown
+   * fed so far, of the byte where this item's marker (`-`, `*`, `1.`, …) begins.
+   * Same origin as {@link Block.start}, and stable as the document grows (the
+   * parser's buffer is append-only), so `source.slice(item.start)` always begins
+   * at this item's marker. Use it to read or rewrite the item in place — e.g.
+   * find the task-list checkbox with your own `findTaskListMarkerOffset(source,
+   * item.start)` and flip `[ ]` ⇄ `[x]` in the original string.
+   *
+   * Present only when {@link ParserConfig.blockData} is on.
+   *
+   * KNOWN LIMITATION — absent for NESTED list items. A nested list is not a
+   * separate block: its items live inside the parent item's `html` and never
+   * reach the `items` channel, and the nested render runs against a synthesized
+   * de-indented string with no document offset. Nested items therefore carry no
+   * offset rather than a wrong one. Only top-level list items get a `start`.
+   */
+  start?: number;
 }
 
 /**
@@ -274,6 +301,18 @@ export interface BlockComponentProps {
   text?: string;
   /** Info-string language — present for `CodeBlock` (from `kind.data.lang`). */
   language?: string;
+  /**
+   * Info-string META — everything after the language word, trimmed (from
+   * `kind.data.meta`), e.g. `title="src/main.ts"` or a bare `src/main.ts`.
+   * Always-on like `language` (no `blockData` needed); `undefined` when the
+   * fence carried none. Deliberately absent from the rendered HTML, so render a
+   * filename header from this prop.
+   *
+   * While streaming it appears once it can no longer change — when the opening
+   * fence line is terminated by a newline, or at finalize — so a header never
+   * flickers through a half-typed `title="src/ma`.
+   */
+  meta?: string;
   /** Component tag name — present for `Component` blocks (from `kind.data.tag`). */
   tag?: string;
   /**
@@ -305,11 +344,12 @@ export interface BlockComponentProps {
   heading?: HeadingData;
   /**
    * Structured code data — present for `CodeBlock` blocks when
-   * {@link ParserConfig.blockData} is on (otherwise `undefined`). `{ lang, code }`
-   * with `code` the DECODED source. Build a copy-to-clipboard string / re-highlight
-   * from `code` — no HTML re-parse, no entity-decode. (`props.text` / `props.language`
-   * carry the same source / lang and stay populated even when off, via the HTML
-   * regex fallback.)
+   * {@link ParserConfig.blockData} is on (otherwise `undefined`). `{ lang, meta?,
+   * code }` with `code` the DECODED source. Build a copy-to-clipboard string /
+   * re-highlight from `code` — no HTML re-parse, no entity-decode. (`props.text` /
+   * `props.language` carry the same source / lang and stay populated even when off,
+   * via the HTML regex fallback; `props.meta` carries the same meta and is
+   * always-on, since it has no HTML form to fall back to.)
    */
   code?: CodeBlockData;
   /**
@@ -376,6 +416,28 @@ export interface ParserConfig {
    */
   dirAuto?: boolean;
   /**
+   * Lenient list indentation: a list marker followed by 6 or more columns of
+   * SPACE padding yields the item's text, where strict CommonMark (§5.2) keeps
+   * one column and renders the rest as an indented code block. Default false.
+   *
+   * Aimed at model output, which routinely over-indents after a bullet
+   * (`-       const value = 1;`). Four cases stay strictly conformant: exactly
+   * 5 columns of padding, a fenced code block opened on the marker line itself,
+   * indented code that starts on a line AFTER the marker, and tab-padded
+   * markers (`-\t\tfoo`).
+   */
+  lenientLists?: boolean;
+  /**
+   * Render a CommonMark SOFT line break (a bare `\n` inside inline content) as
+   * a `<br>` — the `remark-breaks` / "GitHub comment" convention, where one
+   * Enter is one visual line. Default false (strict CommonMark: a soft break is
+   * whitespace). Hard breaks (two trailing spaces, or a trailing `\`) are `<br>`
+   * either way, so enabling this only ADDS breaks — it never removes one. Chat
+   * UIs streaming model output usually want this on, since models emit single
+   * newlines expecting a visible break.
+   */
+  softBreaks?: boolean;
+  /**
    * Opt-in accessibility markup that deviates from strict GFM byte-output:
    * wraps a task-list checkbox + its text in a `<label>` (programmatic
    * association for screen readers) and adds `scope="col"` to table header
@@ -417,8 +479,8 @@ export interface ParserConfig {
    * `input`, `svg`, …); a **non-empty** array renders only those tags (e.g.
    * `["br","sub","sup"]`) and escapes the rest. Every rendered tag's attributes
    * are sanitized (event handlers dropped, dangerous URL schemes → `#`), and HTML
-   * comments are dropped. Block-level raw HTML stays escaped (sanitize is
-   * inline-scoped for now). Unset/omitted = off (raw HTML handling unchanged).
+   * comments are dropped. Block-level raw HTML stays escaped unless you also set
+   * {@link blockHtml}. Unset/omitted = off (raw HTML handling unchanged).
    * Matching is case-insensitive. See also {@link dropHtmlTags}.
    */
   htmlAllowlist?: string[];
@@ -429,6 +491,52 @@ export interface ParserConfig {
    * raw-HTML sanitizer (see {@link htmlAllowlist}). Case-insensitive.
    */
   dropHtmlTags?: string[];
+  /**
+   * Extend the safe raw-HTML sanitizer to **block-level** raw HTML, so a model
+   * emitting `<details><summary>…</summary>…</details>` on its own lines renders
+   * as real elements instead of an escaped code block. Only takes effect when
+   * the sanitizer is engaged ({@link htmlAllowlist} / {@link dropHtmlTags}); on
+   * its own it does nothing. Default false — existing sanitizer users keep
+   * escaped block HTML until they opt in.
+   *
+   * Scope is CommonMark HTML block **types 6 and 7**: a known block-level tag
+   * (`<details>`, `<div>`, `<table>`, …) or any other complete tag alone on its
+   * line. Types 1–5 stay escaped/dropped: type 1 is the raw-text family
+   * (`<script>`, `<pre>`, `<style>`, `<textarea>`) — a browser reads everything
+   * after such a tag as unparsed text, so a speculative mid-stream close is
+   * mXSS-prone — and types 2–5 (comments, PIs, CDATA, declarations) carry no
+   * renderable element. The tag allow/drop/dangerous decision and the hardened
+   * attribute policy are exactly the inline sanitizer's.
+   *
+   * While the block streams, still-open elements get **speculative closers**, so
+   * what the reader has seen so far is a complete tree at every append; a
+   * half-arrived tag stays invisible until it completes. Markdown *inside* the
+   * HTML is not parsed (the body is text + tags).
+   */
+  blockHtml?: boolean;
+  /**
+   * Opt-in **un-blocklist** for URL schemes that brookmd blocks by default.
+   * Bare scheme names, **without** the colon (`["file"]`), matched
+   * case-insensitively. Empty/omitted = the built-in policy is unchanged.
+   *
+   * This never *restricts* anything — it is not a general allowlist. Schemes
+   * outside the built-in blocklist (`vscode:`, `ftp:`, `mailto:`, …) already
+   * render today and are unaffected. The only tier it can reach is the
+   * overridable-blocked one, currently just `file:`.
+   *
+   * The script-executing tier — `javascript:`, `vbscript:`, `data:text/html`,
+   * `data:text/javascript`, and the scriptable `data:` media types
+   * (`data:image/svg`, `data:application/xhtml`, …) — is **non-overridable**:
+   * listing one here is a silent no-op, exactly as allowlisting `<script>`
+   * cannot re-enable it via {@link htmlAllowlist}.
+   *
+   * Only enable `file:` in a host that intercepts link clicks instead of
+   * navigating (an Electron / extension UI that opens the path in an editor);
+   * local-resource disclosure then becomes the embedder's responsibility.
+   * Applies uniformly to links, URI autolinks, images, and sanitized URL
+   * attributes.
+   */
+  allowSchemes?: string[];
   /**
    * Opt-in structured table data. When on, a `Table` block's `kind.data` is
    * populated with `{ headers, rows, aligns }` (each cell `{ text, html }`) so a

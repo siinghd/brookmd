@@ -83,6 +83,11 @@ jobs:
         env:
           CMARK_MIN_PASS: "652"
           GFM_MIN_PASS: "24"
+          # Byte-exact floors: the normalized floors above allow whitespace
+          # laxity, these do not. Both harnesses already default to these
+          # numbers; pinning them here keeps the gate visible in the workflow.
+          CMARK_MIN_EXACT: "652"
+          GFM_MIN_EXACT: "24"
         run: bun run test:rust
       - name: Complexity-scaling gate (streaming stays sub-quadratic)
         working-directory: crates/brookmd-core

@@ -66,6 +66,10 @@ struct Opts {
     /// Wire delta mode (`WIRE.md` §11): active re-emits count only their
     /// `append` tails toward `emitted`. See `wire_delta_emitted_is_linear`.
     wire_delta: bool,
+    /// Safe raw-HTML sanitizer, allow-all (`set_html_sanitize(true, [], [])`).
+    html_sanitize: bool,
+    /// Block-level raw HTML (`set_block_html`) — only bites with `html_sanitize`.
+    block_html: bool,
 }
 
 struct Shape {
@@ -99,7 +103,11 @@ fn measure(md: &str, chunk: usize, o: Opts) -> Work {
         .with_gfm_footnotes(o.footnotes)
         .with_block_data(o.block_data)
         .with_unsafe_html(o.unsafe_html)
-        .with_wire_delta(o.wire_delta);
+        .with_wire_delta(o.wire_delta)
+        .with_block_html(o.block_html);
+    if o.html_sanitize {
+        p = p.with_html_sanitize(true, Vec::new(), Vec::new());
+    }
     if !o.component_tags.is_empty() {
         p = p.with_component_tags(o.component_tags.iter().map(|s| s.to_string()).collect());
     }
@@ -318,6 +326,20 @@ fn big_code(target: usize) -> String {
     s
 }
 
+/// A fence whose OPENER is indented, so §4.5 makes every body line shed those
+/// columns. The de-indent is per-line work at fold time; if a cache ever
+/// re-derived it by rescanning the accumulated body per append, this shape goes
+/// quadratic while flush-left `big_code` stays flat.
+fn indented_big_code(target: usize) -> String {
+    let mut s = String::from("   ```rust\n");
+    let line = "   let result = compute(alpha, beta, gamma); // a line of code\n";
+    while s.len() < target {
+        s.push_str(line);
+    }
+    s.push_str("   ```\n");
+    s
+}
+
 fn big_math(target: usize) -> String {
     let mut s = String::from("$$\n\\begin{aligned}\n");
     let line = "x_{n+1} &= \\frac{1}{2}\\left(x_n + \\frac{a}{x_n}\\right) \\\\\n";
@@ -487,6 +509,57 @@ fn html_block_aligned(opener: &str, target: usize) -> String {
     open.push('\n');
     s.push_str(&open);
     let line = "abcdefghij klmnopqrst uvwxyz0123 456789ABCD EFGHIJKLMN OPQRSTUV\n"; // 64 bytes
+    while s.len() < target {
+        s.push_str(line);
+    }
+    s
+}
+
+/// BLOCK-level raw HTML under the sanitizer (`block_html`): a long open type-6
+/// `<div>` whose body is markup, so every append walks real TAGS instead of a
+/// per-byte escape map. The `HtmlBlockCache` runs its THIRD mode here — folding
+/// at token boundaries with a carried open-element stack — because a per-LINE
+/// fold is impossible once a tag may span lines. Without it every append
+/// re-sanitizes the whole growing block: O(n²), and `rendered` sees it (every
+/// byte entering `render::fold_block_html` is counted).
+///
+/// 64-byte body lines, so a 128-byte append boundary always lands on a line
+/// start — the ALIGNED twin of the ragged shapes below.
+fn block_html_aligned(target: usize) -> String {
+    let mut s = String::from("<div class=\"wrap\">\n");
+    let line = "<span class=\"c\">abcdefghij</span> plain tail text 012345678<br>\n";
+    assert_eq!(line.len(), 64, "aligned body line must be 64 bytes");
+    while s.len() < target {
+        s.push_str(line);
+    }
+    s
+}
+
+/// RAGGED twin of [`block_html_aligned`]: an ODD 37-byte line, coprime with the
+/// 128-byte append chunk (`gcd(128, 37) = 1`), so the boundary visits EVERY
+/// offset within a line — parking the buffer mid-tag-name, mid-attribute-name,
+/// inside a quoted attribute value, and between a tag's `<` and its first
+/// letter, in turn. Each park leaves a still-STREAMING `<…` that the fold must
+/// refuse to consume and must re-examine on the next append, which is exactly
+/// where a token-boundary fold can silently degrade into re-sanitizing the whole
+/// block (the gcd lesson from the ragged paragraph shapes). Must stay linear.
+fn block_html_ragged(target: usize) -> String {
+    let mut s = String::from("<div class=\"wrap\">\n");
+    let line = "<i class=\"q\">abc</i> defgh ijklm<br>\n";
+    assert_eq!(line.len(), 37, "ragged body line must be an odd 37 bytes");
+    while s.len() < target {
+        s.push_str(line);
+    }
+    s
+}
+
+/// Type-7 ragged twin (the opener is an arbitrary complete tag alone on its
+/// line, not a known block-level one) — same fold, different arm-time gate.
+/// 27-byte lines: odd, coprime with the 128-byte chunk.
+fn block_html_type7_ragged(target: usize) -> String {
+    let mut s = String::from("<mytag class=\"wrap\">\n");
+    let line = "<b>abcd</b> efghijklmn opq\n";
+    assert_eq!(line.len(), 27, "type-7 ragged body line must be an odd 27 bytes");
     while s.len() < target {
         s.push_str(line);
     }
@@ -875,6 +948,18 @@ fn shapes() -> Vec<Shape> {
         scanned: Expect::Linear,
         rendered,
     };
+    // Sanitizer + block-level raw HTML (the third HtmlBlockCache mode). Both
+    // metrics must stay linear: the fold consumes each token exactly once.
+    let block_html_shape = |name: &'static str, gen: fn(usize) -> String| Shape {
+        name,
+        gen,
+        opts: Opts { html_sanitize: true, block_html: true, ..Opts::default() },
+        chunk: CHUNK,
+        small: SMALL,
+        large: LARGE,
+        scanned: Expect::Linear,
+        rendered: Expect::Linear,
+    };
     // A known-quadratic fix-campaign entry, named by hunt group key. `scanned`/
     // `rendered` reflect which metric actually sees the cliff (measured, not
     // assumed): a metric that stays linear on a wall-only cliff is declared
@@ -912,6 +997,30 @@ fn shapes() -> Vec<Shape> {
         // -- shapes that MUST stay linear (commit regularly or have a cache) --
         lin("mixed", mixed, Linear),
         lin("many_paragraphs", many_paragraphs, Linear),
+        // Word-wrapped prose with INDENTED continuation lines -> ParagraphCache.
+        // Was O(n²) (see `indented_wrapped_para`): `is_boundary` proposed no
+        // commit candidate anywhere in the paragraph, so the cut pinned at 0 and
+        // every append re-rendered it whole. Both gated counters see it, so this
+        // is the deterministic witness; `indented_continuation_para_is_wall_linear`
+        // is the wall-time second one.
+        lin("indented_wrapped_para", indented_wrapped_para, Linear),
+        // Same prose on a line length that does NOT divide the append size, so
+        // boundaries regularly park the buffer on a TRANSIENT paragraph end (a
+        // whitespace-only unterminated last line). Was O(n²) on its own: the
+        // incremental path dropped its cache there and paid a full re-scan +
+        // re-render, one append in seven. `trailing_open_ws_line` suspends instead.
+        lin("indented_wrapped_para_ragged", indented_wrapped_para_ragged, Linear),
+        // The same transient-end shape one container deep. An open list item
+        // hosts a nested StreamParser, so its paragraph inherits the suspension
+        // through the very same `try_incremental_paragraph` — this pins that
+        // inheritance (212x scanned / 209x rendered without it).
+        lin("indented_list_item_ragged", indented_list_item_ragged, Linear),
+        // Proven-safe pin: `ContainerCache` never consults `ParaEnd`, so a
+        // quoted indented-continuation paragraph has no transient verdict to
+        // drop on. Flat with AND without the suspension — registered so a future
+        // refactor that routes containers through the paragraph path can't
+        // silently inherit the cliff.
+        lin("indented_blockquote_ragged", indented_blockquote_ragged, Linear),
         lin("big_list", big_list, Linear), // flat list -> ListCache (incremental)
         lin("big_blockquote", big_blockquote, Linear), // prose quote -> ContainerCache
         lin("quote_many_paras", quote_many_paras, Linear), // multi-para quote -> ContainerCache
@@ -926,6 +1035,7 @@ fn shapes() -> Vec<Shape> {
         lin("nested_loose_list", nested_loose_list, Linear),
         lin("big_table", big_table, Linear),
         lin("big_code", big_code, Linear),
+        lin("indented_big_code", indented_big_code, Linear),
         lin("big_math", big_math, Linear),
         // Open HTML block (types 6/7) with newline-aligned appends ->
         // HtmlBlockCache (incremental). Was O(n²) (hunt group
@@ -946,6 +1056,14 @@ fn shapes() -> Vec<Shape> {
             rendered: Expect::Linear,
         },
         lin("html_type7_aligned", html_type7_aligned, Linear),
+        // BLOCK-level raw HTML through the sanitizer (`block_html`): the
+        // HtmlBlockCache's token-boundary fold. `rendered` counts every byte
+        // entering `fold_block_html`, so a cache that re-sanitized the whole
+        // growing block per append shows up here as O(n²) — measured 96x/94x
+        // (scanned/rendered) over the 16x span before the fold existed.
+        block_html_shape("block_html_aligned", block_html_aligned),
+        block_html_shape("block_html_ragged", block_html_ragged),
+        block_html_shape("block_html_type7_ragged", block_html_type7_ragged),
         // CRLF twins (hunt group crlf-cache-bail, FIXED via ingest
         // normalization) — must cost the same as their LF originals.
         lin("crlf_big_list", crlf_big_list, Linear),
@@ -1018,6 +1136,7 @@ fn shapes() -> Vec<Shape> {
         bd("blockdata_nested_list", nested_loose_list),
         bd("blockdata_big_table", big_table),
         bd("blockdata_big_code", big_code),
+        bd("blockdata_indented_big_code", indented_big_code),
         bd("blockdata_big_math", big_math),
         // Footnote shapes (hunt group footnote-global-state, FIXED): def-run
         // tails commit up to the last def opener, the per-cache footnote
@@ -1374,6 +1493,321 @@ fn wire_delta_emitted_is_linear() {
     assert!(failures.is_empty(), "wire-delta emitted regression(s):\n  {}", failures.join("\n  "));
 }
 
+/// The growing-OPENER-LINE shape, gated on WALL time — deliberately, because no
+/// counter here can see its failure mode.
+///
+/// `fence_giant_info` streams a code fence whose opener line (`` ```rust `` + a
+/// giant info tail) never gets its newline, so `FenceInfoCache` stays armed for
+/// thousands of appends. That cache's contract is that everything it re-emits is
+/// FROZEN — O(new bytes) per append. The way to break it is to re-derive some
+/// growing part of the opener line (e.g. the info string's `meta`) on every
+/// append: pure allocation + memcpy, entirely INSIDE the cache. `scanned` and
+/// `rendered` count units of parser work the cache legitimately does not do, so
+/// both stay flat and green while wall time goes quadratic; `emitted` is
+/// informational and also flat (the frozen HTML is small). Wall time is the only
+/// signal that moves, so this asserts on it.
+///
+/// Crude by construction: wall is noisy. Damped by taking the best of 3 runs per
+/// size and by an 8x span (64 KB → 512 KB opener line), where linear ≈ 8x and
+/// quadratic ≈ 64x — a factor-8 gap. The limit sits at 24x: 3x headroom over
+/// linear, 2.7x below the quadratic floor. The regression this pins measured 64x.
+#[test]
+fn fence_opener_line_growth_is_wall_linear() {
+    const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
+    let mut walls = Vec::with_capacity(SIZES.len());
+    for &n in &SIZES {
+        let md = fence_giant_info(n);
+        // Best of 3 — the least-noisy sample, never the worst.
+        let wall = (0..3)
+            .map(|_| measure(&md, CHUNK, Opts::default()).wall_ms)
+            .fold(f64::INFINITY, f64::min);
+        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+        println!(
+            "fence_giant_info opener {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)",
+            n / 1024,
+            wall
+        );
+        walls.push(wall);
+    }
+    let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
+    let ratio = walls[walls.len() - 1] / walls[0];
+    println!("fence_giant_info wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
+    assert!(
+        ratio < 24.0,
+        "growing fence opener line went superlinear in WALL time: {ratio:.1}x for {span:.0}x \
+         input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x). Something re-derives a \
+         growing part of the opener line per append — FenceInfoCache must stay frozen.",
+        span * span
+    );
+}
+
+/// A paragraph whose continuation lines are INDENTED — the wrapped-prose shape
+/// an LLM/chat backend emits all day. Isolates `is_boundary`'s indent-led-line
+/// rule: every word start sits after a space whose own predecessor is a space
+/// or the line's `\n`, so without that rule the paragraph yields ZERO commit
+/// candidates (`synth_boundary` can't rescue it either — its inert runs need
+/// `SYNTH_GAP` space-free bytes and every line has a space), the cut pins at 0
+/// and every append re-renders the whole accumulated paragraph.
+///
+/// Two deliberate shape choices, both needed to measure only the cut:
+/// * ONE space-free token per line. A second token would sit after a single
+///   inter-word space and hand the OLD rule a candidate for free.
+/// * A 32-byte line and no preamble, so every 128-byte append boundary lands
+///   exactly on a line start. A boundary landing INSIDE a leading indent leaves
+///   the buffer ending in a whitespace-only incomplete line, which the block
+///   scanner reads as a blank line (it genuinely ends the paragraph — the
+///   one-shot render agrees), so `paragraph_ends_before_eof` bails the
+///   incremental path into a full re-scan + re-render. That is a SECOND,
+///   independent O(n²) — one append in `indent period` — and it is not what
+///   this shape guards; see the indented-continuation note in `parser.rs`.
+fn indented_wrapped_para(target: usize) -> String {
+    let mut s = String::new();
+    while s.len() < target {
+        s.push_str(" the-quick-brown-fox-jumps-over\n"); // exactly 32 bytes
+    }
+    s
+}
+
+/// The FLUSH control twin of [`indented_wrapped_para`]: byte-for-byte the same
+/// stream minus the indent, so its line-leading word is a candidate under the
+/// pre-existing after-a-`\n` rule and its cut has always advanced. Same length,
+/// same line count, same 32-byte alignment — so any wall-time gap between the
+/// two is the indent, and nothing else.
+fn flush_wrapped_para(target: usize) -> String {
+    let mut s = String::new();
+    while s.len() < target {
+        s.push_str("the-quick-brown-fox-jumps-overs\n"); // exactly 32 bytes
+    }
+    s
+}
+
+/// The same wrapped-prose stream on an ODD line length, which is what makes an
+/// append boundary land on the leading indent. Boundaries sit at multiples of
+/// `128 mod L` within a line, so they only ever visit offsets that are multiples
+/// of `gcd(128, L)`: any even `L` skips offset 1 entirely and never parks the
+/// buffer on a bare `" "`. With `L = 7` the cycle covers every offset, so one
+/// append in seven ends the buffer on a whitespace-only UNTERMINATED line.
+///
+/// That is a real (but transient) paragraph end — the block scanner splits the
+/// line off — so `paragraph_ends_before_eof` fires and the incremental paragraph
+/// path used to DROP its cache and pay a full re-scan + re-render for it.
+/// Quadratic on its own, even with the commit cut advancing;
+/// `trailing_open_ws_line` now suspends the cache across it instead.
+fn indented_wrapped_para_ragged(target: usize) -> String {
+    let mut s = String::new();
+    while s.len() < target {
+        s.push_str(" words\n"); // 7 bytes, odd -> gcd(128, 7) = 1
+    }
+    s
+}
+
+/// Flush control twin of [`indented_wrapped_para_ragged`] — same length, same
+/// line count, same misalignment, no indent. Its trailing partial line always
+/// carries content, so it never reaches the transient end.
+fn flush_wrapped_para_ragged(target: usize) -> String {
+    let mut s = String::new();
+    while s.len() < target {
+        s.push_str("wordsx\n"); // 7 bytes
+    }
+    s
+}
+
+/// A LIST ITEM whose open paragraph is word-wrapped with an extra indent past
+/// the content column — the same transient-end shape as
+/// [`indented_wrapped_para_ragged`], one container deep. An open item hosts a
+/// nested `StreamParser`, so its paragraph runs through the very same
+/// `try_incremental_paragraph`, and it inherits the suspension for free: with
+/// the suspension disabled this measures 212x scanned / 209x rendered across a
+/// 16x span (limit 64) and 22x its own flush control's wall time.
+///
+/// 9-byte lines: odd, so the 128-byte append boundary visits every offset and
+/// regularly parks the nested buffer on a whitespace-only unterminated line.
+fn indented_list_item_ragged(target: usize) -> String {
+    let mut s = String::from("- first item line\n");
+    while s.len() < target {
+        s.push_str("   words\n"); // 2 stripped to the content column + 1 indent
+    }
+    s
+}
+
+/// Flush control twin of [`indented_list_item_ragged`]: same length, same line
+/// count, same misalignment, but the nested paragraph's lines start flush at the
+/// content column, so the nested buffer never ends whitespace-only.
+fn flush_list_item_ragged(target: usize) -> String {
+    let mut s = String::from("- first item line\n");
+    while s.len() < target {
+        s.push_str("  wordsx\n"); // exactly the content column, no extra indent
+    }
+    s
+}
+
+/// A BLOCKQUOTE of the same indented wrapped prose. Registered as a linear pin
+/// for the proven-safe case: `ContainerCache` keeps its own stripped
+/// `inner_buffer`/`inner_cut` and never consults [`ParaEnd`], so no transient
+/// verdict exists for it to drop on — measured flat (15.9x / 15.9x over a 16x
+/// span) both with and without the paragraph suspension.
+fn indented_blockquote_ragged(target: usize) -> String {
+    let mut s = String::from("> first line of the quote\n");
+    while s.len() < target {
+        s.push_str(">  words\n"); // 9 bytes; `> ` stripped, leaving ` words`
+    }
+    s
+}
+
+/// Wall-time twin of the `rendered` counter gate for the indented-continuation
+/// paragraph (see [`indented_wrapped_para`]). Same crude-but-wide shape as
+/// `fence_opener_line_growth_is_wall_linear`: best of 3 per size, an 8x span
+/// (64 KB → 512 KB) where linear ≈ 8x and quadratic ≈ 64x, limit 24x.
+///
+/// Growth ratio alone is a blunt instrument HERE, though: one giant open
+/// paragraph re-emits its whole `Block.html` every append (the documented wire
+/// contract — see the `emitted` counter), which is an O(n²/chunk) memcpy floor
+/// no commit-cut fix can remove, and it dominates the 512 KB sample. So the
+/// sharp assertion is the second one: indented prose must cost about what the
+/// identical FLUSH prose costs. That ratio is ~1x when the cut advances and was
+/// 60x+ when it pinned at 0.
+#[test]
+fn indented_continuation_para_is_wall_linear() {
+    const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
+    // Best of 3 — the least-noisy sample, never the worst.
+    let best = |md: &str| {
+        (0..3)
+            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut walls = Vec::with_capacity(SIZES.len());
+    let mut worst_vs_flush = 0.0f64;
+    for &n in &SIZES {
+        let wall = best(&indented_wrapped_para(n));
+        let flush = best(&flush_wrapped_para(n));
+        let vs_flush = wall / flush;
+        worst_vs_flush = worst_vs_flush.max(vs_flush);
+        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+        println!(
+            "indented_wrapped_para {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
+             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
+            n / 1024,
+            wall,
+            flush
+        );
+        walls.push(wall);
+    }
+    println!("indented_wrapped_para worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    assert!(
+        worst_vs_flush < 4.0,
+        "indented continuation lines cost {worst_vs_flush:.1}x what the identical FLUSH prose \
+         costs (limit 4x). The paragraph commit cut stopped advancing — `is_boundary` must keep \
+         proposing the first word of an indent-led line."
+    );
+    let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
+    let ratio = walls[walls.len() - 1] / walls[0];
+    println!("indented_wrapped_para wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
+    assert!(
+        ratio < 24.0,
+        "indented continuation lines went superlinear in WALL time: {ratio:.1}x for {span:.0}x \
+         input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x). The paragraph commit cut \
+         stopped advancing — `is_boundary` must keep proposing the first word of an indent-led \
+         line.",
+        span * span
+    );
+}
+
+/// Wall/control twin of [`indented_continuation_para_is_wall_linear`] for the
+/// CHUNK-MISALIGNED line length (see [`indented_wrapped_para_ragged`]), where an
+/// append boundary regularly parks the buffer on a transient paragraph end. Same
+/// method, same limits; the sharp assertion is again the flush-prose control,
+/// which was 63x when the cache was dropped there instead of suspended.
+#[test]
+fn indented_para_ragged_chunks_is_wall_linear() {
+    const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
+    let best = |md: &str| {
+        (0..3)
+            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut walls = Vec::with_capacity(SIZES.len());
+    let mut worst_vs_flush = 0.0f64;
+    for &n in &SIZES {
+        let wall = best(&indented_wrapped_para_ragged(n));
+        let flush = best(&flush_wrapped_para_ragged(n));
+        let vs_flush = wall / flush;
+        worst_vs_flush = worst_vs_flush.max(vs_flush);
+        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+        println!(
+            "indented_ragged {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
+             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
+            n / 1024,
+            wall,
+            flush
+        );
+        walls.push(wall);
+    }
+    println!("indented_ragged worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    assert!(
+        worst_vs_flush < 4.0,
+        "chunk-misaligned indented continuation lines cost {worst_vs_flush:.1}x what the \
+         identical FLUSH prose costs (limit 4x). An append boundary landing on a line's leading \
+         indent must SUSPEND the paragraph cache (`trailing_open_ws_line`), not drop it into a \
+         full re-scan + re-render."
+    );
+    let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
+    let ratio = walls[walls.len() - 1] / walls[0];
+    println!("indented_ragged wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
+    assert!(
+        ratio < 24.0,
+        "chunk-misaligned indented continuation lines went superlinear in WALL time: {ratio:.1}x \
+         for {span:.0}x input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x).",
+        span * span
+    );
+}
+
+/// Wall/control twin of [`indented_para_ragged_chunks_is_wall_linear`] one
+/// container deep (see [`indented_list_item_ragged`]). The nested parser inside
+/// an open list item reaches the transient paragraph end exactly as the
+/// top-level one does; this pins that it keeps inheriting the suspension.
+#[test]
+fn indented_list_item_ragged_is_wall_linear() {
+    const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
+    let best = |md: &str| {
+        (0..3)
+            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let mut walls = Vec::with_capacity(SIZES.len());
+    let mut worst_vs_flush = 0.0f64;
+    for &n in &SIZES {
+        let wall = best(&indented_list_item_ragged(n));
+        let flush = best(&flush_list_item_ragged(n));
+        let vs_flush = wall / flush;
+        worst_vs_flush = worst_vs_flush.max(vs_flush);
+        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+        println!(
+            "indented_list_item {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
+             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
+            n / 1024,
+            wall,
+            flush
+        );
+        walls.push(wall);
+    }
+    println!("indented_list_item worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    assert!(
+        worst_vs_flush < 4.0,
+        "an open list item's indented continuation lines cost {worst_vs_flush:.1}x what the \
+         identical FLUSH item costs (limit 4x). The item's NESTED parser must keep suspending \
+         its paragraph cache on a transient end (`ParaEnd::OpenBlank`), not dropping it."
+    );
+    let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
+    let ratio = walls[walls.len() - 1] / walls[0];
+    println!("indented_list_item wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
+    assert!(
+        ratio < 24.0,
+        "an open list item's indented continuation lines went superlinear in WALL time: \
+         {ratio:.1}x for {span:.0}x input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x).",
+        span * span
+    );
+}
+
 #[test]
 fn ref_def_run_is_linear() {
     let small = measure(&ref_heavy(250), CHUNK, Opts::default());
@@ -1387,5 +1821,69 @@ fn ref_def_run_is_linear() {
         ratio < linear_limit(16.0),
         "ref-def run regressed to superlinear: {ratio:.1}x work for 16x defs (limit {:.0}x)",
         linear_limit(16.0)
+    );
+}
+
+/// Wall-time twin of the `rendered` gate for BLOCK-level raw HTML, against an
+/// ESCAPE control: the identical stream measured with `block_html` OFF, which
+/// folds per LINE through the long-standing escaped path. Same bytes, same line
+/// count, same misalignment — so the gap between the two IS the token fold.
+///
+/// Growth ratio alone is blunt here for the same reason it is for the indented
+/// paragraph: one giant open block re-emits its whole `Block.html` every append
+/// (the documented wire contract — see the `emitted` column), an O(n²/chunk)
+/// memcpy floor that dominates the 256 KB sample and that no fold can remove.
+/// So the ONLY assertion is the control comparison: sanitizing block HTML must
+/// cost about what escaping the same bytes costs (the raw growth ratio is
+/// printed, not gated — the escaped control grows just as fast). Measured ~1x with the token fold;
+/// the naive path (cache refuses to arm, full reparse + full re-sanitize per
+/// append) measured 247x on BOTH work counters over the 16x span and 11.2 s vs
+/// 49 ms of wall at 256 KB.
+#[test]
+fn block_html_sanitize_is_wall_linear() {
+    // 64 KB up: below that the per-append fixed costs swamp the fold and the
+    // ratio is pure noise (a 32 KB sample swung 1.9x–5.1x run to run).
+    const SIZES: [usize; 3] = [64 * 1024, 128 * 1024, 256 * 1024];
+    let on = Opts { html_sanitize: true, block_html: true, ..Opts::default() };
+    // The control twin: sanitizer engaged, block HTML still escaped.
+    let control = Opts { html_sanitize: true, ..Opts::default() };
+    // Best of 5 — the least-noisy sample, never the worst.
+    let best = |md: &str, o: Opts| {
+        (0..5).map(|_| measure(md, CHUNK, o).wall_ms).fold(f64::INFINITY, f64::min)
+    };
+    let mut walls = Vec::with_capacity(SIZES.len());
+    let mut escs = Vec::with_capacity(SIZES.len());
+    let mut worst_vs_control = 0.0f64;
+    for &n in &SIZES {
+        let md = block_html_ragged(n);
+        let wall = best(&md, on);
+        let esc = best(&md, control);
+        let vs = wall / esc;
+        worst_vs_control = worst_vs_control.max(vs);
+        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+        println!(
+            "block_html_ragged {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
+             escaped {:>8.2} ms  (x{vs:.1} vs escaped)",
+            n / 1024,
+            wall,
+            esc
+        );
+        walls.push(wall);
+        escs.push(esc);
+    }
+    println!("block_html_ragged worst cost vs escaped control {worst_vs_control:.1}x (limit 6)");
+    println!(
+        "block_html_ragged raw wall growth {:.1}x over a 4x span (informational — the open \
+         block's per-append full re-emit is an O(n\u{b2}/chunk) memcpy floor; the ESCAPED control \
+         grows {:.1}x on the same stream)",
+        walls[walls.len() - 1] / walls[0],
+        escs[escs.len() - 1] / escs[0],
+    );
+    assert!(
+        worst_vs_control < 6.0,
+        "sanitizing block HTML costs {worst_vs_control:.1}x what ESCAPING the same bytes costs \
+         (limit 6x). The HtmlBlockCache token fold must consume each token exactly once — \
+         re-sanitizing the growing block per append measured 247x on both work counters and \
+         121x this control's wall time."
     );
 }

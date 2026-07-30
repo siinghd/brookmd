@@ -87,16 +87,21 @@ export function blockProps(block: Block): BlockComponentProps {
     speculative: block.speculative,
   };
   const data = block.kind.data as
-    | { lang?: string | null; code?: string; latex?: string; start?: number; ordered?: boolean; items?: { html: string }[]; tag?: string; attrs?: [string, string][] }
+    | { lang?: string | null; meta?: string; code?: string; latex?: string; start?: number; ordered?: boolean; items?: { html: string }[]; tag?: string; attrs?: [string, string][] }
     | undefined;
   if (block.kind.type === "CodeBlock") {
     // Prefer the structured `code` (present when blockData is on) over the HTML
     // regex — it is the lossless decoded source. Fall back to the regex when off.
     props.text = data?.code ?? decodeCodeText(block.html);
     props.language = data?.lang ?? "";
+    // The info string's META (everything past the language word) — always-on like
+    // `lang`, absent when the fence carried none. It has no HTML representation
+    // (no `data-meta` attribute), so there is no regex fallback: it comes from
+    // DATA or not at all.
+    if (typeof data?.meta === "string") props.meta = data.meta;
     // Surface the typed convenience field only when the opt-in `code` is present.
     if (typeof data?.code === "string") {
-      props.code = { lang: data.lang ?? null, code: data.code } as CodeBlockData;
+      props.code = { lang: data.lang ?? null, meta: data.meta, code: data.code } as CodeBlockData;
     }
   } else if (block.kind.type === "MathBlock") {
     // Prefer the structured `latex` (present when blockData is on) over the regex.

@@ -210,6 +210,17 @@ impl BrookParser {
         self.inner.set_gfm_math(on);
     }
 
+    /// Lenient list indentation: a list marker followed by 6+ columns of SPACE
+    /// padding yields the item's text instead of an indented code block. Off by
+    /// default (strict CommonMark §5.2). Useful for model output, which routinely
+    /// over-indents after a bullet. Exactly-5-column padding, a fence opened on
+    /// the marker line, indented code starting on a later line, and tab-padded
+    /// markers all stay strictly conformant.
+    #[wasm_bindgen(js_name = setLenientLists)]
+    pub fn set_lenient_lists(&mut self, on: bool) {
+        self.inner.set_lenient_lists(on);
+    }
+
     /// Emit `dir="auto"` on block-level text elements so the browser detects
     /// each block's direction (LTR/RTL) independently — correct rendering for
     /// documents that mix English with Arabic/Hebrew. Off by default; code
@@ -217,6 +228,16 @@ impl BrookParser {
     #[wasm_bindgen(js_name = setDirAuto)]
     pub fn set_dir_auto(&mut self, on: bool) {
         self.inner.set_dir_auto(on);
+    }
+
+    /// Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+    /// `<br>` — the `remark-breaks` convention, where one Enter is one visual
+    /// line. Off by default (strict CommonMark: a soft break is whitespace).
+    /// Hard breaks (two trailing spaces / trailing `\`) are `<br>` either way,
+    /// so turning this on only ADDS breaks; it never removes one.
+    #[wasm_bindgen(js_name = setSoftBreaks)]
+    pub fn set_soft_breaks(&mut self, on: bool) {
+        self.inner.set_soft_breaks(on);
     }
 
     /// Opt-in accessibility markup that deviates from strict GFM byte-output:
@@ -276,6 +297,33 @@ impl BrookParser {
     #[wasm_bindgen(js_name = setHtmlSanitize)]
     pub fn set_html_sanitize(&mut self, on: bool, allow: Vec<String>, drop: Vec<String>) {
         self.inner.set_html_sanitize(on, allow, drop);
+    }
+
+    /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML — a
+    /// `<details><summary>…` block renders as real elements instead of escaping
+    /// into a code block. Takes effect ONLY when the sanitizer is engaged
+    /// (`setHtmlSanitize`), and only for CommonMark HTML block types 6 and 7.
+    /// Types 1–5 (`<script>`/`<pre>`/`<style>`/`<textarea>`, comments, PIs,
+    /// CDATA, declarations) stay escaped/dropped. Still-open elements get
+    /// speculative closers while the block streams, so the emitted HTML is a
+    /// complete tree at every prefix. Off by default (output unchanged).
+    #[wasm_bindgen(js_name = setBlockHtml)]
+    pub fn set_block_html(&mut self, on: bool) {
+        self.inner.set_block_html(on);
+    }
+
+    /// Un-block specific URL schemes that are blocked by DEFAULT — bare scheme
+    /// names without the colon (`["file"]`), matched case-insensitively. Empty
+    /// by default (built-in policy unchanged). This never RESTRICTS anything:
+    /// schemes outside the built-in blocklist (`vscode:`, `ftp:`, …) already
+    /// pass. The script-executing tier (`javascript:`, `vbscript:`,
+    /// `data:text/html`, `data:text/javascript`, scriptable `data:` media types)
+    /// is non-overridable — listing one here is a no-op. Only enable `file:` in
+    /// a host that intercepts link clicks instead of navigating (Electron,
+    /// extensions); local-resource disclosure is then the embedder's call.
+    #[wasm_bindgen(js_name = setAllowSchemes)]
+    pub fn set_allow_schemes(&mut self, schemes: Vec<String>) {
+        self.inner.set_allow_schemes(schemes);
     }
 }
 

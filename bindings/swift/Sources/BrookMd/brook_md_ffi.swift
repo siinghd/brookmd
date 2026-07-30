@@ -781,9 +781,10 @@ public func FfiConverterTypeBrookSession_lower(_ value: BrookSession) -> UInt64 
  *
  * The record's field defaults reproduce the worker's `?? default` behavior
  * exactly: GFM autolinks and alerts default **on** (LLM output is full of bare
- * URLs and `> [!NOTE]` callouts), everything else off. The four tag/allowlist
- * fields are optional arrays (`Option<Vec<String>>`), matching the `?:` optional
- * arrays on the TypeScript side — `None` (omitted) is the "feature off" state.
+ * URLs and `> [!NOTE]` callouts), everything else off. The five tag/allowlist/
+ * scheme fields are optional arrays (`Option<Vec<String>>`), matching the `?:`
+ * optional arrays on the TypeScript side — `None` (omitted) is the "feature off"
+ * state.
  *
  * Setting `html_allowlist` **or** `drop_html_tags` (even to an empty array)
  * engages the safe raw-HTML sanitizer, exactly as the worker derives its
@@ -854,6 +855,34 @@ public struct BrookConfig: Equatable, Hashable {
      * layer does). Off by default — wire bytes identical to contract v1.1.0.
      */
     public var wireDelta: Bool
+    /**
+     * Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+     * `<br>` — the `remark-breaks` convention. Off by default (strict CommonMark:
+     * a soft break is whitespace). Only ever ADDS breaks; hard breaks are `<br>`
+     * either way.
+     */
+    public var softBreaks: Bool
+    /**
+     * Un-block URL schemes that are blocked by DEFAULT — bare scheme names
+     * without the colon (`["file"]`), matched case-insensitively. `None` = the
+     * built-in policy is unchanged. This never RESTRICTS anything, and the
+     * script-executing tier (`javascript:`, `data:text/html`, …) is
+     * non-overridable — listing one here is a no-op.
+     */
+    public var allowSchemes: [String]?
+    /**
+     * Lenient list indentation: a list marker followed by 6+ columns of SPACE
+     * padding yields the item's text instead of an indented code block. Off by
+     * default (strict CommonMark §5.2); useful for over-indenting model output.
+     */
+    public var lenientLists: Bool
+    /**
+     * Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (a
+     * `<details><summary>…` block renders as real elements). Takes effect ONLY
+     * when the sanitizer is engaged (`html_allowlist`/`drop_html_tags`), and only
+     * for CommonMark HTML block types 6 and 7. Off by default.
+     */
+    public var blockHtml: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -906,7 +935,31 @@ public struct BrookConfig: Equatable, Hashable {
          * previous emit instead of full `html`. A consumer that enables this MUST
          * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
          * layer does). Off by default — wire bytes identical to contract v1.1.0.
-         */wireDelta: Bool = false) {
+         */wireDelta: Bool = false, 
+        /**
+         * Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+         * `<br>` — the `remark-breaks` convention. Off by default (strict CommonMark:
+         * a soft break is whitespace). Only ever ADDS breaks; hard breaks are `<br>`
+         * either way.
+         */softBreaks: Bool = false, 
+        /**
+         * Un-block URL schemes that are blocked by DEFAULT — bare scheme names
+         * without the colon (`["file"]`), matched case-insensitively. `None` = the
+         * built-in policy is unchanged. This never RESTRICTS anything, and the
+         * script-executing tier (`javascript:`, `data:text/html`, …) is
+         * non-overridable — listing one here is a no-op.
+         */allowSchemes: [String]? = nil, 
+        /**
+         * Lenient list indentation: a list marker followed by 6+ columns of SPACE
+         * padding yields the item's text instead of an indented code block. Off by
+         * default (strict CommonMark §5.2); useful for over-indenting model output.
+         */lenientLists: Bool = false, 
+        /**
+         * Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (a
+         * `<details><summary>…` block renders as real elements). Takes effect ONLY
+         * when the sanitizer is engaged (`html_allowlist`/`drop_html_tags`), and only
+         * for CommonMark HTML block types 6 and 7. Off by default.
+         */blockHtml: Bool = false) {
         self.gfmAutolinks = gfmAutolinks
         self.gfmAlerts = gfmAlerts
         self.gfmTagfilter = gfmTagfilter
@@ -921,6 +974,10 @@ public struct BrookConfig: Equatable, Hashable {
         self.dropHtmlTags = dropHtmlTags
         self.blockData = blockData
         self.wireDelta = wireDelta
+        self.softBreaks = softBreaks
+        self.allowSchemes = allowSchemes
+        self.lenientLists = lenientLists
+        self.blockHtml = blockHtml
     }
 
     
@@ -952,7 +1009,11 @@ public struct FfiConverterTypeBrookConfig: FfiConverterRustBuffer {
                 htmlAllowlist: FfiConverterOptionSequenceString.read(from: &buf), 
                 dropHtmlTags: FfiConverterOptionSequenceString.read(from: &buf), 
                 blockData: FfiConverterBool.read(from: &buf), 
-                wireDelta: FfiConverterBool.read(from: &buf)
+                wireDelta: FfiConverterBool.read(from: &buf), 
+                softBreaks: FfiConverterBool.read(from: &buf), 
+                allowSchemes: FfiConverterOptionSequenceString.read(from: &buf), 
+                lenientLists: FfiConverterBool.read(from: &buf), 
+                blockHtml: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -971,6 +1032,10 @@ public struct FfiConverterTypeBrookConfig: FfiConverterRustBuffer {
         FfiConverterOptionSequenceString.write(value.dropHtmlTags, into: &buf)
         FfiConverterBool.write(value.blockData, into: &buf)
         FfiConverterBool.write(value.wireDelta, into: &buf)
+        FfiConverterBool.write(value.softBreaks, into: &buf)
+        FfiConverterOptionSequenceString.write(value.allowSchemes, into: &buf)
+        FfiConverterBool.write(value.lenientLists, into: &buf)
+        FfiConverterBool.write(value.blockHtml, into: &buf)
     }
 }
 

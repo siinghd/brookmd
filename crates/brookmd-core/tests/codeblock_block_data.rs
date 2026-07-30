@@ -23,7 +23,7 @@ fn finalize(md: &str, block_data: bool) -> StreamParser {
 /// The (lang, code) of the first CodeBlock among a parser's blocks.
 fn first_code(p: &StreamParser) -> Option<(Option<String>, Option<String>)> {
     for b in p.all_blocks() {
-        if let BlockKind::CodeBlock { lang, code } = &b.kind {
+        if let BlockKind::CodeBlock { lang, code, .. } = &b.kind {
             // `code` rides behind an `Rc` (streaming re-emit is a refcount bump);
             // deep-copy it here so assertions compare plain `String`s.
             return Some((lang.clone(), code.as_ref().map(|c| (**c).clone())));

@@ -16,8 +16,11 @@
 //! is escaped (or passed through if unsafe mode is enabled).
 
 use crate::entities::decode_entity;
-use crate::render::{push_tagfiltered, RenderOpts};
-use crate::url::{escape_attr, escape_html, sanitize_attrs, sanitize_image_url, sanitize_url};
+use crate::render::{push_tagfiltered, HtmlPolicy, RenderOpts};
+use crate::url::{
+    escape_attr, escape_html, sanitize_attrs, sanitize_image_url, sanitize_raw_html_attrs,
+    sanitize_url,
+};
 
 const ESCAPABLE: &[u8] = b"!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
 
@@ -36,18 +39,166 @@ pub fn render_inline_boundary(input: &str, opts: &RenderOpts, out: &mut String) 
     render_inline_core(input, opts, out, true)
 }
 
+/// A paragraph's leading spaces or tabs are not content (CommonMark §4.8: the
+/// raw content is the lines "with initial and final spaces or tabs removed"),
+/// so every paragraph-flavored render skips them. The CONTINUATION lines' own
+/// indents are shed by the break arms inside [`render_inline_core`]; only the
+/// first line needs a skip here, and only because nothing precedes it.
+///
+/// Deliberately NOT folded into [`render_inline`]: link text, image alt, table
+/// cells and inline-component bodies all keep their leading whitespace, and
+/// they share the same entry point.
+pub fn render_inline_para(input: &str, opts: &RenderOpts, out: &mut String) {
+    render_inline_core(&input[para_indent(input)..], opts, out, false);
+}
+
+/// [`render_inline_boundary`] for a paragraph slice ([`render_inline_para`]'s
+/// skip applied first). The returned cut is an offset into `input` — the skip
+/// is added back — so callers keep their `start + boundary` arithmetic. A `0`
+/// return still means "nothing settled": a cut is only ever proposed at a byte
+/// that renders to visible content, never at the end of the leading indent.
+///
+/// Composition with the skip is exact because a cut never lands on whitespace
+/// ([`is_boundary`]'s first guard), so only the FIRST segment of a paragraph
+/// can begin inside the leading indent — every later segment starts on a byte
+/// where the skip is a no-op.
+pub fn render_inline_para_boundary(input: &str, opts: &RenderOpts, out: &mut String) -> usize {
+    let skip = para_indent(input);
+    match render_inline_core(&input[skip..], opts, out, true) {
+        0 => 0,
+        cut => skip + cut,
+    }
+}
+
+/// True for the bytes CommonMark strips from both ends of a paragraph line —
+/// spaces and tabs.
+#[inline]
+fn is_para_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t')
+}
+
+/// Byte length of `input`'s leading spaces/tabs run. O(indent).
+fn para_indent(input: &str) -> usize {
+    input.as_bytes().iter().take_while(|&&b| is_para_ws(b)).count()
+}
+
+/// Drop the spaces/tabs `out` ends with — a paragraph line's *final* whitespace,
+/// which is not content — stopping at `floor` (this render's own start, so a
+/// segment render can never eat into an already-frozen prefix).
+///
+/// Never needs to reach `floor`: the trailing whitespace run of a line always
+/// renders inside the same segment as the `\n` that follows it (no cut lands on
+/// whitespace), and the byte a segment starts on always renders to a non-space
+/// character or is preceded by a `\n` — see [`is_boundary`].
+fn trim_line_end_ws(out: &mut String, floor: usize) {
+    while out.len() > floor && out.as_bytes().last().is_some_and(|&b| is_para_ws(b)) {
+        out.pop();
+    }
+}
+
+/// Skip a continuation line's leading spaces/tabs (the second half of the same
+/// rule): `pos` is just past a line break, so whatever whitespace follows is
+/// indentation, not content. O(indent), and each indent run is walked once.
+fn skip_line_indent(bytes: &[u8], mut pos: usize) -> usize {
+    while pos < bytes.len() && is_para_ws(bytes[pos]) {
+        pos += 1;
+    }
+    pos
+}
+
 /// A top-level position is a clean cut iff a word begins there right after a
-/// single inter-word space (preceded by a non-space) or right after a newline —
-/// never inside a multi-space hard-break run.
+/// newline, right after a single inter-word space (preceded by a non-space), or
+/// right after the leading indent of a continuation line (see
+/// [`indent_led_boundary`]) — never inside a multi-space hard-break run. That
+/// last property still holds: a hard break's spaces sit at line END and
+/// *precede* their `\n`, so the backward walk below — which accepts a space/tab
+/// run only when a `\n` terminates it on the LEFT — can never reach into one,
+/// and the guard above rejects whitespace positions outright anyway.
+///
+/// # The `&`/`<` exclusion
+///
+/// Both whitespace-led rules leave the whitespace itself in the FROZEN segment
+/// — and the `\n` arm's `out.ends_with("  ")` hard-break lookbehind is the
+/// renderer's one output-*state*-dependent decision. It straddles the cut
+/// whenever the rest of the line renders to nothing or to a single space: the
+/// suffix render sees one space (or none) where the full render sees two, and
+/// emits a literal space where the full render emits `<br>`. Requiring `pos`
+/// itself to render to a non-space character rules that out — the suffix's last
+/// character before the next `\n` is then either that character or one of >= 2
+/// characters wholly inside the suffix, so both renders decide alike.
+///
+/// Every byte that reaches the check qualifies (whitespace is already excluded,
+/// and `` \`[!$*_~ `` and the catch-all all emit a non-space character or an
+/// opening tag) except two: `&`, which may decode to a space (`&#32;`), and
+/// `<`, whose whole token the sanitizer may drop (`<!--…-->`). A word right
+/// after a bare `\n` needs no such guard — the frozen render then ends in `\n`
+/// or `<br>\n`, never a space, so nothing can straddle.
+///
+/// # Cut parity under the paragraph whitespace rules
+///
+/// The break arms now DROP a line's final spaces/tabs and skip the next line's
+/// indent, so a frozen segment no longer ends in the literal whitespace it
+/// contains. The invariant survives, case by case, because a cut's own byte is
+/// never whitespace:
+///
+/// * indent-led cut — the frozen segment now ends at the `\n` (its own render
+///   skipped the indent that follows), and the suffix starts at the word byte.
+///   The full render is at exactly that state after the same `\n`;
+/// * inter-word-space cut — that space is not line-final (a non-space follows
+///   it inside the same line), so no trim touches it and the frozen segment
+///   still ends with it;
+/// * `\n`-led cut — unchanged, the frozen segment ends in `\n` / `<br>\n`.
+///
+/// And no trim ever needs to cross a cut: a line's trailing whitespace run and
+/// its `\n` share a segment (neither offers a candidate), and the segment's
+/// first byte renders to a non-space character in the two space-led cases, so
+/// the pop stops there — strictly above the segment's `out_floor`.
 fn is_boundary(bytes: &[u8], pos: usize) -> bool {
     if pos == 0 || pos >= bytes.len() || matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
         return false;
     }
-    match bytes[pos - 1] {
-        b'\n' => true,
-        b' ' => pos >= 2 && !matches!(bytes[pos - 2], b' ' | b'\t' | b'\n' | b'\r'),
-        _ => false,
+    if bytes[pos - 1] == b'\n' {
+        return true;
     }
+    if !matches!(bytes[pos - 1], b' ' | b'\t') || matches!(bytes[pos], b'&' | b'<') {
+        return false;
+    }
+    // A single inter-word space (its own predecessor a non-space) …
+    if bytes[pos - 1] == b' ' && pos >= 2 && !matches!(bytes[pos - 2], b' ' | b'\t' | b'\n' | b'\r')
+    {
+        return true;
+    }
+    // … or the leading indent of a continuation line.
+    indent_led_boundary(bytes, pos)
+}
+
+/// The indent-led-line arm of [`is_boundary`]: `bytes[pos - 1]` is a space or
+/// tab that the single-inter-word-space rule rejected, so walk back over that
+/// whitespace run and accept iff a `\n` terminates it — i.e. `pos` is the first
+/// word of an *indented continuation line*, the same kind of candidate a word
+/// right after a bare `\n` already is (minus the `&`/`<` exclusion the caller
+/// has already applied).
+///
+/// Without it, word-wrapped prose whose continuation lines carry any indent
+/// (`"a\n b\n c\n…"` — ordinary LLM/chat output) yields NO candidates anywhere:
+/// each line's first word sits after a space whose own predecessor is a space
+/// or the line's `\n`, and [`synth_boundary`] can't rescue it either (its inert
+/// runs need [`SYNTH_GAP`] space-free bytes; these lines have a space every few
+/// bytes). The commit cut pins at 0 and every append re-renders the whole
+/// accumulated paragraph — O(n²).
+///
+/// The walk stays O(n) per render pass: it is bounded by the whitespace run it
+/// traverses, and each run is entered at most once per pass — only the position
+/// at a run's right end probes it (positions inside a run are whitespace,
+/// rejected by [`is_boundary`]'s first guard), so the traversed spans are
+/// disjoint and sum to at most the slice length.
+///
+fn indent_led_boundary(bytes: &[u8], pos: usize) -> bool {
+    let mut i = pos - 1;
+    while i > 0 && matches!(bytes[i - 1], b' ' | b'\t') {
+        i -= 1;
+    }
+    i > 0 && bytes[i - 1] == b'\n'
 }
 
 /// Byte distance between synthetic boundary candidates in space-free text.
@@ -179,6 +330,11 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
     INLINE_DEPTH.with(|d| d.set(depth + 1));
     let _inline_depth_guard = InlineDepthGuard(depth);
     let bytes = input.as_bytes();
+    // Floor for the line-end whitespace trim in the break arms: this render's
+    // own start in `out`, never the document's. A segment render therefore
+    // cannot pop bytes an earlier segment froze (and never has to — see
+    // [`trim_line_end_ws`]).
+    let out_floor = out.len();
     let mut pos = 0;
     let mut deli_stack: Vec<Delim> = Vec::new();
     // Streaming boundary tracking (only populated when `track`).
@@ -266,8 +422,11 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                 pos += 2;
             }
             b'\\' if pos + 1 < bytes.len() && bytes[pos + 1] == b'\n' => {
+                // Backslash hard break. Nothing to trim on the left (the line's
+                // final character is the `\` itself), but the NEXT line's indent
+                // is still stripped (example 637).
                 out.push_str("<br>\n");
-                pos += 2;
+                pos = skip_line_indent(bytes, pos + 2);
             }
             b'&' => {
                 if let Some((decoded, consumed)) = decode_entity(&bytes[pos..]) {
@@ -325,7 +484,7 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                 }
             }
             b'<' => {
-                if let Some(consumed) = try_autolink(bytes, pos, out) {
+                if let Some(consumed) = try_autolink(bytes, pos, out, &opts.allow_schemes) {
                     pos = consumed;
                 } else {
                     match try_inline_component(input, bytes, pos, opts, out) {
@@ -486,21 +645,39 @@ fn render_inline_core(input: &str, opts: &RenderOpts, out: &mut String, track: b
                     k += 1;
                 }
                 if k < bytes.len() && bytes[k] == b'\n' {
+                    // The break's own spaces are consumed here; any whitespace
+                    // LEFT of them is this line's remaining final whitespace and
+                    // is not content either (`"foo \t  \n"` → `foo<br>`).
+                    trim_line_end_ws(out, out_floor);
                     out.push_str("<br>\n");
-                    pos = k + 1;
+                    pos = skip_line_indent(bytes, k + 1);
                 } else {
                     out.push(' ');
                     pos += 1;
                 }
             }
             b'\n' => {
-                if out.ends_with("  ") {
+                // Composition order (each step reads the state the previous one
+                // left): the hard-break lookbehind decides FIRST — it is the one
+                // decision made on rendered output, and 2+ SOURCE spaces have
+                // already been intercepted by the arm above — then the line's
+                // final spaces/tabs go, then the break itself, then the next
+                // line's leading indent.
+                let hard = out.ends_with("  ");
+                if hard {
                     out.truncate(out.len() - 2);
+                }
+                trim_line_end_ws(out, out_floor);
+                if hard || opts.soft_breaks {
+                    // `remark-breaks` parity: a soft break renders as a visible
+                    // line break. The `\n` still follows the tag so the emitted
+                    // markup keeps its line structure (and byte-parity with the
+                    // hard-break arm above).
                     out.push_str("<br>\n");
                 } else {
                     out.push('\n');
                 }
-                pos += 1;
+                pos = skip_line_indent(bytes, pos + 1);
             }
             b'\r' => {
                 pos += 1;
@@ -1079,7 +1256,12 @@ fn try_dollar_math(
 // Autolinks
 // ---------------------------------------------------------------------
 
-fn try_autolink(bytes: &[u8], start: usize, out: &mut String) -> Option<usize> {
+fn try_autolink(
+    bytes: &[u8],
+    start: usize,
+    out: &mut String,
+    allow_schemes: &[Box<str>],
+) -> Option<usize> {
     let end = bytes[start..].iter().position(|&b| b == b'>')? + start;
     let inner = &bytes[start + 1..end];
     if inner.is_empty() {
@@ -1109,7 +1291,7 @@ fn try_autolink(bytes: &[u8], start: usize, out: &mut String) -> Option<usize> {
         // dangerous-scheme filter as regular links so the href becomes `#`. The
         // visible link TEXT below is unaffected (still HTML-escaped verbatim).
         let decoded = crate::url::decode_text(s);
-        if crate::url::is_dangerous_href_scheme(&decoded) {
+        if crate::url::is_dangerous_href_scheme(&decoded, allow_schemes) {
             out.push('#');
         } else {
             // Backslash escapes are NOT processed in autolinks; percent-encode
@@ -1211,6 +1393,14 @@ const DANGEROUS_HTML_TAGS: &[&[u8]] = &[
     b"xmp", b"plaintext", b"noembed", b"noframes", b"listing",
 ];
 
+/// HTML void elements: they have no end tag, so a rendered one never enters the
+/// block sanitizer's open-element stack and never earns a speculative closer
+/// (see `render::fold_block_html`).
+pub(crate) const VOID_HTML_TAGS: &[&[u8]] = &[
+    b"area", b"base", b"br", b"col", b"embed", b"hr", b"img", b"input", b"link",
+    b"meta", b"param", b"source", b"track", b"wbr",
+];
+
 /// Emit an inline raw-HTML token verbatim (`unsafe_html` pass-through),
 /// routing through the GFM tagfilter when it's on — so a disallowed inline
 /// `<title>` / `<script …>` renders as text (GFM spec §6.11).
@@ -1237,7 +1427,7 @@ fn try_inline_html(bytes: &[u8], start: usize, opts: &RenderOpts, out: &mut Stri
     }
 
     if opts.html_sanitize {
-        sanitize_inline_html(token, opts, out);
+        sanitize_html_token(token, opts.html_policy(), out);
         return Some(start + consumed);
     }
 
@@ -1271,50 +1461,81 @@ fn inline_tag_name(token: &[u8]) -> Option<(core::ops::Range<usize>, bool)> {
     Some((name_start..i, is_close))
 }
 
-/// Render one inline raw-HTML token under the safe sanitizer (`html_sanitize`).
-/// Drop-list tags and (in allow-all mode) dangerous tags are removed; allowed
-/// tags render natively with sanitized attributes; everything else is escaped.
-fn sanitize_inline_html(token: &[u8], opts: &RenderOpts, out: &mut String) {
+/// What the sanitizer did with one complete raw-HTML token. The inline path
+/// ignores this; the BLOCK path needs the outcome (and the tag's identity) to
+/// maintain its open-element stack.
+pub(crate) enum SanitizedTag<'a> {
+    /// Nothing emitted: a comment / PI / CDATA / declaration / malformed token,
+    /// a drop-list tag, or a tag from the non-overridable dangerous set.
+    Dropped,
+    /// Emitted as escaped literal text (a non-empty allowlist didn't list it).
+    Escaped,
+    /// Emitted as a real element. `name` is the SOURCE spelling (HTML tag names
+    /// are case-insensitive; callers match with `eq_ignore_ascii_case`). `void`
+    /// folds together "this element has no end tag" and "the author self-closed
+    /// it" — either way it never enters an open-element stack.
+    Rendered { name: &'a str, close: bool, void: bool },
+}
+
+/// Route ONE complete raw-HTML token through the safe sanitizer
+/// (`html_sanitize`). This is the single tag decision path, shared by inline raw
+/// HTML ([`try_inline_html`]) and block-level raw HTML
+/// (`render::fold_block_html`) so the two can never drift: drop-list tags and
+/// (non-overridably) dangerous tags are removed, allowlisted tags render
+/// natively with sanitized attributes, everything else is escaped.
+pub(crate) fn sanitize_html_token<'a>(
+    token: &'a [u8],
+    policy: HtmlPolicy<'_>,
+    out: &mut String,
+) -> SanitizedTag<'a> {
     let Some((name_range, is_close)) = inline_tag_name(token) else {
-        return; // PI / CDATA / declaration / malformed: drop in sanitize mode
+        // PI / CDATA / declaration / comment / malformed: drop in sanitize mode.
+        return SanitizedTag::Dropped;
     };
     let name = &token[name_range.clone()];
     // Explicit drop-list removes the tag entirely (markup gone; any text between
     // an open/close pair stays as inert text).
-    if opts.html_drop.iter().any(|t| t.as_bytes().eq_ignore_ascii_case(name)) {
-        return;
+    if policy.drop.iter().any(|t| t.as_bytes().eq_ignore_ascii_case(name)) {
+        return SanitizedTag::Dropped;
     }
     // The dangerous set is NON-OVERRIDABLE: a script/iframe/svg/… is dropped in
     // BOTH allow-all and restrict mode, even if explicitly allowlisted — a caller
     // who truly wants raw script uses `unsafe_html`, not the sanitizer. Dropping
     // (rather than escaping) leaves any open/close pair's body as inert text.
     if DANGEROUS_HTML_TAGS.iter().any(|d| d.eq_ignore_ascii_case(name)) {
-        return;
+        return SanitizedTag::Dropped;
     }
     // Allow-all renders every (non-dangerous) tag; restrict renders only the
     // allowlisted ones and escapes the rest (visible as literal text, never
     // executed).
-    if !opts.html_allowlist.is_empty()
-        && !opts.html_allowlist.iter().any(|t| t.as_bytes().eq_ignore_ascii_case(name))
+    if !policy.allowlist.is_empty()
+        && !policy.allowlist.iter().any(|t| t.as_bytes().eq_ignore_ascii_case(name))
     {
         for &b in token {
             push_escaped(b, out);
         }
-        return;
+        return SanitizedTag::Escaped;
     }
     // Validate the whole token to UTF-8 once; the tag name is an ASCII sub-slice
     // of it, so it can be sliced out without a second validation pass.
     let token_str = std::str::from_utf8(token).unwrap_or("");
     let name_str = token_str.get(name_range).unwrap_or("");
+    let void =
+        VOID_HTML_TAGS.iter().any(|v| v.eq_ignore_ascii_case(name)) || token.ends_with(b"/>");
     if is_close {
         out.push_str("</");
         out.push_str(name_str);
         out.push('>');
-        return;
+        return SanitizedTag::Rendered { name: name_str, close: true, void };
     }
     out.push('<');
     out.push_str(name_str);
-    for (k, v) in sanitize_attrs(token_str) {
+    // RAW HTML: the sanitized attributes below are emitted as real DOM
+    // attributes on an attacker-authored tag, so this path uses the stricter
+    // entry point (drops `srcdoc`, `id`/`name`, `slot`, the `form*` family, …).
+    // Component tags deliberately keep the permissive `sanitize_attrs` — their
+    // attributes become framework props the consumer mediates, not DOM.
+    for (k, v) in sanitize_raw_html_attrs(token_str, policy.allow_schemes) {
         out.push(' ');
         out.push_str(&k);
         out.push_str("=\"");
@@ -1328,9 +1549,10 @@ fn sanitize_inline_html(token: &[u8], opts: &RenderOpts, out: &mut String) {
     } else {
         out.push('>');
     }
+    SanitizedTag::Rendered { name: name_str, close: false, void }
 }
 
-fn match_inline_html(bytes: &[u8], start: usize) -> Option<usize> {
+pub(crate) fn match_inline_html(bytes: &[u8], start: usize) -> Option<usize> {
     if bytes.get(start) != Some(&b'<') {
         return None;
     }
@@ -1462,7 +1684,7 @@ fn match_inline_html(bytes: &[u8], start: usize) -> Option<usize> {
 /// deliberately NOT mirrored: their local part admits digits and common
 /// punctuation, so suppressing them would momentarily hide everyday
 /// comparisons like `x<2` — a worse trade than a short-lived visible address.
-fn inline_html_streams_to_eof(bytes: &[u8], start: usize) -> bool {
+pub(crate) fn inline_html_streams_to_eof(bytes: &[u8], start: usize) -> bool {
     let rest = &bytes[start..];
     if rest.first() != Some(&b'<') {
         return false;
@@ -1783,7 +2005,12 @@ fn try_inline_component(
         return InlineComp::NotComponent;
     };
     let name = &input[start + 1..name_end];
-    let attrs = sanitize_attrs(&input[start..attrs_end]);
+    // PERMISSIVE on purpose: `sanitize_attrs`, not `sanitize_raw_html_attrs`.
+    // These become props on `components[tag]` — the consumer's component decides
+    // whether any of them ever reaches the DOM — so the raw-HTML DOM denylist
+    // (`id`/`name` clobbering, `slot`, `form*`, …) does not apply. `on*`, `style`,
+    // React-unsafe names and dangerous URL schemes are still filtered.
+    let attrs = sanitize_attrs(&input[start..attrs_end], &opts.allow_schemes);
 
     if self_closing {
         write_inline_component(name, &attrs, "", opts, out);
@@ -2140,7 +2367,7 @@ fn write_link(
     end_pos: usize,
 ) -> usize {
     out.push_str("<a href=\"");
-    sanitize_url(url, out, false);
+    sanitize_url(url, out, false, &opts.allow_schemes);
     out.push('"');
     if let Some(t) = title {
         out.push_str(" title=\"");
@@ -2556,12 +2783,12 @@ fn write_image(
     alt_range: &core::ops::Range<usize>,
     url: &str,
     title: Option<&str>,
-    _opts: &RenderOpts,
+    opts: &RenderOpts,
     out: &mut String,
     end_pos: usize,
 ) -> usize {
     out.push_str("<img src=\"");
-    sanitize_image_url(url, out);
+    sanitize_image_url(url, out, &opts.allow_schemes);
     out.push_str("\" alt=\"");
     let alt_text = std::str::from_utf8(&bytes[alt_range.clone()]).unwrap_or("");
     let mut tmp = String::new();

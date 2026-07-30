@@ -616,15 +616,18 @@ export function blockKindProps(block: Block, components?: Components): BlockComp
     speculative: block.speculative,
   };
   const data = block.kind.data as
-    | { lang?: string | null; code?: string; latex?: string; start?: number; ordered?: boolean; items?: { html: string }[]; tag?: string; attrs?: [string, string][] }
+    | { lang?: string | null; meta?: string; code?: string; latex?: string; start?: number; ordered?: boolean; items?: { html: string }[]; tag?: string; attrs?: [string, string][] }
     | undefined;
   if (block.kind.type === "CodeBlock") {
     // Prefer the structured `code` (present when blockData is on) over the HTML
     // regex — the lossless decoded source. Fall back to the regex when off.
     props.text = data?.code ?? decodeCodeText(block.html);
     props.language = data?.lang ?? "";
+    // Info-string META (past the language word) — always-on like `lang`, and
+    // DATA-only: it has no HTML representation to fall back to.
+    if (typeof data?.meta === "string") props.meta = data.meta;
     if (typeof data?.code === "string") {
-      props.code = { lang: data.lang ?? null, code: data.code };
+      props.code = { lang: data.lang ?? null, meta: data.meta, code: data.code };
     }
   } else if (block.kind.type === "MathBlock") {
     props.text = data?.latex ?? decodeMathText(block.html);

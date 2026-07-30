@@ -339,8 +339,8 @@ fn checkbox_candidates_never_speculate() {
         p.finalize();
         collect(&p)
     };
-    assert!(fin.contains("<input type=\"checkbox\" checked disabled>"));
-    assert!(fin.contains("<input type=\"checkbox\" disabled>"));
+    assert!(fin.contains("<input checked=\"\" disabled=\"\" type=\"checkbox\">"));
+    assert!(fin.contains("<input disabled=\"\" type=\"checkbox\">"));
 }
 
 #[test]

@@ -44,11 +44,11 @@ fn render_plain(md: &str) -> String {
 fn task_list_checkbox_wrapped_in_label() {
     let out = render_a11y("- [ ] foo\n- [x] bar\n");
     assert!(
-        out.contains("<li><label><input type=\"checkbox\" disabled> foo</label></li>"),
+        out.contains("<li><label><input disabled=\"\" type=\"checkbox\"> foo</label></li>"),
         "unchecked task item must wrap checkbox+text in a label: {out}"
     );
     assert!(
-        out.contains("<li><label><input type=\"checkbox\" checked disabled> bar</label></li>"),
+        out.contains("<li><label><input checked=\"\" disabled=\"\" type=\"checkbox\"> bar</label></li>"),
         "checked task item must wrap checkbox+text in a label: {out}"
     );
 }
@@ -76,7 +76,7 @@ fn off_by_default_is_byte_identical_gfm() {
     }
     // The exact legacy task-list markup is preserved by default.
     assert!(render_plain("- [ ] foo\n")
-        .contains("<li><input type=\"checkbox\" disabled> foo</li>"));
+        .contains("<li><input disabled=\"\" type=\"checkbox\"> foo</li>"));
 }
 
 #[test]
@@ -86,12 +86,12 @@ fn nested_task_item_is_not_label_wrapped() {
     let out = render_a11y("- [x] foo\n  - [ ] bar\n");
     assert_eq!(out.matches("<label>").count(), 1, "only the leaf item is wrapped: {out}");
     assert!(
-        out.contains("checkbox\" disabled> bar</label>"),
+        out.contains("disabled=\"\" type=\"checkbox\"> bar</label>"),
         "the leaf task item is wrapped: {out}"
     );
     // The outer checkbox is emitted bare (not inside a label).
     assert!(
-        out.contains("<li><input type=\"checkbox\" checked disabled> "),
+        out.contains("<li><input checked=\"\" disabled=\"\" type=\"checkbox\"> "),
         "outer item's checkbox stays unwrapped: {out}"
     );
 }

@@ -10,10 +10,13 @@ use crate::blocks::{
     AlertKind, BlockKind, ContainerData, HeadingData, ListItemData, MathBlockData, NestedBlock,
     TableCell, TableData,
 };
-use crate::inline::render_inline;
+use crate::inline::{
+    inline_html_streams_to_eof, match_inline_html, render_inline, render_inline_para,
+    sanitize_html_token, SanitizedTag,
+};
 use crate::scanner::{
-    component_inner_range, indent_cols, is_blank_line, line_end, line_slice, scan, scan_marker,
-    RawBlock, RawBlockKind, ScanCtx,
+    component_inner_range, detect_html_block_open, indent_cols, is_blank_line, line_end,
+    line_slice, scan, scan_marker, RawBlock, RawBlockKind, ScanCtx,
 };
 use crate::url::{escape_attr, escape_html, sanitize_attrs};
 
@@ -77,6 +80,18 @@ pub struct RenderOpts {
     /// Emit `dir="auto"` on block-level text elements for per-block bidi. Off by
     /// default (strict-CommonMark output is unchanged).
     pub dir_auto: bool,
+    /// Lenient list indentation: a marker followed by 6+ columns of SPACE padding
+    /// yields the item's text instead of an indented code block. Off by default
+    /// (strict CommonMark). Purely a scanner rule — see [`ScanCtx::lenient_lists`].
+    pub lenient_lists: bool,
+    /// Render a CommonMark SOFT line break (a bare `\n` inside inline content)
+    /// as a `<br>` instead of a literal newline — the `remark-breaks` /
+    /// "GitHub comment" convention, where a single Enter starts a new visual
+    /// line. Off by default (strict CommonMark: a soft break is whitespace).
+    /// Chat UIs that stream model output usually want this on, since models
+    /// emit single newlines expecting a visible break. Hard breaks (two trailing
+    /// spaces, or a trailing `\`) are unaffected — they are already `<br>`.
+    pub soft_breaks: bool,
     /// Emit extra accessibility markup that deviates from strict GFM byte-output:
     /// wrap a task-list checkbox + its inline text in a `<label>` (programmatic
     /// association), and add `scope="col"` to table header cells. Off by default
@@ -135,9 +150,44 @@ pub struct RenderOpts {
     pub html_sanitize: bool,
     pub html_allowlist: Vec<Box<str>>,
     pub html_drop: Vec<Box<str>>,
+    /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (see
+    /// `StreamParser::set_block_html`). Only takes effect when `html_sanitize` is
+    /// also on, and only for CommonMark HTML block types 6 and 7 — types 1–5
+    /// (`<script>`/`<pre>`/`<style>`/`<textarea>`, comments, PIs, CDATA,
+    /// declarations) stay escaped. Off (default) = block raw HTML is escaped
+    /// exactly as before.
+    pub block_html: bool,
+    /// Opt-in URL-scheme un-blocklist (see `StreamParser::set_allow_schemes`):
+    /// BARE scheme names, no colon, matched case-insensitively. Empty (default)
+    /// = every default-blocked scheme stays blocked. This only reaches the
+    /// OVERRIDABLE-blocked tier (`file:`) — it can never re-enable a
+    /// script-executing scheme, and it never restricts a scheme that already
+    /// passes.
+    pub allow_schemes: Vec<Box<str>>,
+}
+
+/// The three configuration lists the raw-HTML sanitizer actually reads,
+/// projected out of [`RenderOpts`] so the streaming block-HTML cache — which
+/// holds no `RenderOpts` — can drive the SAME decision path
+/// ([`crate::inline::sanitize_html_token`]) from borrowed parser state, with no
+/// per-append clone of the lists.
+#[derive(Clone, Copy)]
+pub(crate) struct HtmlPolicy<'a> {
+    pub allowlist: &'a [Box<str>],
+    pub drop: &'a [Box<str>],
+    pub allow_schemes: &'a [Box<str>],
 }
 
 impl RenderOpts {
+    /// Borrowed view of the sanitizer's allow/drop/scheme lists.
+    pub(crate) fn html_policy(&self) -> HtmlPolicy<'_> {
+        HtmlPolicy {
+            allowlist: &self.html_allowlist,
+            drop: &self.html_drop,
+            allow_schemes: &self.allow_schemes,
+        }
+    }
+
     pub fn lookup(&self, label: &str) -> Option<&LinkRef> {
         let key = normalize_label(label);
         // Committed (permanent) definitions win over tail ones — first-wins.
@@ -158,6 +208,7 @@ impl RenderOpts {
             math: self.gfm_math,
             component_tags: &self.component_tags,
             inline_component_tags: &self.inline_component_tags,
+            lenient_lists: self.lenient_lists,
         }
     }
 
@@ -227,7 +278,15 @@ pub fn valid_link_label(s: &str) -> bool {
     has_content
 }
 
-pub fn classify(raw: &RawBlockKind, slice: &str, gfm_alerts: bool) -> BlockKind {
+/// `finalizing` is the parser's finalize pass (see `StreamParser::reparse_tail`).
+/// It gates exactly one thing: a code fence's `meta` (see the `CodeFence` arm).
+pub fn classify(
+    raw: &RawBlockKind,
+    slice: &str,
+    gfm_alerts: bool,
+    allow_schemes: &[Box<str>],
+    finalizing: bool,
+) -> BlockKind {
     if gfm_alerts {
         if let RawBlockKind::Blockquote = raw {
             if let Some(kind) = alert_head(&blockquote_inner(slice)) {
@@ -243,15 +302,35 @@ pub fn classify(raw: &RawBlockKind, slice: &str, gfm_alerts: bool) -> BlockKind 
         RawBlockKind::SetextHeading { level } => BlockKind::Heading { level: *level, rich: None },
         RawBlockKind::Paragraph => BlockKind::Paragraph,
         RawBlockKind::CodeFence { info, .. } => {
-            let lang = info.split_whitespace().next().unwrap_or("");
+            let (lang, meta) = split_info(info);
+            // `meta` is exposed only once it can no longer change: the opener line
+            // has its terminating `\n`, or the stream is finalizing (which makes a
+            // still-partial opener line final by definition, so nothing is lost at
+            // EOF). While that line is still growing, its remainder is a
+            // half-arrived value — publishing it would flicker a filename header
+            // through every prefix, and would force the streaming `FenceInfoCache`
+            // (whose whole contract is FROZEN output, O(new bytes) per append) to
+            // re-derive a growing string on every append, which is quadratic in the
+            // line length. `lang` needs no such gate: it is the FIRST word, and the
+            // cache only arms once that word is settled by following whitespace.
+            // Both the full path and every cache classify through here, so
+            // streaming and one-shot agree at every prefix (`midstream_parity.rs`).
+            // The scan is O(opener line): it stops at the first `\n`, and a slice
+            // with none IS the opener line.
+            let meta = if finalizing || slice.as_bytes().contains(&b'\n') { meta } else { None };
             match lang {
                 "math" | "latex" | "tex" => BlockKind::MathBlock(None),
                 "mermaid" => BlockKind::Mermaid,
-                "" => BlockKind::CodeBlock { lang: None, code: None },
-                other => BlockKind::CodeBlock { lang: Some(other.to_string()), code: None },
+                "" => BlockKind::CodeBlock { lang: None, meta: None, code: None },
+                other => BlockKind::CodeBlock {
+                    lang: Some(other.to_string()),
+                    meta: meta.map(str::to_string),
+                    code: None,
+                },
             }
         }
-        RawBlockKind::IndentedCode => BlockKind::CodeBlock { lang: None, code: None },
+        // An indented code block has no info string at all — never a lang or meta.
+        RawBlockKind::IndentedCode => BlockKind::CodeBlock { lang: None, meta: None, code: None },
         RawBlockKind::MathFence { .. } => BlockKind::MathBlock(None),
         RawBlockKind::List { ordered, .. } => {
             BlockKind::List { ordered: *ordered, start: None, items: Vec::new() }
@@ -263,9 +342,12 @@ pub fn classify(raw: &RawBlockKind, slice: &str, gfm_alerts: bool) -> BlockKind 
         RawBlockKind::ComponentBlock { tag, .. } => {
             // Attributes are parsed + sanitized from the open tag for the JS layer
             // (`components[tag]` receives them); the same sanitizer feeds the HTML
-            // wrapper in render_component.
+            // wrapper in render_component. PERMISSIVE tier (`sanitize_attrs`):
+            // these are props the consumer's component mediates, so the raw-HTML
+            // DOM denylist (`id`/`name`, `slot`, `form*`, … — see
+            // `RAW_HTML_DROPPED_ATTRS`) is deliberately NOT applied here.
             let open = slice.trim_start_matches([' ', '\t']);
-            BlockKind::Component { tag: tag.clone(), attrs: sanitize_attrs(open) }
+            BlockKind::Component { tag: tag.clone(), attrs: sanitize_attrs(open, allow_schemes) }
         }
         RawBlockKind::LinkRefDefinition => BlockKind::Paragraph, // no output anyway
     }
@@ -330,7 +412,13 @@ impl Drop for DepthGuard {
 /// `opts.block_data` is on; `None` for every other kind and whenever the flag is
 /// off. Nested (recursive) call sites ignore the return — only blocks that
 /// appear at the document top level get a `kind.data`.
-pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut String) -> Option<Enrichment> {
+/// `base` is `source`'s own DOCUMENT-ABSOLUTE start offset, used only to stamp
+/// absolute source offsets onto the opt-in structured channel (list items). The
+/// top-level caller passes `Some(tail_start)`; the recursive calls below render
+/// SYNTHESIZED strings (a `>`-stripped blockquote inner, a de-indented list-item
+/// body, an alert/component inner) that have no offset in the document, so they
+/// pass `None` — and their `Enrichment` is discarded anyway.
+pub fn render_block(source: &str, raw: &RawBlock, base: Option<usize>, opts: &RenderOpts, out: &mut String) -> Option<Enrichment> {
     let slice = &source[raw.range.clone()];
     // Depth guard: every recursive call (blockquote / list-item / alert /
     // component inner blocks) funnels back through here. Past the cap, stop
@@ -380,7 +468,8 @@ pub fn render_block(source: &str, raw: &RawBlock, opts: &RenderOpts, out: &mut S
         }
         RawBlockKind::Blockquote => return render_blockquote(slice, opts, out),
         RawBlockKind::List { ordered, start } => {
-            let items = render_list(slice, *ordered, *start, opts, out);
+            let items =
+                render_list(slice, *ordered, *start, base.map(|b| b + raw.range.start), opts, out);
             if opts.block_data {
                 return Some(Enrichment::List(*start, items));
             }
@@ -533,7 +622,7 @@ fn render_paragraph(slice: &str, opts: &RenderOpts, out: &mut String) {
     // trailing whitespace in place. render_inline already targets a non-empty
     // `out` correctly (same idiom as list items / table cells).
     let inner_start = out.len();
-    render_inline(trimmed, opts, out);
+    render_inline_para(trimmed, opts, out);
     // CommonMark: trailing whitespace at end of final line is stripped.
     let keep = out[inner_start..]
         .trim_end_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r')
@@ -570,17 +659,31 @@ fn render_code_fence(
         };
         let last_line = &bytes[last_line_start..content_end];
         if is_fence_close_line(last_line) {
-            content_end = if last_line_start == content_start { content_start } else { last_line_start - 1 };
+            // Cut at the closer's line START, not one byte before it: the `\n`
+            // at `last_line_start - 1` terminates the last CONTENT line and
+            // belongs to the body. Treating it as the closer's separator ate a
+            // trailing blank line (CommonMark example 318). The normal case is
+            // unaffected — the body then simply ends with the `\n` that the
+            // `!content.ends_with('\n')` guard below used to re-add.
+            content_end = last_line_start;
             if content_end < content_start {
                 content_end = content_start;
             }
         }
     }
-    let content = if content_end > content_start {
+    let raw = if content_end > content_start {
         std::str::from_utf8(&bytes[content_start..content_end]).unwrap_or("")
     } else {
         ""
     };
+    // §4.5: an indented opening fence removes up to that many columns of
+    // indentation from EACH body line (a line with less loses only what it has).
+    // Indent 0 — the overwhelmingly common case — keeps the zero-copy slice.
+    let deindented = match fence_indent(bytes) {
+        0 => None,
+        n => Some(strip_fence_indent(raw, n)),
+    };
+    let content: &str = deindented.as_deref().unwrap_or(raw);
 
     push_code_fence_open(info, out);
     escape_html(content, out);
@@ -598,6 +701,24 @@ fn render_code_fence(
     }
 }
 
+/// Columns of indentation on a fenced block's OPENER line — the width each body
+/// line may shed (§4.5). A fence opener carries 0–3 leading SPACES by
+/// construction (`scan_fence` rejects 4+, and a leading tab already counts 4), so
+/// this looks at no more than three bytes.
+pub(crate) fn fence_indent(slice: &[u8]) -> usize {
+    slice.iter().take(3).take_while(|&&b| b == b' ').count()
+}
+
+/// De-indent a fenced block's body: up to `cols` columns off each line. Shared
+/// with the streaming fence cache, which applies it per line as lines arrive.
+pub(crate) fn strip_fence_indent(body: &str, cols: usize) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.split_inclusive('\n') {
+        strip_cols_into(line.as_bytes(), cols, &mut out);
+    }
+    out
+}
+
 /// The decoded source the `<pre><code>` body holds for a `content` string: empty
 /// stays empty; otherwise a trailing `\n` is guaranteed (mirroring the HTML the
 /// code renderers emit), so it equals `decodeCodeText(block.html)` byte-for-byte.
@@ -611,6 +732,30 @@ fn code_body_source(content: &str) -> String {
         s.push_str(content);
         s.push('\n');
         s
+    }
+}
+
+/// Split a code fence's info string into its LANGUAGE (the first
+/// whitespace-delimited word, `""` when the info string is empty) and its META
+/// (the remainder, trimmed; `None` when nothing follows the language). CommonMark
+/// §4.5 makes the info string one opaque run — the "first word is the language"
+/// split is convention, and `meta` is simply the rest of the same string, so both
+/// halves are the RAW source text: backslash escapes and entity references are
+/// left undecoded on the data channel exactly as `lang` already leaves them
+/// (`push_code_fence_open` decodes only for the HTML `class`/`data-lang`).
+/// Shared by `classify` and the streaming fence-info cache so the two can't drift.
+pub(crate) fn split_info(info: &str) -> (&str, Option<&str>) {
+    // The scanner already trims `info`; trimming here keeps the helper total for
+    // the cache's raw-buffer slice and makes the first word match
+    // `split_whitespace().next()` exactly.
+    let info = info.trim();
+    match info.find(char::is_whitespace) {
+        None => (info, None),
+        Some(i) => {
+            let (lang, rest) = info.split_at(i);
+            let rest = rest.trim();
+            (lang, if rest.is_empty() { None } else { Some(rest) })
+        }
     }
 }
 
@@ -743,6 +888,29 @@ fn render_setext_heading(slice: &str, level: u8, opts: &RenderOpts, out: &mut St
     heading_data(level, inner)
 }
 
+/// Drop an indented code body's trailing BLANK LINES — and only those. The
+/// trailing whitespace INSIDE the last content line is significant and must
+/// survive (`"    foo  "` → `<code>foo  `, CommonMark example 118), so a plain
+/// `trim_end` is wrong here: code is the one place whitespace carries meaning.
+///
+/// cmark's `chop_trailing_blank_lines`: walk back to the last non-whitespace
+/// byte, then cut at the first `\n` at or after it (everything past that point
+/// is whitespace-only lines). Both scans stay inside the trailing whitespace
+/// run, so this is O(trailing run) — never a rescan of the body.
+pub(crate) fn chop_trailing_blank_lines(content: &str) -> &str {
+    let bytes = content.as_bytes();
+    let last = match bytes.iter().rposition(|&b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n')) {
+        Some(i) => i,
+        None => return "",
+    };
+    // `last` is a non-whitespace byte, so any `\n` found sits strictly after it
+    // and is a char boundary — the slice is always valid UTF-8.
+    match bytes[last..].iter().position(|&b| b == b'\n') {
+        Some(off) => &content[..last + off],
+        None => content,
+    }
+}
+
 /// Render an indented code block. When `opts.block_data` is on, also returns the
 /// decoded source (the de-indented body + the trailing `\n` the HTML always
 /// carries), matching `decodeCodeText(block.html)`; `None` when off.
@@ -767,7 +935,7 @@ fn render_indented_code(slice: &str, opts: &RenderOpts, out: &mut String) -> Opt
         }
         content.push_str(std::str::from_utf8(&bytes[i..]).unwrap_or(""));
     }
-    let trimmed = content.trim_end_matches(|c: char| c == '\n' || c == '\r' || c == ' ' || c == '\t');
+    let trimmed = chop_trailing_blank_lines(&content);
     out.push_str("<pre><code>");
     escape_html(trimmed, out);
     out.push('\n');
@@ -782,6 +950,64 @@ fn render_indented_code(slice: &str, opts: &RenderOpts, out: &mut String) -> Opt
     } else {
         None
     }
+}
+
+/// Columns of leading whitespace a blockquote's stripped content keeps when a
+/// TAB follows the `>` marker (`rest` is the line past `>`, whose `>` sat at
+/// column `indent`). §2.2: the marker's optional trailing space is one COLUMN,
+/// so the tab is only PARTIALLY consumed — and every tab after it in the run had
+/// its stop measured from the ORIGINAL column, so re-basing the line to column 0
+/// would move them. The whole run therefore materializes as spaces.
+/// `>\t\tfoo` ⇒ 6 spaces + `foo`, which is indented code (CommonMark example 6).
+/// Shared shape with [`strip_container_delta`](crate::parser)'s streaming twin.
+fn quote_tab_content(rest: &str, indent: usize) -> String {
+    let b = rest.as_bytes();
+    // `>` occupies column `indent`, so the run starts at column `indent + 1`.
+    let mut col = indent + 1;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b' ' => col += 1,
+            b'\t' => col += 4 - (col % 4),
+            _ => break,
+        }
+        i += 1;
+    }
+    // The marker ate `>` plus one column; the columns past it are content.
+    let spaces = col - (indent + 2);
+    let mut out = String::with_capacity(spaces + rest.len() - i);
+    for _ in 0..spaces {
+        out.push(' ');
+    }
+    out.push_str(&rest[i..]);
+    out
+}
+
+/// Indentation a lazy continuation line is re-emitted at when a container
+/// rebuilds its inner document ([`push_lazy_line`]).
+///
+/// A lazy line is, by definition, paragraph continuation TEXT — the scanner only
+/// keeps it inside the container when it can be nothing else. The re-scan of the
+/// rebuilt inner document has lost that context, though, so a line like `===`,
+/// `- bar` or `# x` would open a block there (CommonMark examples 93, 238, 312).
+/// Four columns is the one indent that is inert to every block start (a setext
+/// underline takes at most 3, and indented code cannot interrupt a paragraph)
+/// while staying invisible in the output: a paragraph's leading spaces or tabs
+/// are stripped at render time (`render_inline_para` + the inline break arms),
+/// which is what lets the line keep its own `\n` instead of being glued to the
+/// previous one with a space.
+pub(crate) const LAZY_INDENT: &str = "    ";
+
+/// Append one lazy continuation line's content at [`LAZY_INDENT`], returning the
+/// number of bytes pushed. The caller owns the line terminator (a streaming
+/// PARTIAL lazy line has none yet). Shared by `blockquote_inner`, `item_body`
+/// and the streaming container cache so all three build byte-identical inner
+/// documents.
+pub(crate) fn push_lazy_line(out: &mut String, line: &str) -> usize {
+    let content = line.trim_start_matches([' ', '\t']);
+    out.push_str(LAZY_INDENT);
+    out.push_str(content);
+    LAZY_INDENT.len() + content.len()
 }
 
 /// Strip the blockquote prefix (≤3 spaces, one `>`, one optional space) from
@@ -800,20 +1026,23 @@ pub(crate) fn blockquote_inner(slice: &str) -> String {
         }
         s = &s[indent..];
         if let Some(stripped) = s.strip_prefix('>') {
-            s = stripped.strip_prefix(' ').unwrap_or(stripped);
+            let owned;
+            s = if stripped.as_bytes().first() == Some(&b'\t') {
+                owned = quote_tab_content(stripped, indent);
+                &owned
+            } else {
+                stripped.strip_prefix(' ').unwrap_or(stripped)
+            };
             inner.push_str(s);
             inner.push('\n');
         } else {
             // A line without a `>` is a lazy paragraph continuation (the
-            // scanner only kept valid ones). Glue it to the previous line with
-            // a space so the re-scan can't reinterpret it as a new block (a
-            // setext underline, a list marker, …). A soft break renders as a
-            // space anyway, so this is faithful.
-            if inner.ends_with('\n') {
-                inner.pop();
-            }
-            inner.push(' ');
-            inner.push_str(s.trim_start());
+            // scanner only kept valid ones), so it keeps its OWN line: the soft
+            // break between it and the line above is a `\n`, not a space
+            // (examples 93, 232, 233, 238, 247, 250, 251). It is re-emitted at
+            // [`LAZY_INDENT`] columns so the re-scan still can't reinterpret it
+            // as a new block — see that constant.
+            push_lazy_line(&mut inner, s);
             inner.push('\n');
         }
     }
@@ -828,6 +1057,20 @@ pub(crate) fn alert_head(inner: &str) -> Option<AlertKind> {
     let first = inner.lines().next()?;
     let kw = first.trim().strip_prefix("[!")?.strip_suffix(']')?;
     AlertKind::from_keyword(kw)
+}
+
+/// cmark's `cr()`: end the current output line — append `\n` only if `out` is
+/// non-empty and does not ALREADY end with one. Every container (`<li>`,
+/// `<blockquote>`, an alert body) separates its children with this rather than
+/// an unconditional push, because some children serialize their own trailing
+/// newline (a raw HTML block — see `render_html_block`) and a second one would
+/// be a real byte divergence (CommonMark example 174), while a container with
+/// no children still needs the newline its opener implies (examples 218/239).
+/// O(1) — a byte test at a push that already happens.
+pub(crate) fn cr(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
 }
 
 fn render_blockquote(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<Enrichment> {
@@ -845,20 +1088,20 @@ fn render_blockquote(slice: &str, opts: &RenderOpts, out: &mut String) -> Option
         .into_iter()
         .filter(|b| !matches!(b.kind, RawBlockKind::LinkRefDefinition))
         .collect();
-    if !sub.is_empty() {
-        out.push('\n');
-    }
+    // Unconditional (cmark opens a blockquote with `cr()`): an EMPTY blockquote
+    // still renders as `<blockquote>\n</blockquote>` (examples 218, 239, 240).
+    out.push('\n');
     // Opt-in: capture each inner sub-block's own HTML fragment (byte-identical to
     // what lands in `out`) into the structured `nested` channel so a keyed
     // override can render children one node at a time. Off ⇒ no Vec, no Enrichment.
     let mut nested: Vec<Rc<NestedBlock>> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
     for b in &sub {
         let frag_start = out.len();
-        render_block(&inner, b, opts, out);
+        render_block(&inner, b, None, opts, out);
         if opts.block_data {
             nested.push(Rc::new(NestedBlock { html: out[frag_start..].to_string() }));
         }
-        out.push('\n');
+        cr(out);
     }
     out.push_str("</blockquote>");
     if opts.block_data {
@@ -901,11 +1144,11 @@ fn render_alert(inner: &str, kind: AlertKind, opts: &RenderOpts, out: &mut Strin
     let mut nested: Vec<Rc<NestedBlock>> = if opts.block_data { Vec::with_capacity(sub.len()) } else { Vec::new() };
     for b in &sub {
         let frag_start = out.len();
-        render_block(body, b, opts, out);
+        render_block(body, b, None, opts, out);
         if opts.block_data {
             nested.push(Rc::new(NestedBlock { html: out[frag_start..].to_string() }));
         }
-        out.push('\n');
+        cr(out);
     }
     out.push_str("</div>");
     if opts.block_data {
@@ -1353,27 +1596,32 @@ pub(crate) fn render_footnote_section(
 /// Strip an item's marker and per-line content indentation, yielding the item
 /// body as a mini-document to be scanned recursively. Column-based, so a tab
 /// straddling the strip boundary is partially preserved as spaces (§2.2).
-pub(crate) fn item_body(item: &[u8]) -> Option<String> {
+pub(crate) fn item_body(item: &[u8], ctx: ScanCtx<'_>) -> Option<String> {
     let first_line_end =
         item.iter().position(|&b| b == b'\n').map(|i| i + 1).unwrap_or(item.len());
     let first_line = &item[..first_line_end];
-    let m = scan_marker(first_line)?;
+    let m = scan_marker(first_line, ctx)?;
     let ci = m.content_indent;
     let mut body = String::with_capacity(item.len());
+    // A tab-padded marker leaves columns the byte slice can't carry — replay
+    // them as spaces so the first line's geometry survives the re-basing.
+    for _ in 0..m.content_overflow {
+        body.push(' ');
+    }
     body.push_str(std::str::from_utf8(&first_line[m.content_byte..]).unwrap_or(""));
     let mut pos = first_line_end;
     while pos < item.len() {
         let line = line_slice(item, pos);
         let is_blank = line.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
         // A non-blank line indented less than the content column, immediately
-        // after paragraph text, is a lazy continuation: glue it on with a space
+        // after paragraph text, is a lazy continuation: it keeps its own line
+        // (the soft break is a `\n` — examples 290-293, 312) but is re-indented
         // so the re-scan can't read it as a new block (e.g. a nested list).
         if !is_blank && indent_cols(line) < ci && !body.ends_with("\n\n") && !body.is_empty() {
-            if body.ends_with('\n') {
-                body.pop();
+            if !body.ends_with('\n') {
+                body.push('\n');
             }
-            body.push(' ');
-            body.push_str(std::str::from_utf8(line).unwrap_or("").trim_start());
+            push_lazy_line(&mut body, std::str::from_utf8(line).unwrap_or(""));
             if !body.ends_with('\n') {
                 body.push('\n');
             }
@@ -1385,9 +1633,18 @@ pub(crate) fn item_body(item: &[u8]) -> Option<String> {
     Some(body)
 }
 
-/// Remove up to `cols` columns of leading whitespace; tabs expand to width-4
-/// stops, and a tab that crosses the boundary re-emits its overflow as spaces.
-fn strip_cols(line: &[u8], cols: usize) -> String {
+/// Consume up to `cols` columns of `line`'s leading whitespace (tabs expanding
+/// to width-4 stops measured from the line start, §2.2) and report how to re-emit
+/// the remainder at column 0: `(spaces_to_prepend, rest_bytes)`.
+///
+/// When the boundary falls exactly between characters, nothing is prepended. When
+/// a TAB STRADDLES the boundary the rest of the leading whitespace run is consumed
+/// too, and its full column width is returned as spaces: those later tabs' stops
+/// were measured from the ORIGINAL column, so leaving them literal would re-expand
+/// them from the re-based column and silently move the content (CommonMark
+/// examples 5/7). Materializing the whole run as spaces is the only faithful
+/// re-basing. O(leading whitespace run).
+pub(crate) fn split_cols(line: &[u8], cols: usize) -> (usize, &[u8]) {
     let mut col = 0;
     let mut i = 0;
     while i < line.len() && col < cols {
@@ -1398,28 +1655,52 @@ fn strip_cols(line: &[u8], cols: usize) -> String {
             }
             b'\t' => {
                 let w = 4 - (col % 4);
+                i += 1;
                 if col + w <= cols {
                     col += w;
-                    i += 1;
                 } else {
-                    let overflow = (col + w) - cols;
-                    i += 1;
-                    let mut s = " ".repeat(overflow);
-                    s.push_str(std::str::from_utf8(&line[i..]).unwrap_or(""));
-                    return s;
+                    // Straddle: finish the whitespace run in true columns.
+                    col += w;
+                    while i < line.len() {
+                        match line[i] {
+                            b' ' => col += 1,
+                            b'\t' => col += 4 - (col % 4),
+                            _ => break,
+                        }
+                        i += 1;
+                    }
+                    return (col - cols, &line[i..]);
                 }
             }
             _ => break,
         }
     }
-    std::str::from_utf8(&line[i..]).unwrap_or("").to_string()
+    (0, &line[i..])
+}
+
+/// [`split_cols`], written into `out` (the spaces materialized, then the rest).
+pub(crate) fn strip_cols_into(line: &[u8], cols: usize, out: &mut String) {
+    let (spaces, rest) = split_cols(line, cols);
+    for _ in 0..spaces {
+        out.push(' ');
+    }
+    out.push_str(std::str::from_utf8(rest).unwrap_or(""));
+}
+
+/// Remove up to `cols` columns of leading whitespace — [`split_cols`], owned.
+fn strip_cols(line: &[u8], cols: usize) -> String {
+    let mut s = String::with_capacity(line.len());
+    strip_cols_into(line, cols, &mut s);
+    s
 }
 
 /// Render a list to HTML. When `opts.block_data` is on, also returns one
 /// `ListItemData` per item carrying that item's inner `<li>` HTML (byte-identical
-/// to the content between the matching `<li…>`/`</li>` in `out`); returns an empty
-/// `Vec` when off (zero extra work / allocation).
-fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &mut String) -> Vec<Rc<ListItemData>> {
+/// to the content between the matching `<li…>`/`</li>` in `out`) plus, when `base`
+/// is `Some`, the item's absolute source offset (`base` is `slice`'s own absolute
+/// offset, so `base + <item offset within slice>`); returns an empty `Vec` when off
+/// (zero extra work / allocation).
+fn render_list(slice: &str, ordered: bool, start: u32, base: Option<usize>, opts: &RenderOpts, out: &mut String) -> Vec<Rc<ListItemData>> {
     let bytes = slice.as_bytes();
     let mut items: Vec<Rc<ListItemData>> = Vec::new();
     // Split into sibling items by tracking each item's own content_indent
@@ -1443,7 +1724,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
         let line = line_slice(bytes, pos);
         let ind = indent_cols(line);
         if item_starts.is_empty() {
-            let m = scan_marker(line).expect("list slice starts with a marker");
+            let m = scan_marker(line, opts.scan_ctx()).expect("list slice starts with a marker");
             edge = m.marker_indent;
             cur_ci = m.content_indent;
             item_starts.push(pos);
@@ -1453,7 +1734,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
             // far belong to this nested content, not *between* sibling items.
             prev_blank_count = 0;
         } else if ind <= edge + 3 {
-            if let Some(m) = scan_marker(line) {
+            if let Some(m) = scan_marker(line, opts.scan_ctx()) {
                 if m.ordered == ordered {
                     if prev_blank_count > 0 {
                         had_blank_between = true;
@@ -1515,7 +1796,12 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
         // renderer gets the exact bytes between this `<li…>` and its `</li>` —
         // no second render, no HTML re-parse.
         if let Some((lo, hi)) = inner {
-            items.push(Rc::new(ListItemData { html: out[lo..hi].to_string() }));
+            // `s` is the item's offset RELATIVE to `slice`; `base` lifts it to the
+            // document. A `usize` add at a push that already happens — no rescan.
+            items.push(Rc::new(ListItemData {
+                html: out[lo..hi].to_string(),
+                start: base.map(|b| b + s),
+            }));
         }
         out.push('\n');
     }
@@ -1530,7 +1816,7 @@ fn render_list(slice: &str, ordered: bool, start: u32, opts: &RenderOpts, out: &
 /// Blanks inside a single block (fenced code, a nested list) are part of that
 /// child block and are invisible to this top-level scan, so they don't count.
 pub(crate) fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
-    let body = match item_body(item) {
+    let body = match item_body(item, ctx) {
         Some(b) => b,
         None => return false,
     };
@@ -1564,7 +1850,7 @@ pub(crate) fn item_directly_loose(item: &[u8], ctx: ScanCtx) -> bool {
 /// as `ListItemData` without a second render; returns `None` when off.
 fn render_list_item(item: &[u8], ordered: bool, loose: bool, opts: &RenderOpts, out: &mut String) -> Option<(usize, usize)> {
     let _ = ordered;
-    let body = match item_body(item) {
+    let body = match item_body(item, opts.scan_ctx()) {
         Some(b) => b,
         None => {
             let lo = out.len();
@@ -1633,28 +1919,38 @@ pub(crate) fn render_item_body(mut body: String, loose: bool, opts: &RenderOpts,
         out.push_str("<label>");
     }
     if let Some(checked) = task_state {
+        // GFM's exact byte-form for a task-list checkbox: attributes in this
+        // order, boolean attrs spelled `=""` (GFM spec examples 279/280). Unlike
+        // the `target`/`rel` we add to links, there is no product reason to
+        // deviate here, so we match the reference byte-for-byte. The a11y
+        // `<label>` wrap (above) reuses this same string.
         out.push_str(if checked {
-            "<input type=\"checkbox\" checked disabled> "
+            "<input checked=\"\" disabled=\"\" type=\"checkbox\"> "
         } else {
-            "<input type=\"checkbox\" disabled> "
+            "<input disabled=\"\" type=\"checkbox\"> "
         });
     }
     if sub.is_empty() {
         // Empty item.
     } else if !loose && sub.len() == 1 && matches!(sub[0].kind, RawBlockKind::Paragraph) {
         let slice = &tmp[sub[0].range.clone()];
-        render_inline(trim_trailing_newlines(slice), opts, out);
+        render_inline_para(trim_trailing_newlines(slice), opts, out);
     } else {
-        // A leading newline after <li>, and a newline *between* blocks, but
-        // none trailing — a trailing newline would normalize to a stray space
-        // before </li> when the last block is tight inline text.
+        // cmark's rule, child by child: a tight paragraph is inline text and
+        // gets NO separator on either side (so `<li>a\n<ul>…` keeps `a` glued to
+        // the `<li>`); every other child is line-oriented and is bracketed by
+        // `cr()` — hence a `\n` right after `<li>` unless the first child is a
+        // tight paragraph, and a `\n` right before `</li>` unless the last one
+        // is. `cr()` (not a per-kind test) is what keeps a raw-HTML child, which
+        // already ends in `\n`, from getting a second one (example 174).
         for b in &sub {
-            out.push('\n');
             if !loose && matches!(b.kind, RawBlockKind::Paragraph) {
                 let slice = &tmp[b.range.clone()];
-                render_inline(trim_trailing_newlines(slice), opts, out);
+                render_inline_para(trim_trailing_newlines(slice), opts, out);
             } else {
-                render_block(&tmp, b, opts, out);
+                cr(out);
+                render_block(&tmp, b, None, opts, out);
+                cr(out);
             }
         }
     }
@@ -1670,6 +1966,13 @@ pub(crate) fn render_item_body(mut body: String, loose: bool, opts: &RenderOpts,
 /// Render a GFM table to HTML. When `opts.block_data` is on, also returns the
 /// structured `TableData` (headers/rows/aligns with per-cell `{text,html}`) for
 /// the opt-in `kind.data` channel; returns `None` when off (zero extra work).
+///
+/// Serialization follows the GFM reference renderer: every table element ends
+/// its own output line, so `<table>`, `<thead>`, each `<tr>`, each cell,
+/// `</tr>`, `</thead>`, `<tbody>` and `</tbody>` are each followed by `\n`
+/// (cells carry theirs from [`push_table_cell`]). The closing `</table>` does
+/// NOT — no block's HTML ends with a newline; the document join supplies the
+/// one that follows a top-level block (see WIRE.md §12).
 fn render_table(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<TableData> {
     let lines: Vec<&str> = slice.lines().collect();
     if lines.len() < 2 {
@@ -1686,20 +1989,20 @@ fn render_table(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<Tabl
     let mut td_rows: Vec<Rc<Vec<TableCell>>> = Vec::new();
     out.push_str("<table");
     out.push_str(opts.dir());
-    out.push_str("><thead><tr>");
+    out.push_str(">\n<thead>\n<tr>\n");
     for i in 0..ncol {
         let cell = push_table_cell("th", header.get(i).map(String::as_str).unwrap_or(""), aligns.get(i), opts, out);
         if let Some(c) = cell {
             td_headers.push(c);
         }
     }
-    out.push_str("</tr></thead>");
+    out.push_str("</tr>\n</thead>\n");
     let body: Vec<&&str> = lines[2..].iter().filter(|l| !l.trim().is_empty()).collect();
     if !body.is_empty() {
-        out.push_str("<tbody>");
+        out.push_str("<tbody>\n");
         for line in body {
             let cells = split_table_cells(line);
-            out.push_str("<tr>");
+            out.push_str("<tr>\n");
             let mut row: Vec<TableCell> = Vec::new();
             for i in 0..ncol {
                 let cell = push_table_cell("td", cells.get(i).map(String::as_str).unwrap_or(""), aligns.get(i), opts, out);
@@ -1710,9 +2013,9 @@ fn render_table(slice: &str, opts: &RenderOpts, out: &mut String) -> Option<Tabl
             if opts.block_data {
                 td_rows.push(Rc::new(row));
             }
-            out.push_str("</tr>");
+            out.push_str("</tr>\n");
         }
-        out.push_str("</tbody>");
+        out.push_str("</tbody>\n");
     }
     out.push_str("</table>");
     if opts.block_data {
@@ -1756,9 +2059,17 @@ pub(crate) fn push_table_cell_open(
     out.push('>');
 }
 
-/// Render a `<td>`/`<th>` cell into `out`. When `opts.block_data` is on, also
-/// returns the structured `TableCell` ({text,html}) for the same cell; returns
-/// `None` when off. The emitted HTML is byte-identical either way.
+/// Render a `<td>`/`<th>` cell into `out`, followed by the newline that ends
+/// its output line (GFM serializes one row/cell element per line — see
+/// [`render_table`]). When `opts.block_data` is on, also returns the structured
+/// `TableCell` ({text,html}) for the same cell — which carries the cell's INLINE
+/// content only, never the line terminator; returns `None` when off. The emitted
+/// HTML is byte-identical either way.
+///
+/// The terminator lives here, not at the call sites, so the full renderer and
+/// the streaming `TableCache` (which renders committed rows, the speculative
+/// partial row, and its empty padding cells through this same function) cannot
+/// drift apart on newline placement.
 pub(crate) fn push_table_cell(
     tag: &str,
     content: &str,
@@ -1780,7 +2091,7 @@ pub(crate) fn push_table_cell(
     };
     out.push_str("</");
     out.push_str(tag);
-    out.push('>');
+    out.push_str(">\n");
     cell
 }
 
@@ -1936,10 +2247,18 @@ fn render_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
     if comment_only && !(opts.unsafe_html && !opts.html_sanitize) {
         return;
     }
+    // Block-level sanitize (opt-in `block_html`, sanitizer engaged), CommonMark
+    // HTML block types 6 and 7 ONLY — see [`html_block_sanitizes`].
+    if detect_html_block_open(slice.as_bytes(), 0)
+        .is_some_and(|(_, ty)| html_block_sanitizes(opts.block_html, opts.html_sanitize, ty))
+    {
+        render_sanitized_html_block(slice, opts, out);
+        return;
+    }
     // The sanitizer takes precedence over `unsafe_html`: when it's engaged,
-    // block-level raw HTML is escaped (block sanitize is not yet implemented), so
-    // enabling the inline sanitizer can never let a block `<script>` render raw
-    // even if `unsafe_html` is also on.
+    // block-level raw HTML is escaped (unless `block_html` opted the block in
+    // just above), so enabling the sanitizer can never let a block `<script>`
+    // render raw even if `unsafe_html` is also on.
     if opts.unsafe_html && !opts.html_sanitize {
         let trimmed = slice.trim_end_matches(|c: char| c == '\n' || c == '\r');
         if opts.gfm_tagfilter {
@@ -1960,15 +2279,169 @@ fn render_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
     }
 }
 
+/// Does an HTML block of CommonMark `html_type` render through the raw-HTML
+/// sanitizer? The single gate, shared by [`render_html_block`] and the streaming
+/// [`crate::parser`] cache's arm-time lock + per-append re-validation.
+///
+/// Types 1–5 are deliberately excluded: type 1 is the raw-text family
+/// (`<script>`, `<pre>`, `<style>`, `<textarea>`) — a browser reads everything
+/// after such a tag as unparsed text, so a speculative mid-stream close is
+/// mXSS-prone — and types 2–5 (comments, PIs, CDATA, declarations) carry no
+/// renderable element. They stay escaped/dropped exactly as with the flag off.
+pub(crate) fn html_block_sanitizes(block_html: bool, html_sanitize: bool, html_type: u8) -> bool {
+    block_html && html_sanitize && matches!(html_type, 6 | 7)
+}
+
+/// Nesting cap for the block-HTML open-element stack. The speculative-closer
+/// suffix is regenerated on every append, so an unbounded stack would make a
+/// `<div><div><div>…` document quadratic (and is a classic sanitizer DoS). Past
+/// the cap an opening tag ESCAPES instead of rendering — inert, visible, and the
+/// emitted tree stays balanced. Matches [`MAX_RENDER_DEPTH`]'s budget; no real
+/// document nests raw HTML this deep.
+const MAX_BLOCK_HTML_DEPTH: usize = 100;
+
+/// Fold the SETTLED prefix of `slice[from..]` through the safe raw-HTML
+/// sanitizer, maintaining `open` (the open-element stack, outermost first, in
+/// source spelling). Returns the offset where folding stopped: either
+/// `slice.len()`, or the offset of a `<` that is still STREAMING (an incomplete
+/// tag whose later bytes could still complete it) — the caller decides what that
+/// trailing partial means (suppressed on the open tail, escaped once settled).
+///
+/// Every complete token routes through [`sanitize_html_token`], the one decision
+/// path inline raw HTML uses; text between tokens is escaped; comments (and PIs
+/// / CDATA / declarations) are dropped. A `<` that can never become a tag
+/// (`a < b`) is settled literal text and folds as `&lt;`.
+///
+/// INCREMENTAL BY CONSTRUCTION, which is what lets `HtmlBlockCache` fold at
+/// token boundaries: a consumed token can never be un-consumed (the tokenizer
+/// stops at the first terminator), a text byte's escape is context-free, and
+/// `inline_html_streams_to_eof` returning `false` means the `<` is broken
+/// forever. So folding `[a,b)` then `[b,c)` produces exactly what folding
+/// `[a,c)` in one call produces.
+pub(crate) fn fold_block_html(
+    slice: &str,
+    from: usize,
+    policy: HtmlPolicy<'_>,
+    open: &mut Vec<String>,
+    out: &mut String,
+) -> usize {
+    // Deterministic complexity probe (feature `perf_counters` only): a cache
+    // that re-sanitized the whole growing block per append goes quadratic HERE.
+    #[cfg(feature = "perf_counters")]
+    crate::perf::add_render(slice.len() - from);
+    let bytes = slice.as_bytes();
+    let mut pos = from;
+    while pos < bytes.len() {
+        let Some(rel) = bytes[pos..].iter().position(|&b| b == b'<') else {
+            escape_html(slice.get(pos..).unwrap_or(""), out);
+            return bytes.len();
+        };
+        let lt = pos + rel;
+        escape_html(slice.get(pos..lt).unwrap_or(""), out);
+        let Some(consumed) = match_inline_html(bytes, lt) else {
+            if inline_html_streams_to_eof(bytes, lt) {
+                return lt; // still streaming — the caller owns the partial
+            }
+            out.push_str("&lt;"); // broken forever (`a < b`): literal text
+            pos = lt + 1;
+            continue;
+        };
+        let mark = out.len();
+        match sanitize_html_token(&bytes[lt..lt + consumed], policy, out) {
+            SanitizedTag::Rendered { name, close: true, .. } => {
+                close_open_element(name, mark, open, out)
+            }
+            SanitizedTag::Rendered { name, close: false, void } if !void => {
+                if open.len() >= MAX_BLOCK_HTML_DEPTH {
+                    out.truncate(mark);
+                    escape_html(slice.get(lt..lt + consumed).unwrap_or(""), out);
+                } else {
+                    open.push(name.to_string());
+                }
+            }
+            _ => {}
+        }
+        pos = lt + consumed;
+    }
+    bytes.len()
+}
+
+/// Settle an author's `</name>` — already emitted at `mark` — against the open
+/// stack. A matching element deeper in the stack implicitly closes everything
+/// above it, and those closers are spliced in BEFORE the author's own close tag
+/// so the emitted tree stays balanced (`<b><i></b>` → `<b><i></i></b>`). A close
+/// tag matching nothing open is a stray: its markup is removed, since emitting
+/// it could only unbalance the tree. `mark` sits at the very end of `out` bar
+/// the close tag itself, so the splice shifts a handful of bytes.
+fn close_open_element(name: &str, mark: usize, open: &mut Vec<String>, out: &mut String) {
+    let Some(idx) = open.iter().rposition(|t| t.eq_ignore_ascii_case(name)) else {
+        out.truncate(mark);
+        return;
+    };
+    let mut implicit = String::new();
+    for tag in open[idx + 1..].iter().rev() {
+        implicit.push_str("</");
+        implicit.push_str(tag);
+        implicit.push('>');
+    }
+    if !implicit.is_empty() {
+        out.insert_str(mark, &implicit);
+    }
+    open.truncate(idx);
+}
+
+/// Append one speculative closer per still-open element, innermost first, so the
+/// HTML a consumer has seen SO FAR is a complete tree at every stream prefix.
+/// Regenerated on each append (the stack is bounded by [`MAX_BLOCK_HTML_DEPTH`]);
+/// when the real `</tag>` finally arrives the closer simply stops being
+/// speculative and the emitted bytes are unchanged.
+pub(crate) fn push_html_closers(open: &[String], out: &mut String) {
+    for tag in open.iter().rev() {
+        out.push_str("</");
+        out.push_str(tag);
+        out.push('>');
+    }
+}
+
+/// Render a type-6/7 raw-HTML block through the safe sanitizer (`block_html` +
+/// `html_sanitize`). Shape mirrors the `unsafe_html` pass-through arm — body
+/// with trailing newlines trimmed, then the single `\n` CommonMark puts after an
+/// HTML block — with the speculative closers between them. For content that is
+/// entirely allowlisted and attribute-free the two arms agree byte for byte.
+///
+/// The trim runs on the assembled BODY, not the source slice: a suppressed
+/// trailing partial (`<div>\n<spa`) must not take the newline before it along.
+fn render_sanitized_html_block(slice: &str, opts: &RenderOpts, out: &mut String) {
+    let body_start = out.len();
+    let mut open: Vec<String> = Vec::new();
+    let stop = fold_block_html(slice, 0, opts.html_policy(), &mut open, out);
+    if stop < slice.len() && !opts.open_tail {
+        // A half-arrived tag that is SETTLED (finalize, or a block a blank line
+        // already closed) can never complete, so it renders as escaped literal
+        // text. On the genuine open tail it stays suppressed instead — the same
+        // pending-invisible contract as a streaming link destination.
+        escape_html(slice.get(stop..).unwrap_or(""), out);
+    }
+    let keep = out[body_start..].trim_end_matches(['\n', '\r']).len();
+    out.truncate(body_start + keep);
+    push_html_closers(&open, out);
+    out.push('\n');
+}
+
 /// Render an opt-in component tag (`<Tag …>…</Tag>`) as `<tag …>inner</tag>`,
 /// with the inner content parsed as markdown. The tag is allowlisted and its
 /// attributes are sanitized (event handlers dropped, dangerous URL schemes
 /// neutralized), so this is safe to emit even with `unsafe_html` off. The body
 /// is scanned + rendered like a blockquote/alert; nested allowlisted tags are
 /// recognized via `opts.scan_ctx()`.
+///
+/// Uses the PERMISSIVE `sanitize_attrs` (same as the `BlockKind::Component` prop
+/// bag it must stay byte-consistent with), not the raw-HTML tier: a component's
+/// attributes are consumer-mediated props, so `RAW_HTML_DROPPED_ATTRS` (`id`,
+/// `slot`, `form*`, …) does not apply.
 fn render_component(slice: &str, tag: &str, terminated: bool, opts: &RenderOpts, out: &mut String) {
     let open = slice.trim_start_matches([' ', '\t']);
-    let attrs = sanitize_attrs(open);
+    let attrs = sanitize_attrs(open, &opts.allow_schemes);
     let (open_end, inner_end) = component_inner_range(slice, tag, terminated);
     let inner = slice.get(open_end..inner_end).unwrap_or("");
 
@@ -1991,8 +2464,13 @@ fn render_component(slice: &str, tag: &str, terminated: bool, opts: &RenderOpts,
         out.push('\n');
     }
     for b in &sub {
-        render_block(inner, b, opts, out);
-        out.push('\n');
+        render_block(inner, b, None, opts, out);
+        // `cr()`, not an unconditional push: a raw-HTML-block child already ends
+        // with `\n` and a second one is a stray blank line (the example-174 bug,
+        // in a component body). The leading newline above keeps its
+        // `!sub.is_empty()` guard — unlike a blockquote, an empty component body
+        // stays `<Tag></Tag>`.
+        cr(out);
     }
     out.push_str("</");
     out.push_str(tag);

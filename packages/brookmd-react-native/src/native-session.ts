@@ -46,6 +46,10 @@ function toBrookConfig(c: ParserConfig | undefined): BrookConfig {
     if (c.htmlAllowlist !== undefined) partial.htmlAllowlist = c.htmlAllowlist;
     if (c.dropHtmlTags !== undefined) partial.dropHtmlTags = c.dropHtmlTags;
     if (c.blockData !== undefined) partial.blockData = c.blockData;
+    if (c.softBreaks !== undefined) partial.softBreaks = c.softBreaks;
+    if (c.allowSchemes !== undefined) partial.allowSchemes = c.allowSchemes;
+    if (c.lenientLists !== undefined) partial.lenientLists = c.lenientLists;
+    if (c.blockHtml !== undefined) partial.blockHtml = c.blockHtml;
   }
   // Wire delta mode (WIRE.md §11) is always on for OUR session↔client pair,
   // mirroring the browser worker: active re-emits cross the JSI boundary as

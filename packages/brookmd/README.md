@@ -461,6 +461,17 @@ export default function Doc({ md }: { md: string }) {
 - **`renderToString(md, { config })`** — synchronous HTML string, **zero React
   dependency** (imports cleanly with no `react` installed).
 - **`parseToBlocks(md, { config })`** — the block array, for custom rendering.
+
+**Document assembly.** A `Block.html` never ends with a newline — the terminator
+that follows a top-level block belongs to the *document*, not the block.
+`renderToString` therefore joins blocks with cmark's `cr()` rule: insert `\n`
+before a block only when the output doesn't already end with one, and end the
+document with one `\n`. An unconditional `"\n".join(...)` would double the
+newline a raw HTML block serializes for itself. **If you assemble
+`parseToBlocks` output into a document string yourself, use the same rule** —
+it's what makes the output byte-identical to a reference CommonMark/GFM renderer
+(652/652 CommonMark 0.31 and 24/24 GFM extension examples, byte-for-byte). See
+`WIRE.md` §12.
 - **`<BrookMarkdownStatic content config components />`** (from
   `brookmd/server/react`) — synchronous React tree for **render-once** contexts;
   render it with your framework's server renderer
@@ -614,12 +625,16 @@ const client = new BrookClient({
     gfmFootnotes: true,   // [^1] + [^1]: → footnote section (default false)
     gfmMath: true,        // $…$ / \(…\) inline + $$…$$ / \[…\] display math (default false)
     dirAuto: true,        // per-block dir="auto" for RTL/bidi text (default false)
+    softBreaks: true,     // a single \n renders as <br> (remark-breaks / chat convention; default false)
+    lenientLists: true,   // marker + 6+ SPACES → item text, not indented code (default false)
     a11y: true,           // task-list <label> + <th scope="col"> a11y markup (default false)
     unsafeHtml: false,    // pass raw HTML through (default false — keep it false for untrusted input)
     componentTags: ["Thinking", "Callout"], // BLOCK custom tags w/ markdown inside (default none)
     inlineComponentTags: ["tik", "cite"],   // INLINE custom tags (chips/citations) w/ markdown inside (default none)
     htmlAllowlist: ["br", "sub", "sup"],    // safe raw-HTML sanitizer: [] = allow all but dangerous; list = only those (default off)
     dropHtmlTags: [],                        // tags removed entirely (comments always dropped when sanitizing; default off)
+    blockHtml: true,                         // extend the sanitizer to BLOCK raw HTML (<details>…); needs a list above (default false)
+    allowSchemes: ["file"],                  // un-block a default-blocked URL scheme (default none — see "Security")
     blockData: true,      // opt-in structured kind.data per block (default false — see "Structured block data")
   },
 });
@@ -640,6 +655,32 @@ When to enable each flag:
   definitions. Off by default; see the footnote streaming caveat above.
 - `dirAuto: true` — when content can be RTL / mixed-direction. Emits per-block
   `dir="auto"` so the browser detects direction independently per block.
+- `lenientLists: true` — when your LLM over-indents after a list marker. Strict
+  CommonMark (§5.2) says a marker followed by **5 or more** columns of
+  whitespace starts an indented code block, so a model writing
+  `-       const value = 1;` renders as a `<pre><code>` block instead of a list
+  item. This flag raises that cutoff to **6 columns of literal spaces**: at 6+
+  the padding is absorbed into the item's content column and the text renders
+  as the item's own markdown (inline formatting, links, and nested lists all
+  parse normally). Off by default, so strict-CommonMark output is unchanged.
+
+  Four cases stay strictly conformant **by design** — the flag is deliberately
+  narrow, not a general "fix my indentation" pass:
+
+  | Input | Stays | Why |
+  | --- | --- | --- |
+  | `-` + exactly 5 spaces | code block | 5 columns is the §5.2 boundary itself; relaxing it would swallow genuine one-space-past-the-minimum code |
+  | `` - ```js `` (fence on the marker line) | fenced code | the marker line opens a real fence — there is no over-indentation to undo |
+  | `-` then code indented on a **later** line | code block | the decision reads only the marker's own line; a later-line indent is unambiguous authored code |
+  | `-\t\tfoo` (tab padding) | code block | tab padding is a deliberate authoring choice, unlike model over-indentation which is always literal spaces |
+
+  Excluding tabs is what keeps the divergence from CommonMark down to a single
+  spec example (274, `1.` + 6 spaces). Everything else in the 652-example suite
+  renders identically with the flag on or off; the conformance suites
+  themselves run in strict mode and are unaffected.
+
+  The rule is a pure per-line comparison made when the marker is first scanned,
+  so it costs no lookahead and no re-parse while streaming.
 - `a11y: true` — opt-in accessibility markup that deviates from strict GFM
   byte-output: wraps task-list checkboxes in a `<label>` (screen-reader
   association) and adds `scope="col"` to table headers. Off by default so
@@ -664,6 +705,15 @@ When to enable each flag:
 - `htmlAllowlist` / `dropHtmlTags` — render a **safe subset of raw HTML** (e.g.
   `<br>`, `<sub>`, `<sup>`) natively without `unsafeHtml`, drop specific tags, and
   drop HTML comments. See [Safe raw HTML](#safe-raw-html).
+- `blockHtml: true` — extend that sanitizer to **block-level** raw HTML, so a
+  `<details><summary>…</summary>…</details>` block renders as real elements
+  instead of an escaped code block. Needs one of the two lists above to be set;
+  `<script>`/`<pre>`/`<style>`/`<textarea>` blocks stay escaped. See
+  [Block-level raw HTML](#block-level-raw-html-blockhtml).
+- `allowSchemes: ["file"]` — un-block a URL scheme brookmd blocks by default,
+  for privileged hosts (Electron, extensions) that intercept link clicks instead
+  of navigating. Script-executing schemes can never be re-enabled. See
+  [Un-blocking a scheme](#un-blocking-a-scheme--allowschemes).
 
 **Footnotes** (`gfmFootnotes`) work in streaming with one honest caveat: a
 `[^1]` reference renders speculatively the moment it's seen (committed blocks
@@ -763,8 +813,9 @@ attributes (with `class`→`className` and `style` as an object) plus `children`
 **Block-kind** keys (`CodeBlock`, `Mermaid`, `MathBlock`, `Alert`, `Paragraph`,
 `Heading`, `List`, `Blockquote`, `Table`, `Rule`, `Html`) replace the entire
 block. The component receives [`BlockComponentProps`](#types): `{ block, html,
-open, speculative }`, plus `text`/`language` for code/math blocks (the alert
-type is at `block.kind.data.kind`).
+open, speculative }`, plus `text`/`language` for code/math blocks — and `meta`,
+the rest of a fence's info string (```` ```ts title="src/main.ts" ````), for a
+filename header (the alert type is at `block.kind.data.kind`).
 
 > **One map, two prop contracts — the single biggest footgun.** The keys above
 > are looked up by TWO dispatchers. The block-kind dispatcher passes
@@ -866,7 +917,7 @@ byte-identical, so non-users pay nothing.
 |------|-------------------|------|-----|
 | `Table` | `{ headers, rows, aligns }`, cells `{ text, html }` | `props.table` | sort / filter / transpose / CSV / chart |
 | `Heading` | `{ level, text, id }` | `props.heading` | table of contents with anchors |
-| `CodeBlock` | `{ lang, code }` | `props.code` | decoded source (copy / run) |
+| `CodeBlock` | `{ lang, meta?, code }` | `props.code` | decoded source (copy / run) |
 | `MathBlock` | `{ latex }` | `props.math` | LaTeX source (re-render) |
 | `List` | `{ ordered, start }` | `props.list` | ordered-list numbering |
 
@@ -1004,11 +1055,77 @@ new BrookClient({ config: { htmlAllowlist: [] } });
   text stays as inert text).
 - Every rendered tag's **attributes are sanitized**: `on*` handlers and `style`
   (a CSS beacon / clickjacking vector) are dropped, and dangerous URL schemes
-  (`javascript:`, …, including multi-encoded) become `#`.
-- **Scope:** *inline* raw HTML. Block-level raw HTML stays escaped for now (use
-  `unsafeHtml` **without** the sanitizer to render block HTML — when the sanitizer
-  is engaged, block HTML stays escaped even if `unsafeHtml` is also on). Tag
-  matching is case-insensitive.
+  (`javascript:`, …, including multi-encoded) become `#` — in `href`, `src`,
+  `srcset`, `poster`, `cite`, `action`, `data`, `longdesc` and `background`.
+- A further set of **DOM-hazard attributes is dropped outright** (case-insensitive)
+  — they neither execute nor carry a URL, but each lets authored markup reach
+  past the text it should be:
+  `srcdoc` (inline document injection), `is` (customized-built-in upgrade),
+  `autofocus` / `contenteditable` (focus-steal, UI spoof), `id` / `name` (DOM
+  clobbering — an element shadowing `document.getElementById` or a global),
+  `slot` / `part` / `exportparts` (shadow-DOM injection), `form`, `formaction`,
+  `formenctype`, `formmethod`, `formnovalidate`, `formtarget` (form hijack),
+  `xmlns` / `xlink:*` (namespace escape hatch), and `ping` (tracking beacon).
+  Some are inert *today* only because the tag that gives them meaning is already
+  in the dangerous set — they are dropped anyway so the policy never depends on
+  that coincidence. `class`, `title`, `alt`, `target`, `rel`, `data-*` and
+  `aria-*` are unaffected.
+- **This applies to raw HTML only.** [Component tags](#component-tags) stay
+  permissive: their attributes become framework *props* on `components[tag]`, so
+  `<Tab id="x">` keeps `id` — the consumer's component decides whether it ever
+  reaches the DOM. `on*`, `style` and dangerous URL schemes are filtered there too.
+- **Scope:** *inline* raw HTML by default. Block-level raw HTML stays escaped
+  unless you also set `blockHtml` (below). Tag matching is case-insensitive.
+
+#### Block-level raw HTML (`blockHtml`)
+
+A model that emits a disclosure widget on its own lines —
+
+```html
+<details>
+<summary>Sources</summary>
+Three filings and a transcript.
+</details>
+```
+
+— produces an *HTML block*, not inline HTML, so the sanitizer above leaves it
+escaped. Opt in with `blockHtml` and it renders as real elements:
+
+```ts
+new BrookClient({ config: { htmlAllowlist: [], blockHtml: true } });
+// or restrict it:
+new BrookClient({ config: { htmlAllowlist: ["details", "summary"], blockHtml: true } });
+```
+
+- **Only meaningful with the sanitizer engaged.** `blockHtml` on its own does
+  nothing; it extends `htmlAllowlist` / `dropHtmlTags` to block level. Default
+  `false`, so existing sanitizer users keep escaped block HTML until they opt in.
+- **Same policy, no exceptions.** Tags go through the same allow / drop /
+  non-overridable-dangerous decision and the same hardened attribute policy as
+  inline raw HTML — a block-level `<div onclick=… id=… srcdoc=…>` renders as a
+  bare `<div>`.
+- **Scope: CommonMark HTML block types 6 and 7** — a known block-level tag
+  (`<details>`, `<div>`, `<table>`, `<section>`, …) or any other complete tag
+  alone on its line. **Types 1–5 stay escaped/dropped**, as with the flag off:
+  type 1 is the raw-text family (`<script>`, `<pre>`, `<style>`, `<textarea>`),
+  where a browser reads everything after the opening tag as unparsed text — so a
+  *speculative* close mid-stream is an mXSS vector — and types 2–5 (comments,
+  processing instructions, CDATA, declarations) carry no renderable element at
+  all. A block `<script>` is escaped in every configuration, including with
+  `script` explicitly allowlisted and `unsafeHtml` also on.
+- **Streaming: speculative closers.** While the block is still arriving, every
+  still-open element gets a closer appended, so the HTML you have received *so
+  far* is always a complete tree — `<div>\n<b>bol` renders as
+  `<div><b>bol</b></div>`, and the closers simply stop being speculative when the
+  author's own `</b></div>` lands (the emitted bytes don't change). A half-arrived
+  tag (`<spa`, `<a href="htt`) renders as **nothing** until it completes, the same
+  pending-invisible contract as a streaming markdown link's URL; if the stream
+  ends on one, it settles as escaped text. Mis-nesting is repaired rather than
+  propagated: `<b><i></b>` emits `<b><i></i></b>`, and a close tag matching
+  nothing open is dropped. A type-6/7 block ends at a blank line even with tags
+  open — the closers land there.
+- **Markdown inside the HTML is not parsed** (the body is text + tags). That —
+  full `rehype-raw` semantics — is a later stage.
 
 ### Types
 
@@ -1033,7 +1150,8 @@ interface BlockComponentProps {
   open: boolean;
   speculative: boolean;
   text?: string;      // decoded source — CodeBlock / MathBlock
-  language?: string;  // info string — CodeBlock
+  language?: string;  // info string, first word — CodeBlock
+  meta?: string;      // info string, the rest (`title="src/main.ts"`) — CodeBlock
 }
 ```
 
@@ -1051,14 +1169,35 @@ const html = highlight("const x = 1;", "ts");
 
 ## Coverage
 
-**CommonMark 0.31: 100% (652/652 spec examples)** — every section, including
-the hard ones (nested/loose lists, link reference definitions, link precedence,
-lazy blockquote continuation). Plus GFM extensions: tables, strikethrough, task
-lists, extended autolinks, GitHub alerts (`> [!NOTE]` → styled callouts),
-footnotes (`[^1]` + `[^1]:`), and math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`).
-Autolinks and alerts are on by default; footnotes and math are opt-in per stream
-(see [Per-stream config](#per-stream-config)). See
-`crates/brookmd-core/tests/{cmark_spec,gfm_spec,footnotes,math}.rs` for runners and floors.
+**CommonMark 0.31: 100% (652/652 spec examples), byte-exact** — every section,
+including the hard ones (nested/loose lists, link reference definitions, link
+precedence, lazy blockquote continuation). Plus GFM extensions, also **24/24
+byte-exact**: tables, strikethrough, task lists, extended autolinks, GitHub
+alerts (`> [!NOTE]` → styled callouts), footnotes (`[^1]` + `[^1]:`), and math
+(`$…$`, `$$…$$`, `\(…\)`, `\[…\]`). Autolinks and alerts are on by default;
+footnotes and math are opt-in per stream (see
+[Per-stream config](#per-stream-config)).
+
+*Byte-exact* means the full output string matches the reference renderer's
+byte-for-byte — not a structurally normalized or whitespace-forgiving compare.
+Both counts are the harnesses' **default** floors (`CMARK_MIN_EXACT=652`,
+`GFM_MIN_EXACT=24`, pinned explicitly in the CI workflows), so a single byte of
+regression fails the build even when the normalized tally stays green.
+
+The only deviations from the reference output are deliberate brookmd choices,
+folded by a documented `canonicalize` step applied to **both** sides before
+comparison — the only transform on the byte-exact path, so it can erase our
+intentional extras but never hide a structural divergence:
+
+| Deliberate difference | Reference emits |
+|---|---|
+| `target="_blank" rel="noopener noreferrer nofollow"` on links (security-only) | no such attrs |
+| `data-lang="…"` on code blocks (alongside `class="language-…"`) | `class` only |
+| HTML5 void elements (`<br>`) | XHTML self-closing (`<br />`) |
+| `style="text-align:…"` on table cells | GFM's deprecated `align="…"` |
+
+See `crates/brookmd-core/tests/{cmark_spec,gfm_spec,footnotes,math}.rs` for the
+runners, the `canonicalize` source, and the floors.
 
 GitHub alerts render to GitHub-compatible markup
 (`<div class="markdown-alert markdown-alert-note">…`), so existing markdown CSS
@@ -1125,16 +1264,60 @@ brookmd is XSS-safe by default — its HTML output is meant to be injected via
 - **Raw HTML is escaped** (the `unsafeHtml: true` config flag disables this;
   **never enable it for untrusted input without a `sanitize` hook**).
 - **Dangerous URL schemes are neutralized** in `<a href>` and `<img src>` —
-  `javascript:`, `vbscript:`, `data:text/html`, `data:text/javascript` become
-  `#`. The check runs on the *decoded* URL and strips characters browsers
-  ignore in the scheme, so obfuscations like `javascript&#58;…`,
-  `javascript\:…`, `&#106;avascript:…`, and embedded tabs/newlines are caught,
-  not just the literal form. (See `crates/brookmd-core/tests/security.rs`.)
+  `javascript:`, `vbscript:`, `data:text/html`, `data:text/javascript` (and
+  `file:`, see below) become `#`. The check runs on the *decoded* URL and strips
+  characters browsers ignore in the scheme, so obfuscations like
+  `javascript&#58;…`, `javascript\:…`, `&#106;avascript:…`, and embedded
+  tabs/newlines are caught, not just the literal form. (See
+  `crates/brookmd-core/tests/security.rs`.)
+- **The opt-in raw-HTML sanitizer removes DOM-hazard attributes.** Beyond `on*`,
+  `style` and URL schemes, [Safe raw HTML](#safe-raw-html) drops `srcdoc`, `is`,
+  `autofocus`, `contenteditable`, `id`/`name` (DOM clobbering), `slot`/`part`/
+  `exportparts`, the `form*` family and `ping` from raw tags — a denylist by
+  *policy*, not one that happens to be safe because some other tag is blocked.
+  brookmd's own generated ids (footnote `fn-N`/`fnref-N`, heading slugs) are
+  emitted by the renderer and never pass through the sanitizer, so they are
+  unaffected. Component-tag props are exempt (see that section).
 - **`htmlToReact` defends in depth**: it drops inline `on*` event-handler
   attributes and runs URL attributes through the same scheme filter. It's
   intended for brookmd's own (already-sanitized) HTML; if you hand it arbitrary
   third-party HTML, these guards are your only line of defense — prefer a
   dedicated HTML sanitizer for genuinely hostile input.
+
+### Un-blocking a scheme — `allowSchemes`
+
+`file:` is blocked by default. It can't execute script, but it has no legitimate
+use in untrusted/LLM markdown, and in a **privileged** host — Electron, a browser
+extension, a page on a `file://` origin — a live `file:` href is a
+local-resource-disclosure / phishing vector. In an ordinary browser tab blocking
+it costs nothing anyway: a page simply **refuses to navigate** to a `file:` URL,
+so the href is inert there either way.
+
+Some hosts genuinely need it. A coding-agent UI whose model links to local paths
+wants the href present so it can **intercept the click** and open the file in an
+editor or preview pane. `allowSchemes` is the opt-in for exactly that:
+
+```ts
+const client = new BrookClient({ config: { allowSchemes: ["file"] } });
+```
+
+- Takes **bare scheme names, no colon** (`["file"]`), matched
+  case-insensitively.
+- It **never restricts** anything — this is not a general allowlist. Schemes
+  outside the built-in blocklist (`vscode:`, `ftp:`, `mailto:`, …) already render
+  today and are unaffected by this setting.
+- The **script-executing tier is non-overridable**: `javascript:`, `vbscript:`,
+  `data:text/html`, `data:text/javascript`, and the scriptable `data:` media
+  types (`data:image/svg`, `data:application/xhtml`, `data:text/xml`, …) stay
+  blocked no matter what you list. Naming one is a silent no-op — the same rule
+  as `htmlAllowlist`, where allowlisting `<script>` still cannot re-enable it.
+- Applies uniformly to links, URI autolinks, images, and sanitized URL
+  attributes.
+
+Turning it on moves the risk to you: **intercept link clicks rather than letting
+navigation happen**, and treat the path as untrusted input at the point you act
+on it. In a privileged host, whether a model-authored `file:///…` is allowed to
+reach a real file is the embedder's decision, not brookmd's.
 
 ### Rendering untrusted / LLM HTML safely
 

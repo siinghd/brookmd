@@ -1,6 +1,6 @@
 # brookmd-core wire contract
 
-**Wire contract version: 1.2.0**
+**Wire contract version: 1.3.0**
 
 This document specifies the JSON wire format produced by `brookmd-core` and
 consumed by any renderer. It is the stable, versioned boundary between the
@@ -9,7 +9,7 @@ layer in any language. The current JavaScript renderer is one consumer; native
 consumers (for example a React Native, Swift, or Kotlin binding) can implement
 against this document alone.
 
-Covered releases: **npm `brookmd` 0.23.0** and **crate `brookmd-core` 0.23.0**.
+Covered releases: **npm `brookmd` 0.26.0** and **crate `brookmd-core` 0.25.0**.
 
 The contract version tracks the *wire shape*, not the library version. It changes
 independently: a library release that leaves every shape below byte-identical
@@ -126,8 +126,12 @@ sub-object uses the exact bytes from §6):
 
 `html` is always produced through the safe-allowlist serializer and is XSS-safe
 to render as raw HTML (`src/blocks.rs:16-19`). Raw-HTML pass-through is off by
-default; see the `setUnsafeHtml` / `setHtmlSanitize` configuration in
-`src/lib.rs`.
+default; see the `setUnsafeHtml` / `setHtmlSanitize` / `setBlockHtml`
+configuration in `src/lib.rs`.
+
+`html` carries **no trailing newline** — the line terminator that follows a
+top-level block belongs to the document, not to the block. Concatenating blocks
+into one document string therefore has a defined rule; see §12.
 
 ---
 
@@ -199,7 +203,7 @@ The twelve tags and their `data` shapes:
 | --- | --- | --- | --- |
 | `Paragraph` | *(no `data` key)* | *(unchanged)* | `blocks.rs:214-217` |
 | `Heading` | integer level `1`–`6` | `{ level, text, id }` — **polymorphic** | `blocks.rs:59,221-224,273-277` |
-| `CodeBlock` | `{ lang }` (`lang` string or `null`) | `{ lang, code }` (`code` = decoded source) | `blocks.rs:73,147-154,228-230` |
+| `CodeBlock` | `{ lang, meta? }` (`lang` string or `null`) | `{ lang, meta?, code }` (`code` = decoded source) | `blocks.rs:86,160-172,246-248` |
 | `MathBlock` | *(no `data` key)* | `{ latex }` (decoded LaTeX source) | `blocks.rs:82,253-256,291-293` |
 | `Mermaid` | *(no `data` key)* | *(unchanged)* | `blocks.rs:83,214-217` |
 | `List` | `{ ordered }` | `{ ordered, start?, items? }` | `blocks.rs:98,156-167,231-233` |
@@ -251,14 +255,32 @@ Payload shapes when the channel is on:
 - **`HeadingData`** (`src/blocks.rs:273-277`): `{ level: 1–6, text: string, id:
   string }`. `text` is the inline-stripped plaintext; `id` is a GitHub-style
   anchor slug of `text`.
-- **`CodeBlock.data`** (`src/blocks.rs:147-154`): `{ lang: string|null, code?:
-  string }`. `code` (decoded source) is present only when the channel is on and is
-  omitted otherwise.
+- **`CodeBlock.data`** (`src/blocks.rs:160-172`): `{ lang: string|null, meta?:
+  string, code?: string }`. `lang` is the info string's first word; `meta` is the
+  trimmed REMAINDER of the same info string (```` ```ts title="x.ts" ````), raw
+  (undecoded) like `lang`, always-on but **omitted entirely** when the fence
+  carried none — so a fence without meta is byte-identical to before. `code`
+  (decoded source) is present only when the channel is on and is omitted
+  otherwise. `meta` has no HTML counterpart (there is no `data-meta` attribute).
+  Streaming timing: `meta` appears once it can no longer change — when the
+  opening fence line is terminated by a newline, or at `finalize` (which settles
+  a document that ends mid-opener-line). `lang`, the first word, needs no such
+  wait. Both the full path and the streaming caches apply the same rule, so an
+  open block's `data` matches the one-shot parse of the same prefix.
+  `code` is the body as RENDERED, not the verbatim source slice: it is exactly
+  `decodeCodeText(block.html)`, so an indented opening fence (```` ```` ```` at
+  1–3 columns) has already shed that indent from every line, per CommonMark
+  §4.5, and an indented code block has already shed its 4 columns. That is what
+  makes it correct to paste — a copy button emitting the raw slice would carry
+  the container's indentation back in.
 - **`MathBlockData`** (`src/blocks.rs:291-293`): `{ latex: string }` — the decoded
   LaTeX source.
 - **`ListData`** (`src/blocks.rs:156-167`): `{ ordered: bool, start?: number,
   items?: [{ html }, …] }`. `start` is the ordered-list start number; `items`
-  carries each `<li>`'s inner HTML. Both are omitted when empty/off.
+  carries each `<li>`'s inner HTML. Both are omitted when empty/off. An item
+  bearing any BLOCK child (a loose paragraph, a nested list, a fence, a quote)
+  brackets that child with a newline, so its `html` both starts and ENDS with
+  `\n` (`"\n<p>a</p>\n"`); a tight single-paragraph item stays bare (`"first"`).
 - **`TableData`** (`src/blocks.rs:312-326`): `{ headers: [{ text, html }, …], rows:
   [[{ text, html }, …], …], aligns: (string|null)[] }`. Each `aligns` entry is
   `"left"`, `"center"`, `"right"`, or `null`.
@@ -298,6 +320,7 @@ Every `kind` example below is byte-exact against the golden regression strings i
 ```json
 {"type":"CodeBlock","data":{"lang":null}}
 {"type":"CodeBlock","data":{"lang":"rust"}}
+{"type":"CodeBlock","data":{"lang":"ts","meta":"title=\"src/main.ts\""}}
 {"type":"CodeBlock","data":{"lang":"rust","code":"fn main() {}\n"}}
 {"type":"CodeBlock","data":{"lang":null,"code":"plain\n"}}
 ```
@@ -363,7 +386,7 @@ Full `Patch` example (illustrative; `kind` bytes are golden-exact):
 ## 9. Stability policy
 
 The wire contract version is `MAJOR.MINOR.PATCH`. This document is version
-**1.1.0**.
+**1.3.0** (the header above is authoritative; this line tracks it).
 
 **Additive (does not break consumers; MINOR bump):**
 
@@ -390,6 +413,12 @@ out in release notes.
 
 **Version history:**
 
+- **1.3.0** — additive optional `data` fields: `CodeBlockData.meta` (always-on
+  fence info-string remainder; key absent when the fence has none) and
+  `ListItemData.start` (absolute source byte offset per item, present only
+  under `blockData`; absent for nested items). With neither feature exercised
+  the wire is byte-identical to 1.2.0; consumers that ignore unknown keys are
+  unaffected either way.
 - **1.2.0** — opt-in **wire delta mode** (§11): with `setWireDelta(true)`,
   active blocks re-emitted across appends may carry `html_delta` (a verified
   splice against their previous emit) instead of full `html`, retiring the §2
@@ -515,6 +544,53 @@ long-block shapes (open fence, list, table, blockquote, paragraph runs). For
 content whose already-emitted prefix legitimately rewrites mid-stream (late
 delimiter resolution rewriting early bytes), rule 3 degrades that patch to a
 full re-emit — correctness always wins over compression.
+
+---
+
+## 12. Document assembly (the `cr()` join)
+
+brookmd's product is a **per-block** wire: a consumer stamps one DOM node (or one
+framework element) per `Block` and never needs a whole-document string. "The
+document as one string" exists only at an *assembly point* — `renderToString`,
+a static-site build step, a spec harness. This section defines that join, so
+every assembly point produces the same bytes.
+
+**Invariant.** A `Block.html` never ends with a newline. The newline that a
+reference CommonMark/GFM renderer emits after each top-level block is a
+*document* terminator, not part of the block.
+
+**Rule.** Assembling blocks in document order:
+
+1. Before appending a block's `html`, append `\n` **iff** the output so far is
+   non-empty and does not already end with `\n`.
+2. After the last block, apply the same test once more, so the document ends
+   with exactly one `\n`.
+
+That is cmark's `cr()` (`src/render.rs::cr`), the same primitive the renderer
+already uses to separate a container's children.
+
+```
+out = ""
+for block in blocks:
+    if out and not out.endswith("\n"): out += "\n"
+    out += block.html
+if out and not out.endswith("\n"): out += "\n"
+```
+
+**Why `cr()` and not `"\n".join(...)`.** Not every block's HTML is
+newline-free at the end in practice: a raw HTML block (`setUnsafeHtml(true)`,
+or a sanitized type-6/7 block under `setBlockHtml(true)`) serializes its own
+trailing newline as part of its content. An unconditional
+join would double it and diverge from the reference — CommonMark 0.31 examples
+148, 152, 167, 188 and 191 are precisely that case. The conditional test costs
+one byte comparison at a push that already happens.
+
+**Assembly points that implement this rule:** `renderToString` in the npm
+package (`packages/brookmd/src/server.tsx`), and the `join_document` helper in
+both spec harnesses (`tests/cmark_spec.rs`, `tests/gfm_spec.rs`) — which is why
+the byte-exact tallies (652/652 CommonMark, 24/24 GFM extensions) measure real
+public behaviour. The DOM and React renderers stamp one node per block and never
+build a document string, so the rule does not apply to them.
 
 ---
 

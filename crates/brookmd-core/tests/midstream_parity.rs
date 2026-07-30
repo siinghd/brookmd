@@ -15,7 +15,22 @@
 //!   - the alert/blockquote container cache used to emit an empty `<p></p>`
 //!     for an empty body, while the full path emits nothing
 
+use brook_md_core::blocks::BlockKind;
 use brook_md_core::StreamParser;
+
+/// The `(lang, meta)` of every CodeBlock, in order — the DATA twin of
+/// [`collect`]. Mid-stream parity is a claim about what a consumer SEES, and
+/// `kind.data` is half of what it sees; the HTML comparison alone is blind to a
+/// cache that freezes (or re-derives) a structured field.
+fn collect_code(p: &StreamParser) -> Vec<(Option<String>, Option<String>)> {
+    let mut out = Vec::new();
+    for b in p.all_blocks() {
+        if let BlockKind::CodeBlock { lang, meta, .. } = &b.kind {
+            out.push((lang.clone(), meta.clone()));
+        }
+    }
+    out
+}
 
 fn collect(p: &StreamParser) -> String {
     let mut out = String::new();
@@ -48,6 +63,25 @@ fn assert_parity(md: &str) {
     let one = one_shot_open(md);
     let streamed = streamed_open(md);
     assert_eq!(streamed, one, "mid-stream != one-shot for {md:?}");
+}
+
+/// Same contract as [`assert_parity`], on the CodeBlock `kind.data` instead of
+/// the HTML: char-by-char + one empty append (so a freshly armed cache fires),
+/// no finalize, compared to the one-shot view of the same prefix.
+fn assert_code_parity(md: &str) {
+    let mut one = StreamParser::new().with_gfm_alerts(true);
+    one.append(md);
+    let mut streamed = StreamParser::new().with_gfm_alerts(true);
+    let mut buf = [0u8; 4];
+    for ch in md.chars() {
+        streamed.append(ch.encode_utf8(&mut buf));
+    }
+    streamed.append("");
+    assert_eq!(
+        collect_code(&streamed),
+        collect_code(&one),
+        "mid-stream kind.data != one-shot for {md:?}"
+    );
 }
 
 #[test]
@@ -1290,5 +1324,666 @@ fn deep_quote_staircase_deviations_parity() {
         // Char-by-char (chunk 1) parity for the whole document — the per-byte
         // marker-streaming path (deeper markers arriving before content).
         assert_parity(md);
+    }
+}
+
+#[test]
+fn open_code_fence_meta_matches_one_shot() {
+    // A code fence's `meta` (the info string past the language word) is withheld
+    // until the OPENING LINE is terminated — by both paths, which is the whole
+    // point. While that line is still arriving, the streamed tail is served by
+    // the frozen `FenceInfoCache` and the one-shot by the full path; if either
+    // published a half-arrived meta (or froze a stale one), these prefixes would
+    // diverge. Both must also stay in step across the newline that settles it.
+    for md in [
+        "```ts",
+        "```ts ",
+        "```ts t",
+        "```ts title=",
+        "```ts title=\"src/ma",
+        "```ts title=\"src/main.ts\"",
+        "```ts title=\"src/main.ts\"\n",
+        "```ts title=\"src/main.ts\"\nlet x = 1;\n",
+        "```ts title=\"src/main.ts\"\nlet x = 1;\n```\n",
+        "```ts   spaced   out   meta",
+        "```ts   spaced   out   meta\nbody\n",
+        "~~~ts title=x",
+        "~~~ts title=x\nbody\n",
+        "``` title=x",
+        "``` title=x\nbody\n",
+    ] {
+        assert_parity(md);
+        assert_code_parity(md);
+    }
+    // Every prefix of the streaming case, not just the interesting cuts.
+    let md = "```ts title=\"src/main.ts\"\nlet x = 1;\n```\n";
+    for cut in 1..=md.len() {
+        if md.is_char_boundary(cut) {
+            assert_code_parity(&md[..cut]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Indent-led continuation lines — `is_boundary`'s indent-run rule. Word-wrapped
+// prose whose continuation lines carry an indent used to produce NO commit
+// candidates at all (each line's first word sits after a space whose own
+// predecessor is a space or the line's `\n`), so the paragraph cut pinned at 0
+// and every append re-rendered the whole accumulated paragraph — O(n²). The cut
+// now advances to each line's first word, which puts the line's `\n` AND its
+// indent inside the frozen segment; `assert_sweep` (open view at every chunk
+// split + finalize) is what pins that the split stays byte-exact.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn indent_led_line_cuts_keep_midstream_parity() {
+    let plain = || StreamParser::new().with_gfm_alerts(true);
+    let auto = || StreamParser::new().with_gfm_alerts(true).with_gfm_autolinks(true);
+    let soft = || StreamParser::new().with_gfm_alerts(true).with_soft_breaks(true);
+    let cases = [
+        "a\n b\n c",
+        "a\n  b\n  c",
+        "a\n   b\n   c",
+        "a\n\tb\n\tc",
+        "a\n \tb\n\t c",
+        "a\n b\nc\n d",
+        " a\n b\n c",
+        // Hard break (2 trailing spaces) then an indented line: the break's
+        // spaces precede their `\n`, so no cut can land inside the run.
+        "word  \n next line",
+        "a\n b  \n c",
+        // The indent run abuts EOF — no candidate yet, must not panic.
+        "a\n  ",
+        "a\n b\n  ",
+        // `&`/`<` at the line's first byte are excluded: an entity can decode to
+        // a space and a sanitized tag can vanish, either of which would let the
+        // `\n` arm's `out.ends_with("  ")` hard-break lookbehind straddle the cut.
+        "a\n &#32;\nb",
+        "a\n  &amp; b\n c",
+        "a\n  <em>b</em>\n c",
+        // Constructs that span the indent-led cut.
+        "a\n b *emph across* c\n d",
+        "a\n b `code span` c\n d",
+        "a\n b [link](http://x.com/p) c\n d",
+    ];
+    for md in cases {
+        assert_sweep(&plain, md);
+        assert_sweep(&auto, md);
+        assert_sweep(&soft, md);
+    }
+    // Extended autolinks need no extra guard on these candidates: an autolink
+    // can never span whitespace backwards, so one containing the candidate must
+    // start AT it — a start the full render probes too (`ext_autolink_boundary`
+    // is equally true after a space and at slice start).
+    for md in [
+        "a\n www.example.com rest",
+        "a\n  www.example.com/p?q=1 rest",
+        "a\n foo@bar.example rest",
+        "a\n aaaaaaaa@example.com rest",
+        "a\n\thttps://example.org/path rest",
+    ] {
+        assert_sweep(&auto, md);
+    }
+}
+
+/// Append `parts` in order, comparing the OPEN view after each one to a
+/// one-shot append of the same prefix, then compare a finalize from the staged
+/// state to a one-shot finalize. Staging lets a case park the stream exactly on
+/// a transient paragraph end (a trailing whitespace-only, unterminated line) and
+/// then step off it, which a uniform chunking never guarantees.
+fn assert_staged(make: &dyn Fn() -> StreamParser, parts: &[&str]) {
+    assert_staged_inner(make, parts, true)
+}
+
+/// HTML-only variant of [`assert_staged`], for shapes whose OUTER block is an
+/// open list. `ListCache` reports an open list block's `end` including a
+/// trailing whitespace-only line where the full scan excludes it
+/// (`"- first item\n   "` → streamed `(0, 16)`, one-shot `(0, 13)`). That is a
+/// pre-existing span-reporting gap — it reproduces identically with the
+/// paragraph suspension compiled out, and the HTML agrees on both paths — so it
+/// is out of scope here rather than silently asserted as correct.
+fn assert_staged_html(make: &dyn Fn() -> StreamParser, parts: &[&str]) {
+    assert_staged_inner(make, parts, false)
+}
+
+fn assert_staged_inner(make: &dyn Fn() -> StreamParser, parts: &[&str], check_spans: bool) {
+    let mut p = make();
+    let mut acc = String::new();
+    for part in parts {
+        p.append(part);
+        acc.push_str(part);
+        let mut one = make();
+        one.append(&acc);
+        assert_eq!(collect(&p), collect(&one), "open view after {acc:?}");
+        if check_spans {
+            assert_eq!(spans(&p), spans(&one), "block spans after {acc:?}");
+        }
+    }
+    p.finalize();
+    let mut one = make();
+    one.append(&acc);
+    one.finalize();
+    assert_eq!(collect(&p), collect(&one), "finalize after {acc:?}");
+    assert_eq!(spans(&p), spans(&one), "finalized block spans after {acc:?}");
+}
+
+/// `(start, end, open, speculative)` per block — the source range and lifecycle
+/// flags a consumer keys off, which [`collect`]'s HTML comparison is blind to.
+/// A paragraph parked on a transient end must report the range WITHOUT the
+/// trailing whitespace line, exactly like the full scan's raw block.
+fn spans(p: &StreamParser) -> Vec<(usize, usize, bool, bool)> {
+    p.all_blocks().map(|b| (b.start, b.end, b.open, b.speculative)).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Transient paragraph end (`trailing_open_ws_line`). An append boundary landing
+// inside a continuation line's leading indent leaves the buffer ending in a
+// whitespace-only unterminated line. That genuinely ends the paragraph for the
+// open view — the block scanner splits the line off, so a preceding hard break's
+// `<br>` disappears with it — but the next byte almost always undoes it. The
+// paragraph cache is SUSPENDED across it rather than dropped, so these must pin
+// that the suspended view, the resume, and every permanent end still match the
+// full path byte for byte.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn transient_paragraph_end_suspends_and_resumes_with_parity() {
+    let plain = || StreamParser::new().with_gfm_alerts(true);
+    let auto = || StreamParser::new().with_gfm_alerts(true).with_gfm_autolinks(true);
+    let soft = || StreamParser::new().with_gfm_alerts(true).with_soft_breaks(true);
+    let math = || StreamParser::new().with_gfm_alerts(true).with_gfm_math(true);
+
+    // Parked on the transient end, then stepped off it every way it can go.
+    let staged: &[&[&str]] = &[
+        // Resume into a continuation — the common case, and the one the O(n²)
+        // was made of.
+        &["a\n b\n", " ", "c\n d\n e"],
+        &["a\n b\n", "  ", "c"],
+        &["a\n b\n", "\t", "c"],
+        &["a\n b\n", " \t ", "c"],
+        &["a\n b\n", " ", "", "", "c"], // empty appends while suspended
+        &["a\n b\n c\n", " ", "d\n", " ", "e"], // suspend/resume twice
+        // The paragraph's OWN first line is indented (rule 1's first-line skip):
+        // the frozen prefix starts inside the indent, so the suspended view and
+        // the resume both have to drop it exactly once.
+        &["  a\n b\n", " ", "c\n d"],
+        &["  a\n", "\t", "b"],
+        &["   aaa\n", "             ", "bbb\n", "      ", "ccc"],
+        // Line-FINAL spaces/tabs (rule 2) around the same park: a single
+        // trailing space is dropped, two are a hard break, and the park sits in
+        // the next line's indent either way.
+        &["a \n b \n", " ", "c \n d "],
+        &["a\t\n b\t\n", " ", "c\t"],
+        &["a \t \n", "  ", "b"],
+        &["foo \n", " ", "baz"],
+        // The hard-break counterexample: `<br>` must vanish while suspended and
+        // come back on resume.
+        &["first  \n second  \n", " ", "third"],
+        &["word  \n", " ", "next"],
+        &["a\n b  \n", "  ", "c"],
+        // Permanent ends reached FROM the suspended state — the cache must drop.
+        &["a\n b\n", " ", "\n"],              // completes into a real blank line
+        &["a\n b\n", " ", "\n", "next para"], // …then a new block
+        &["a\n b\n", " ", "\n# Heading\n"],
+        &["a\n b\n", " ", "\n- item\n- two\n"],
+        &["a\n b\n", " ", "\n```\ncode\n```\n"],
+        &["a\n b\n", " ", "\n> quote\n"],
+        // Setext underline / table delimiter arriving after a suspension.
+        &["a\n b\n", " ", "\n"],
+        &["head\n", " ", "----\n"],
+        &["| a | b |\n", " ", "| - | - |\n| 1 | 2 |\n"],
+        // EOF while suspended (the helper finalizes from there).
+        &["a\n b\n", " "],
+        &["a\n b\n", "   "],
+        &["first  \n second  \n", " "],
+        &["a\n b\n", " ", ""],
+        // A trailing whitespace line is only TRANSIENT when it is the sole
+        // terminator. With a permanent one also present, the cache must drop —
+        // suspending would fold the whole region into one paragraph.
+        &["a\n b\n", "\nc\n "],
+        &["a\n b\n", "\nc\n ", "d\n "],
+        &["a\n b\n", "\n# H\n "],
+        &["a\n b\n", "\n- item\n "],
+        &["a\n b\n", "\n```\ncode\n "],
+        &["a\n b\n", "\n> q\n "],
+        &["head\n", "----\nnext\n "],
+        &["| a | b |\n", "| - | - |\n| 1 | 2 |\n "],
+        // Suspending right after an open-tail-sensitive construct: with the
+        // blank line following, the paragraph no longer abuts EOF, so the full
+        // path renders it with `open_tail` OFF (literal, not speculative). The
+        // suspended view has to switch the flag the same way.
+        &["a\n b [label](htt", "\n ", "p://x.com/p)\n"],
+        &["a\n b `code sp", "\n ", "an`\n"],
+        &["a\n b [open label", "\n ", "](http://x.com)\n"],
+        &["a\n b <a href=\"http://x.com", "\n ", "\">t</a>\n"],
+    ];
+    for parts in staged {
+        assert_staged(&plain, parts);
+        assert_staged(&auto, parts);
+        assert_staged(&soft, parts);
+        assert_staged(&math, parts);
+    }
+    // `$…` speculation is math-only.
+    for parts in [&["a\n b $x^2 + y", "\n ", "^2$\n"][..], &["a\n b \\(a+b", "\n ", "\\)\n"][..]] {
+        assert_staged(&math, parts);
+    }
+
+    // Uniform chunking over the same shapes: `assert_sweep` splits at EVERY char
+    // boundary, so every suspension point is hit, open view AND finalize.
+    for md in [
+        "a\n b\n c\n ",
+        "a\n b\n  \n c",
+        "first  \n second  \n ",
+        "first  \n second  \n third",
+        "a\n b\n \nc",
+        "a\n b\n \n\nc",
+        "a\n b\n \t \n c",
+        "head\n \n----\n",
+        "a\n b [x](h\n \nc",
+        // Rule 1 / rule 2 shapes, split at EVERY char boundary: a cut can land
+        // in the first line's indent, in a continuation indent, or in a
+        // line-final whitespace run — none of which may survive into the HTML.
+        "   aaa\n bbb\n  ccc",
+        "  a\n\t b\n   c ",
+        "foo \n baz",
+        "foo  \n     bar",
+        "foo\\\n     bar",
+        "a \n b \n c \n",
+        "one two \n three four\n",
+        "a\n\tb\n\tc",
+    ] {
+        assert_sweep(&plain, md);
+        assert_sweep(&auto, md);
+        assert_sweep(&soft, md);
+    }
+}
+
+#[test]
+fn transient_paragraph_end_inside_containers_has_parity() {
+    // The transient end one container deep. An open LIST ITEM hosts a nested
+    // `StreamParser`, so its paragraph runs through the same
+    // `try_incremental_paragraph` and inherits the suspension — which means the
+    // suspended view now has to be right through the `<li>` assembly too (and
+    // through `<blockquote>`, whose ContainerCache keeps its own stripped inner
+    // buffer and never consults `ParaEnd` at all).
+    let plain = || StreamParser::new().with_gfm_alerts(true);
+    let auto = || StreamParser::new().with_gfm_alerts(true).with_gfm_autolinks(true);
+    let soft = || StreamParser::new().with_gfm_alerts(true).with_soft_breaks(true);
+
+    // Outer block is an open LIST — HTML-only, see [`assert_staged_html`].
+    let listed: &[&[&str]] = &[
+        // Continuation indented one past the content column, parked on the
+        // transient end and then resumed.
+        &["- first item\n", "   ", "words\n   more\n"],
+        &["- first item\n  cont\n", "  ", "more"],
+        &["- first item\n", "\t", "tabbed"],
+        &["- a\n   b\n", "   ", "c\n   d"],
+        // …completing to a blank line, a new item, and a new block.
+        &["- first item\n   b\n", "  ", "\n"],
+        &["- first item\n   b\n", "  ", "\n- second item\n"],
+        &["- first item\n   b\n", "  ", "\n\n# After\n"],
+        // …EOF / finalize while parked (the helper finalizes from the last part).
+        &["- first item\n   b\n", "   "],
+        &["- first item\n   b\n", "  \t "],
+        // Hard break inside the item, then the park: the `<br>` must drop while
+        // suspended and return on resume.
+        &["- first  \n   second  \n", "   ", "third"],
+        // Open-tail-sensitive tail inside the item.
+        &["- a\n   b [label](htt", "\n   ", "p://x.com)\n"],
+        &["- a\n   b `code sp", "\n   ", "an`\n"],
+        // Nested: quoted list item with an indented continuation.
+        &["> - a\n", ">    ", "b\n>    c"],
+        &["> - a\n>    b\n", ">    "],
+    ];
+    for parts in listed {
+        assert_staged_html(&plain, parts);
+        assert_staged_html(&auto, parts);
+        assert_staged_html(&soft, parts);
+    }
+    // Blockquote of the same indented prose — spans agree here, so check them.
+    let quoted: &[&[&str]] = &[
+        &["> first line\n", ">  ", "words\n>  more\n"],
+        &[">  a\n", ">  ", "b"],
+        &["> first  \n>  second  \n", ">  ", "third"],
+        &["> a\n>  b\n", ">", "\n> c\n"],
+        &["> a\n>  b\n", ">  "],
+        &["> a\n>  b [label](htt", "\n>  ", "p://x.com)\n"],
+    ];
+    for parts in quoted {
+        assert_staged(&plain, parts);
+        assert_staged(&auto, parts);
+        assert_staged(&soft, parts);
+    }
+    // Uniform every-boundary sweeps over the same shapes.
+    for md in [
+        "- first item\n   words\n   more\n   ",
+        "- a\n   b\n  \n- c",
+        "- first  \n   second  \n   ",
+        "> first line\n>  words\n>  ",
+        ">  a\n>  b\n> \n> c",
+        "> - a\n>    b\n>    ",
+        "* item\n   wrapped line\n   ",
+    ] {
+        assert_sweep(&plain, md);
+        assert_sweep(&auto, md);
+        assert_sweep(&soft, md);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Container-inner newline emission (cmark's `cr()`). A container separates its
+// children with "a `\n` unless the buffer already ends in one", which the
+// streaming mirrors (`assemble_open_item`, `assemble_wrapped_body`,
+// `assemble_deep_quote`, `ContainerCache`) each re-implement by hand. These are
+// the four shapes where the rule is load-bearing and no earlier test covered it:
+// a self-terminating child (raw HTML), a tight paragraph followed by a block
+// child, a block-only item, and a container with no children at all.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn container_child_separators_have_parity() {
+    let plain = || StreamParser::new().with_gfm_alerts(true);
+    // Raw HTML blocks only serialize their own trailing `\n` when they render
+    // raw — escaped, they end at `</code></pre>` and the rule is invisible.
+    let raw = || StreamParser::new().with_gfm_alerts(true).with_unsafe_html(true);
+
+    // (1) An HTML block inside a blockquote (CommonMark example 174): the child
+    // already ends with `\n`, so the container must NOT add a second one.
+    let quoted_html: &[&[&str]] = &[
+        &["> <div>\n", "> foo\n"],
+        &["> <div>\n> foo\n", "\n", "bar\n"],
+        &["> <div>", "\n> foo\n> </div>\n"],
+        &["> text\n", ">\n", "> <div>\n", "> x\n"],
+    ];
+    for parts in quoted_html {
+        assert_staged(&raw, parts);
+        assert_staged(&plain, parts);
+    }
+
+    // (2) A list item whose FIRST child is a tight paragraph and whose later
+    // children are blocks (examples 320/321): no `\n` after `<li>`, but one
+    // before `</li>`.
+    // (3) An item with only a block child — a fence (example 318): `\n` on both
+    // sides.
+    // Outer block is an open LIST — HTML-only, see [`assert_staged_html`].
+    let listed: &[&[&str]] = &[
+        &["* a\n", "  > b\n", "  >\n", "* c\n"],
+        &["- a\n", "  > b\n", "  ```\n  c\n  ```\n", "- d\n"],
+        &["- a\n- ```\n", "  b\n", "  ```\n", "- c\n"],
+        &["- ```\n  b\n  ```\n", "- c\n"],
+        &["- a\n", "  <div>\n", "  x\n", "- b\n"],
+        &["- a\n", "\n", "  b\n", "- c\n"], // loose: `\n` around every child
+    ];
+    for parts in listed {
+        assert_staged_html(&raw, parts);
+        assert_staged_html(&plain, parts);
+    }
+
+    // (4) A blockquote with no body at all — still `<blockquote>\n</blockquote>`
+    // (examples 218/239/240), including the ref-def-only quote whose single
+    // sub-block renders to nothing.
+    let empty_quote: &[&[&str]] = &[
+        &[">", "\n"],
+        &[">\n", ">  \n", "> \n"],
+        &[">\n", "\n", "after\n"],
+        &["> [foo]: /url\n", "\n", "[foo]\n"],
+    ];
+    for parts in empty_quote {
+        assert_staged(&plain, parts);
+        assert_staged(&raw, parts);
+    }
+
+    // Uniform every-boundary sweeps over the same shapes (open view + finalize).
+    for md in [
+        "> <div>\n> foo\n\nbar\n",
+        "> text\n>\n> <div>\n> x\n",
+        "* a\n  > b\n  >\n* c\n",
+        "- a\n  > b\n  ```\n  c\n  ```\n- d\n",
+        "- a\n- ```\n  b\n  ```\n- c\n",
+        "- a\n  <div>\n  x\n- b\n",
+        "- a\n\n  b\n- c\n",
+        ">\n",
+        ">\n>  \n> \n",
+        "> [foo]: /url\n\n[foo]\n",
+    ] {
+        assert_sweep(&plain, md);
+        assert_sweep(&raw, md);
+    }
+}
+
+#[test]
+fn code_fence_meta_lands_at_finalize_when_the_opener_line_never_completed() {
+    // The EOF case. While the stream is OPEN, a fence whose opener line has no
+    // newline yet shows no meta on either path — it could still grow. Finalizing
+    // makes that partial line final by definition, so both paths then publish it:
+    // the rule costs nothing at EOF.
+    let md = "```ts title=\"src/main.ts\"";
+    assert_code_parity(md);
+    let mut open = StreamParser::new().with_gfm_alerts(true);
+    open.append(md);
+    assert_eq!(collect_code(&open), vec![(Some("ts".into()), None)]);
+
+    let mut one = StreamParser::new().with_gfm_alerts(true);
+    one.append(md);
+    one.finalize();
+    let mut streamed = StreamParser::new().with_gfm_alerts(true);
+    let mut buf = [0u8; 4];
+    for ch in md.chars() {
+        streamed.append(ch.encode_utf8(&mut buf));
+    }
+    streamed.finalize();
+    let settled = vec![(Some("ts".into()), Some("title=\"src/main.ts\"".into()))];
+    assert_eq!(collect_code(&one), settled, "one-shot must publish meta at finalize");
+    assert_eq!(collect_code(&streamed), settled, "streamed must publish meta at finalize");
+    // And the finalized HTML is identical too (meta never enters the markup).
+    assert_eq!(collect(&streamed), collect(&one));
+}
+
+#[test]
+fn code_block_content_survives_streaming_byte_for_byte() {
+    // Code content is the one place whitespace is semantically significant, so
+    // "close enough" framing parity is not enough here: each shape below pins a
+    // byte a cache used to drop, move, or re-expand from the wrong column.
+    let plain = || StreamParser::new().with_gfm_alerts(true);
+    let data = || StreamParser::new().with_gfm_alerts(true).with_block_data(true);
+    for md in [
+        // Indented code — trailing spaces on the LAST content line are content
+        // (example 118). Only whole whitespace-only lines are dropped, and the
+        // incremental cache folds lines in as they complete, so the distinction
+        // has to survive a mid-line cut.
+        "    foo  \n",
+        "    foo  ",
+        "    foo  \n    bar  \n",
+        "    foo  \n\n   \n",
+        "    a\n\n    b  \n\n\n",
+        // A tab after a blockquote marker: `> ` is the marker plus one COLUMN,
+        // so the tab is only partly consumed and the rest of the run
+        // re-materializes as spaces — six columns here, i.e. indented code
+        // inside the quote (example 6).
+        ">\t\tfoo\n",
+        ">\tfoo\n",
+        "> \tfoo\n",
+        ">\t\tfoo\n>\t\tbar\n",
+        "> quote\n>\n>\t\tcode\n",
+        // A tab-padded list marker carries columns no byte offset can express
+        // (example 7), and the same tab can straddle the item's body boundary on
+        // a later line (example 5). Both re-base to spaces.
+        "-\t\tfoo\n",
+        "-\tfoo\n",
+        "1.\t\tfoo\n",
+        "- foo\n\n\t\tbar\n",
+        "- foo\n\n\t\tbar\n\t\tbaz\n",
+        // A fenced block inside a list item keeps its interior blank lines: the
+        // newline that ends the last content line belongs to the body, not to
+        // the closing fence (example 318).
+        "- a\n- ```\n  b\n\n\n  ```\n- c\n",
+        "- ```\n  b\n\n  c\n\n  ```\n",
+        "```\nb\n\n\n```\n",
+        // An INDENTED opening fence sheds up to that many columns from EVERY
+        // body line (examples 131/132/133) — and must do so incrementally, as
+        // each line arrives, not by rescanning the body per append.
+        " ```\n aaa\naaa\n```\n",
+        "  ```\naaa\n  aaa\naaa\n  ```\n",
+        "   ```\n   aaa\n    aaa\n  aaa\n   ```\n",
+        "  ```js\n  let x = 1;\n\n      deep\n  ```\n",
+        "   ```\n\ttabbed\n   ```\n",
+        // Indented fence with no closer yet — the open-block view is exactly
+        // where the cache serves, so the de-indent must already be applied.
+        "  ```\n  aaa\n  bbb\n",
+    ] {
+        assert_sweep(&plain, md);
+        assert_sweep(&data, md);
+    }
+}
+
+#[test]
+fn indented_fence_deindents_the_decoded_source_too() {
+    // `CodeBlockData.code` is the copy-button contract: it must equal
+    // `decodeCodeText(block.html)`. A de-indented body that left the DECODED
+    // source at its raw indentation would break that silently — and the
+    // streaming cache derives `code` from a separate buffer than the HTML, so
+    // the two can drift apart only here.
+    let code_of = |p: &StreamParser| -> Vec<String> {
+        let mut out = Vec::new();
+        for b in p.all_blocks() {
+            if let BlockKind::CodeBlock { code: Some(c), .. } = &b.kind {
+                out.push((**c).clone());
+            }
+        }
+        out
+    };
+    for (md, want) in [
+        ("   ```\n   aaa\n    aaa\n  aaa\n   ```\n", "aaa\n aaa\naaa\n"),
+        ("  ```\naaa\n  aaa\naaa\n  ```\n", "aaa\naaa\naaa\n"),
+        // Open (no closer): the cache's own view, mid-stream.
+        ("  ```\n  aaa\n   bbb\n", "aaa\n bbb\n"),
+    ] {
+        let mut one = StreamParser::new().with_block_data(true);
+        one.append(md);
+        one.finalize();
+        assert_eq!(code_of(&one), vec![want.to_string()], "one-shot code for {md:?}");
+
+        // Char-by-char through the incremental fence cache — same decoded bytes.
+        let mut streamed = StreamParser::new().with_block_data(true);
+        let mut buf = [0u8; 4];
+        for ch in md.chars() {
+            streamed.append(ch.encode_utf8(&mut buf));
+        }
+        streamed.finalize();
+        assert_eq!(code_of(&streamed), vec![want.to_string()], "streamed code for {md:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// BLOCK-level raw HTML under the sanitizer (`set_block_html`). The block's
+// `HtmlBlockCache` folds at TOKEN boundaries here (a tag spans lines), carries
+// an open-element stack, and regenerates the speculative closers per append —
+// so the streamed open view, the one-shot open view, and finalize must agree
+// byte for byte at every prefix.
+// ---------------------------------------------------------------------------
+
+/// Sanitizer + block-level raw HTML, allow-all (the shape a chat UI would ship).
+fn block_html() -> StreamParser {
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    p.set_html_sanitize(true, vec![], vec![]);
+    p.set_block_html(true);
+    p
+}
+
+/// Restrict mode: only `details`/`summary`/`div`/`b`/`i` render, the rest escape.
+fn block_html_restrict() -> StreamParser {
+    let mut p = StreamParser::new().with_gfm_alerts(true);
+    p.set_html_sanitize(
+        true,
+        ["details", "summary", "div", "b", "i"].iter().map(|s| s.to_string()).collect(),
+        vec![],
+    );
+    p.set_block_html(true);
+    p
+}
+
+#[test]
+fn block_html_streamed_equals_one_shot_and_finalize() {
+    for make in [&block_html as &dyn Fn() -> StreamParser, &block_html_restrict] {
+        for md in [
+            // Multi-line <details> — the pitch shape, open and closed.
+            "<details>\n<summary>Sources</summary>\nbody text\n</details>\n",
+            "<details>\n<summary>Sources</summary>\nbody text\n",
+            "<details>\n<summary>Sour",
+            // Opened and never closed (EOF + finalize): closers are speculative.
+            "<div class=\"card\">\nhello\n",
+            "<div>\n",
+            // Nested same tag.
+            "<div><div></div>\n",
+            "<div>\n<div>\ninner\n</div>\n</div>\n",
+            // A tag split mid-name / mid-attribute across the sweep's cuts.
+            "<div>\n<span class=\"q\" data-x=\"1\">t</span>\n",
+            "<div>\nx <spa",
+            "<div>\nx <span class=\"un",
+            "<div>\nx <span class=\"unterminated\n",
+            // Type 7: a single complete tag alone on the line opens the block.
+            "<mytag class=\"q\">\nbody\n",
+            "<mytag/>\n",
+            "</closer>\n",
+            // Blank-line termination: the block ENDS there with tags still open.
+            "<div>\nhi\n\nafter\n",
+            "<div>\n<b>bold\n\ntail para\n",
+            // Mis-nesting + strays inside a block.
+            "<div>\n<b><i></b></i>\n</div>\n",
+            "<div>\n</div>\n</div>\n",
+            "<div>\n<table><td>orphan\n",
+            // Comments, dangerous tags and void elements in a block body.
+            "<div>\n<!-- <script>alert(1)</script> -->\n</div>\n",
+            "<div>\n<br>\n<img src=\"/a.png\">\n</div>\n",
+            "<div onclick=\"x()\" id=\"q\">\ny\n</div>\n",
+            // A `<` that can never become a tag stays literal text.
+            "<div>\na < b and 1<2\n</div>\n",
+            // Preceded by other blocks (the cache must still be the tail).
+            "para first\n\n<div>\nhtml body\n",
+            "- item\n\n<details>\n<summary>s</summary>\n",
+        ] {
+            assert_sweep(make, md);
+        }
+    }
+}
+
+#[test]
+fn block_html_staged_appends_keep_parity() {
+    // Append boundaries parked exactly on the seams that matter: inside a tag
+    // name, inside an attribute value, on the newline before a closer, and on
+    // the blank line that terminates a type-6 block.
+    let staged: &[&[&str]] = &[
+        &["<div>\n", "<sp", "an>", "x", "</span>\n"],
+        &["<details>\n", "<summary>", "S", "</summary>\n", "body"],
+        &["<div class=\"", "wrap\">\n", "text\n"],
+        &["<div>\n", "", "", "more\n"],
+        &["<div>\nopen\n", "\n", "after the blank line\n"],
+        &["<div>\n<b>x", "</b", ">\n", "</div>\n"],
+        &["<mytag>\n", "a\n", "b\n", "</mytag>\n"],
+    ];
+    for parts in staged {
+        assert_staged(&block_html, parts);
+        assert_staged(&block_html_restrict, parts);
+    }
+}
+
+#[test]
+fn block_html_off_is_byte_identical() {
+    // The flag is opt-in ON TOP of the sanitizer: with it off, every block above
+    // must render exactly as it does today (escaped into a code block).
+    let off = || {
+        let mut p = StreamParser::new().with_gfm_alerts(true);
+        p.set_html_sanitize(true, vec![], vec![]);
+        p
+    };
+    for md in [
+        "<details>\n<summary>x</summary>\n</details>\n",
+        "<div>\nbody\n",
+        "<mytag>\nbody\n",
+    ] {
+        let mut a = off();
+        a.append(md);
+        a.finalize();
+        assert!(collect(&a).contains("<pre><code>&lt;"), "flag off still escapes: {}", collect(&a));
     }
 }

@@ -1538,9 +1538,10 @@ public object FfiConverterTypeBrookSession: FfiConverter<BrookSession, Long> {
  *
  * The record's field defaults reproduce the worker's `?? default` behavior
  * exactly: GFM autolinks and alerts default **on** (LLM output is full of bare
- * URLs and `> [!NOTE]` callouts), everything else off. The four tag/allowlist
- * fields are optional arrays (`Option<Vec<String>>`), matching the `?:` optional
- * arrays on the TypeScript side — `None` (omitted) is the "feature off" state.
+ * URLs and `> [!NOTE]` callouts), everything else off. The five tag/allowlist/
+ * scheme fields are optional arrays (`Option<Vec<String>>`), matching the `?:`
+ * optional arrays on the TypeScript side — `None` (omitted) is the "feature off"
+ * state.
  *
  * Setting `html_allowlist` **or** `drop_html_tags` (even to an empty array)
  * engages the safe raw-HTML sanitizer, exactly as the worker derives its
@@ -1624,6 +1625,38 @@ data class BrookConfig (
      * layer does). Off by default — wire bytes identical to contract v1.1.0.
      */
     var `wireDelta`: kotlin.Boolean = false 
+    , 
+    /**
+     * Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+     * `<br>` — the `remark-breaks` convention. Off by default (strict CommonMark:
+     * a soft break is whitespace). Only ever ADDS breaks; hard breaks are `<br>`
+     * either way.
+     */
+    var `softBreaks`: kotlin.Boolean = false 
+    , 
+    /**
+     * Un-block URL schemes that are blocked by DEFAULT — bare scheme names
+     * without the colon (`["file"]`), matched case-insensitively. `None` = the
+     * built-in policy is unchanged. This never RESTRICTS anything, and the
+     * script-executing tier (`javascript:`, `data:text/html`, …) is
+     * non-overridable — listing one here is a no-op.
+     */
+    var `allowSchemes`: List<kotlin.String>? = null 
+    , 
+    /**
+     * Lenient list indentation: a list marker followed by 6+ columns of SPACE
+     * padding yields the item's text instead of an indented code block. Off by
+     * default (strict CommonMark §5.2); useful for over-indenting model output.
+     */
+    var `lenientLists`: kotlin.Boolean = false 
+    , 
+    /**
+     * Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (a
+     * `<details><summary>…` block renders as real elements). Takes effect ONLY
+     * when the sanitizer is engaged (`html_allowlist`/`drop_html_tags`), and only
+     * for CommonMark HTML block types 6 and 7. Off by default.
+     */
+    var `blockHtml`: kotlin.Boolean = false 
     
 ){
     
@@ -1654,6 +1687,10 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterOptionalSequenceString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -1671,7 +1708,11 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.allocationSize(value.`htmlAllowlist`) +
             FfiConverterOptionalSequenceString.allocationSize(value.`dropHtmlTags`) +
             FfiConverterBoolean.allocationSize(value.`blockData`) +
-            FfiConverterBoolean.allocationSize(value.`wireDelta`)
+            FfiConverterBoolean.allocationSize(value.`wireDelta`) +
+            FfiConverterBoolean.allocationSize(value.`softBreaks`) +
+            FfiConverterOptionalSequenceString.allocationSize(value.`allowSchemes`) +
+            FfiConverterBoolean.allocationSize(value.`lenientLists`) +
+            FfiConverterBoolean.allocationSize(value.`blockHtml`)
     )
 
     override fun write(value: BrookConfig, buf: ByteBuffer) {
@@ -1689,6 +1730,10 @@ public object FfiConverterTypeBrookConfig: FfiConverterRustBuffer<BrookConfig> {
             FfiConverterOptionalSequenceString.write(value.`dropHtmlTags`, buf)
             FfiConverterBoolean.write(value.`blockData`, buf)
             FfiConverterBoolean.write(value.`wireDelta`, buf)
+            FfiConverterBoolean.write(value.`softBreaks`, buf)
+            FfiConverterOptionalSequenceString.write(value.`allowSchemes`, buf)
+            FfiConverterBoolean.write(value.`lenientLists`, buf)
+            FfiConverterBoolean.write(value.`blockHtml`, buf)
     }
 }
 

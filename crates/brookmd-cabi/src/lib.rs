@@ -63,8 +63,8 @@ const WIRE_VERSION: &CStr = c"1.2.0";
 /// The defaults reproduce the JS worker's `?? default` behavior exactly (and match
 /// `brookmd-ffi`'s uniffi `BrookConfig`): GFM autolinks and alerts default **on**
 /// (LLM output is full of bare URLs and `> [!NOTE]` callouts), everything else
-/// off. The four tag/allowlist fields are optional arrays; `None` (omitted) is the
-/// "feature off" state.
+/// off. The five tag/allowlist/scheme fields are optional arrays; `None` (omitted)
+/// is the "feature off" state.
 ///
 /// Setting `html_allowlist` **or** `drop_html_tags` (even to an empty array)
 /// engages the safe raw-HTML sanitizer, exactly as the worker derives its
@@ -106,6 +106,25 @@ struct BrookConfig {
     /// previous emit instead of full `html`. A consumer that enables this MUST
     /// reconstruct active html per WIRE.md §11. Off by default (v1 wire bytes).
     wire_delta: bool,
+    // ── APPEND-ONLY ZONE ───────────────────────────────────────────────────────
+    // This struct is JSON-keyed (order-irrelevant here), but it is the documented
+    // mirror of `brookmd-ffi`'s uniffi `BrookConfig`, which uniffi serializes
+    // POSITIONALLY. Keep the two field lists append-identical so the snake_case
+    // key set stays a 1:1 map of the uniffi record.
+    /// Render a CommonMark SOFT line break (a bare `\n`) as a `<br>` — the
+    /// `remark-breaks` convention. Off by default (strict CommonMark).
+    soft_breaks: bool,
+    /// Un-block URL schemes blocked by DEFAULT — bare scheme names without the
+    /// colon (`["file"]`), case-insensitive. `None` = built-in policy unchanged.
+    /// Never restricts; the script-executing tier is non-overridable.
+    allow_schemes: Option<Vec<String>>,
+    /// Lenient list indentation: a marker followed by 6+ columns of SPACE padding
+    /// yields the item's text instead of an indented code block. Off by default.
+    lenient_lists: bool,
+    /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML. Takes effect
+    /// ONLY when the sanitizer is engaged, and only for HTML block types 6 and 7.
+    /// Off by default.
+    block_html: bool,
 }
 
 impl Default for BrookConfig {
@@ -128,6 +147,10 @@ impl Default for BrookConfig {
             drop_html_tags: None,
             block_data: false,
             wire_delta: false,
+            soft_breaks: false,
+            allow_schemes: None,
+            lenient_lists: false,
+            block_html: false,
         }
     }
 }
@@ -144,6 +167,8 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
     p.set_gfm_footnotes(config.gfm_footnotes);
     p.set_gfm_math(config.gfm_math);
     p.set_dir_auto(config.dir_auto);
+    p.set_lenient_lists(config.lenient_lists);
+    p.set_soft_breaks(config.soft_breaks);
     p.set_a11y(config.a11y);
     p.set_unsafe_html(config.unsafe_html);
     p.set_component_tags(config.component_tags.clone().unwrap_or_default());
@@ -156,6 +181,8 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
         config.html_allowlist.clone().unwrap_or_default(),
         config.drop_html_tags.clone().unwrap_or_default(),
     );
+    p.set_block_html(config.block_html);
+    p.set_allow_schemes(config.allow_schemes.clone().unwrap_or_default());
     p.set_block_data(config.block_data);
     p.set_wire_delta(config.wire_delta);
     p

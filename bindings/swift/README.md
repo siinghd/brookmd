@@ -3,7 +3,7 @@
 First-party Swift bindings for the brookmd streaming Markdown parser, generated
 by [uniffi](https://mozilla.github.io/uniffi-rs/) from the `crates/brookmd-ffi`
 crate. `BrookSession` streams Markdown and returns the JSON **wire strings**
-defined in `crates/brookmd-core/WIRE.md` (contract v1.2.0) — byte-identical to
+defined in `crates/brookmd-core/WIRE.md` (contract v1.3.0) — byte-identical to
 the WASM/JS boundary. Setting `wireDelta: true` on `BrookConfig` opts into the
 v1.2.0 **wire delta mode** (active re-emits arrive as verified `html_delta`
 splices, O(n) total emitted bytes — WIRE.md §11); the default keeps v1 bytes.

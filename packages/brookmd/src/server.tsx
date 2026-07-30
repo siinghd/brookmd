@@ -90,6 +90,8 @@ function makeParser(config?: ParserConfig): BrookParser {
   p.setGfmFootnotes(config?.gfmFootnotes ?? false);
   p.setGfmMath(config?.gfmMath ?? false);
   p.setDirAuto(config?.dirAuto ?? false);
+  p.setLenientLists(config?.lenientLists ?? false);
+  p.setSoftBreaks(config?.softBreaks ?? false);
   p.setA11y(config?.a11y ?? false);
   p.setUnsafeHtml(config?.unsafeHtml ?? false);
   p.setComponentTags(config?.componentTags ?? []);
@@ -100,6 +102,8 @@ function makeParser(config?: ParserConfig): BrookParser {
     config?.htmlAllowlist ?? [],
     config?.dropHtmlTags ?? [],
   );
+  p.setBlockHtml(config?.blockHtml ?? false);
+  p.setAllowSchemes(config?.allowSchemes ?? []);
   p.setBlockData(config?.blockData ?? false);
   return p;
 }
@@ -131,13 +135,28 @@ export function parseToBlocks(markdown: string, opts?: { config?: ParserConfig }
 
 /**
  * Render a complete markdown string to an HTML string synchronously — no worker,
- * no React. The concatenated per-block HTML (XSS-safe with `unsafeHtml` off).
- * For component dispatch / a `<BrookMarkdown>`-matching React tree, use
- * `BrookMarkdownStatic` from `brookmd/server/react` with your framework's server
- * renderer instead.
+ * no React. The per-block HTML joined into one document (XSS-safe with
+ * `unsafeHtml` off). For component dispatch / a `<BrookMarkdown>`-matching React
+ * tree, use `BrookMarkdownStatic` from `brookmd/server/react` with your
+ * framework's server renderer instead.
+ *
+ * **Document assembly** (WIRE.md §12): a block's `html` never ends with a
+ * newline — that terminator belongs to the document, not the block — so joining
+ * blocks inserts one `\n` between them, `cr()`-style: only when the previous
+ * block does not ALREADY end with one. A raw HTML block serializes its own
+ * trailing newline, so an unconditional join would double it. The document ends
+ * with a final newline. This is exactly what a reference CommonMark/GFM renderer
+ * emits, and what the spec harnesses measure byte-for-byte against.
+ *
+ * If you assemble `Block.html` yourself (rather than calling this), use the same
+ * rule.
  */
 export function renderToString(markdown: string, opts?: { config?: ParserConfig }): string {
-  return parseToBlocks(markdown, opts)
-    .map((b) => b.html)
-    .join("");
+  let out = "";
+  for (const b of parseToBlocks(markdown, opts)) {
+    if (out.length > 0 && !out.endsWith("\n")) out += "\n";
+    out += b.html;
+  }
+  if (out.length > 0 && !out.endsWith("\n")) out += "\n";
+  return out;
 }

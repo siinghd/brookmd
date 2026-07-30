@@ -52,13 +52,13 @@ entirely:
 
 ```toml
 [dependencies]
-brookmd-core = { version = "0.23", default-features = false }
+brookmd-core = { version = "0.25", default-features = false }
 ```
 
 ## Wire format
 
 Blocks and patches serialize to a stable, language-agnostic JSON wire format —
-see [WIRE.md](WIRE.md) (wire contract v1.2.0). Native consumers can produce the
+see [WIRE.md](WIRE.md) (wire contract v1.3.0). Native consumers can produce the
 same bytes as the WASM/JS boundary via `wire::patch_to_json` / `wire::blocks_to_json`.
 
 Contract v1.2.0 adds the opt-in **wire delta mode**

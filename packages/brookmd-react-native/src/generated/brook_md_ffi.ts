@@ -78,9 +78,10 @@ const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
  *
  * The record's field defaults reproduce the worker's `?? default` behavior
  * exactly: GFM autolinks and alerts default **on** (LLM output is full of bare
- * URLs and `> [!NOTE]` callouts), everything else off. The four tag/allowlist
- * fields are optional arrays (`Option<Vec<String>>`), matching the `?:` optional
- * arrays on the TypeScript side — `None` (omitted) is the "feature off" state.
+ * URLs and `> [!NOTE]` callouts), everything else off. The five tag/allowlist/
+ * scheme fields are optional arrays (`Option<Vec<String>>`), matching the `?:`
+ * optional arrays on the TypeScript side — `None` (omitted) is the "feature off"
+ * state.
  *
  * Setting `html_allowlist` **or** `drop_html_tags` (even to an empty array)
  * engages the safe raw-HTML sanitizer, exactly as the worker derives its
@@ -150,7 +151,35 @@ export type BrookConfig = {
      * reconstruct active html per WIRE.md §11 (the brookmd-react-native JS
      * layer does). Off by default — wire bytes identical to contract v1.1.0.
      */
-    wireDelta: boolean
+    wireDelta: boolean,
+    /**
+     * Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+     * `<br>` — the `remark-breaks` convention. Off by default (strict CommonMark:
+     * a soft break is whitespace). Only ever ADDS breaks; hard breaks are `<br>`
+     * either way.
+     */
+    softBreaks: boolean,
+    /**
+     * Un-block URL schemes that are blocked by DEFAULT — bare scheme names
+     * without the colon (`["file"]`), matched case-insensitively. `None` = the
+     * built-in policy is unchanged. This never RESTRICTS anything, and the
+     * script-executing tier (`javascript:`, `data:text/html`, …) is
+     * non-overridable — listing one here is a no-op.
+     */
+    allowSchemes?: Array<string>,
+    /**
+     * Lenient list indentation: a list marker followed by 6+ columns of SPACE
+     * padding yields the item's text instead of an indented code block. Off by
+     * default (strict CommonMark §5.2); useful for over-indenting model output.
+     */
+    lenientLists: boolean,
+    /**
+     * Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (a
+     * `<details><summary>…` block renders as real elements). Takes effect ONLY
+     * when the sanitizer is engaged (`html_allowlist`/`drop_html_tags`), and only
+     * for CommonMark HTML block types 6 and 7. Off by default.
+     */
+    blockHtml: boolean
 }
 
 /**
@@ -171,7 +200,11 @@ export const BrookConfig = (() => {
         htmlAllowlist: undefined,
         dropHtmlTags: undefined,
         blockData: false,
-        wireDelta: false
+        wireDelta: false,
+        softBreaks: false,
+        allowSchemes: undefined,
+        lenientLists: false,
+        blockHtml: false
     });
     const create = (() => {
         return uniffiCreateRecord<BrookConfig, ReturnType<typeof defaults>>(defaults);
@@ -201,7 +234,11 @@ const FfiConverterTypeBrookConfig = (() => {
                 htmlAllowlist: FfiConverterOptionalSequenceString.read(from), 
                 dropHtmlTags: FfiConverterOptionalSequenceString.read(from), 
                 blockData: FfiConverterBool.read(from), 
-                wireDelta: FfiConverterBool.read(from)
+                wireDelta: FfiConverterBool.read(from), 
+                softBreaks: FfiConverterBool.read(from), 
+                allowSchemes: FfiConverterOptionalSequenceString.read(from), 
+                lenientLists: FfiConverterBool.read(from), 
+                blockHtml: FfiConverterBool.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -219,6 +256,10 @@ const FfiConverterTypeBrookConfig = (() => {
             FfiConverterOptionalSequenceString.write(value.dropHtmlTags, into);
             FfiConverterBool.write(value.blockData, into);
             FfiConverterBool.write(value.wireDelta, into);
+            FfiConverterBool.write(value.softBreaks, into);
+            FfiConverterOptionalSequenceString.write(value.allowSchemes, into);
+            FfiConverterBool.write(value.lenientLists, into);
+            FfiConverterBool.write(value.blockHtml, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.gfmAutolinks) +
@@ -234,7 +275,11 @@ const FfiConverterTypeBrookConfig = (() => {
              FfiConverterOptionalSequenceString.allocationSize(value.htmlAllowlist) +
              FfiConverterOptionalSequenceString.allocationSize(value.dropHtmlTags) +
              FfiConverterBool.allocationSize(value.blockData) +
-             FfiConverterBool.allocationSize(value.wireDelta);
+             FfiConverterBool.allocationSize(value.wireDelta) +
+             FfiConverterBool.allocationSize(value.softBreaks) +
+             FfiConverterOptionalSequenceString.allocationSize(value.allowSchemes) +
+             FfiConverterBool.allocationSize(value.lenientLists) +
+             FfiConverterBool.allocationSize(value.blockHtml);
             
         }
     };

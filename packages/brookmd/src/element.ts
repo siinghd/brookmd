@@ -35,11 +35,18 @@ export function parseTriBool(value: string | null): boolean | undefined {
 const CONFIG_ATTRS = [
   "gfm-autolinks",
   "gfm-alerts",
+  // Must mirror the `set(...)` map below: this list feeds `observedAttributes`,
+  // so an attribute missing here is read once at mount and then never reacts to
+  // a change. `gfm-tagfilter` was in the map but not in this list.
+  "gfm-tagfilter",
   "gfm-footnotes",
   "gfm-math",
   "dir-auto",
+  "lenient-lists",
+  "soft-breaks",
   "a11y",
   "unsafe-html",
+  "block-html",
 ];
 
 export function defineBrookMarkdown(tag = "brook-markdown"): void {
@@ -53,7 +60,7 @@ export function defineBrookMarkdown(tag = "brook-markdown"): void {
   // guards above keeps the module import side-effect-free.
   class BrookMarkdownElement extends HTMLElement {
     static get observedAttributes(): string[] {
-      return ["markdown", "src", "component-tags", ...CONFIG_ATTRS];
+      return ["markdown", "src", "component-tags", "allow-schemes", ...CONFIG_ATTRS];
     }
 
     #client: BrookClient | null = null;
@@ -237,14 +244,30 @@ export function defineBrookMarkdown(tag = "brook-markdown"): void {
       set("gfm-footnotes", "gfmFootnotes");
       set("gfm-math", "gfmMath");
       set("dir-auto", "dirAuto");
+      set("lenient-lists", "lenientLists");
+      set("soft-breaks", "softBreaks");
       set("a11y", "a11y");
       set("unsafe-html", "unsafeHtml");
+      // Only meaningful alongside the sanitizer (`html-allowlist` / drop list),
+      // which this element exposes via its `config` property, not an attribute.
+      set("block-html", "blockHtml");
 
       const tags = this.getAttribute("component-tags");
       if (tags !== null) {
         const list = tags.split(/[\s,]+/).filter(Boolean);
         if (list.length > 0) {
           cfg.componentTags = list;
+          any = true;
+        }
+      }
+
+      // Bare scheme names, no colon (`allow-schemes="file"`). Only reaches the
+      // overridable-blocked tier; script-executing schemes stay blocked.
+      const schemes = this.getAttribute("allow-schemes");
+      if (schemes !== null) {
+        const list = schemes.split(/[\s,]+/).filter(Boolean);
+        if (list.length > 0) {
+          cfg.allowSchemes = list;
           any = true;
         }
       }

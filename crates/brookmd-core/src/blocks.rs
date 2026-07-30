@@ -58,7 +58,20 @@ pub enum BlockKind {
     /// bare/with-data variant — covers both wire shapes (the generic carrier).
     Heading { level: u8, rich: Option<HeadingData> },
     /// A fenced or indented code block. `lang` is the always-on info-string
-    /// language (`None` for none). `code` is the opt-in structured channel
+    /// language (`None` for none) — the info string's first whitespace-delimited
+    /// word. `meta` is the always-on REMAINDER of that same info string, trimmed
+    /// (`` ```ts title="src/main.ts" `` ⇒ `lang: "ts"`, `meta: "title=\"src/main.ts\""`),
+    /// `None` when the fence carried none — which is the overwhelming majority, so
+    /// it rides behind `#[serde(skip_serializing_if)]` and the common wire stays
+    /// byte-identical. It is always-on (NOT gated behind `block_data`) because it is
+    /// the same class of information as `lang`, and a consumer rendering a filename
+    /// header should not have to opt into `block_data`'s duplicate source copy.
+    /// NOTE the deliberate asymmetry: `lang` also appears in the rendered HTML
+    /// (`class="language-…" data-lang="…"`), `meta` does NOT — no `data-meta`
+    /// attribute. HTML byte-stability is load-bearing for the streaming caches and
+    /// the parity suites, and meta only feeds a header UI, which needs a component
+    /// override (hence the data channel) to render anyway.
+    /// `code` is the opt-in structured channel
     /// (`setBlockData`): `None` (default-off) ⇒ serializes as
     /// `{"type":"CodeBlock","data":{"lang":<...>}}`, byte-identical to before;
     /// `Some(src)` (on) ⇒ `{"type":"CodeBlock","data":{"lang":<...>,"code":"<src>"}}`
@@ -70,7 +83,7 @@ pub enum BlockKind {
     /// re-emit the (large, growing) source every patch with `Block::clone` as a
     /// refcount bump, not an O(body) `String` copy; serde's `rc` feature
     /// serializes through the `Rc` transparently (wire unchanged).
-    CodeBlock { lang: Option<String>, code: Option<Rc<String>> },
+    CodeBlock { lang: Option<String>, meta: Option<String>, code: Option<Rc<String>> },
     /// A display-math block (`$$…$$` / `\[…\]` / a fenced `math` block). The
     /// `Option<MathBlockData>` is the opt-in structured channel (`setBlockData`):
     /// `None` (default-off) ⇒ serializes as `{"type":"MathBlock"}` with no `data`
@@ -146,6 +159,11 @@ pub enum BlockKind {
 #[derive(Serialize)]
 struct CodeBlockData<'a> {
     lang: &'a Option<String>,
+    /// Always-on info-string meta (everything past the language word); omitted
+    /// entirely when the fence carried none, so every fence without meta — the
+    /// overwhelming majority — stays byte-identical (`{"lang":…}`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    meta: &'a Option<String>,
     /// Opt-in decoded source (`setBlockData`); omitted entirely when off so the
     /// wire stays byte-identical (`{"lang":…}`), present when on (`{"lang":…,
     /// "code":"…"}`).
@@ -225,8 +243,8 @@ impl Serialize for BlockKind {
             // Object payloads via the derive-checked helper structs. The opt-in
             // `code`/`start` field is omitted when `None` (off) via
             // `skip_serializing_if`, so the off wire stays byte-identical.
-            BlockKind::CodeBlock { lang, code } => {
-                with_data(s, "CodeBlock", &CodeBlockData { lang, code })
+            BlockKind::CodeBlock { lang, meta, code } => {
+                with_data(s, "CodeBlock", &CodeBlockData { lang, meta, code })
             }
             BlockKind::List { ordered, start, items } => {
                 with_data(s, "List", &ListData { ordered: *ordered, start: *start, items })
@@ -331,9 +349,21 @@ pub struct TableCell {
 /// `</li>` in `Block::html` — so a keyed renderer can stamp one node per item
 /// (`<li key={i}>`) and re-render only the items whose `html` changed while the
 /// list streams, instead of re-rendering the whole list's HTML every patch.
+///
+/// `start` is the item's DOCUMENT-ABSOLUTE source byte offset — the index of the
+/// item's marker in the markdown fed so far (same origin as [`Block::start`]) —
+/// so a consumer can index the original source to read or rewrite the item in
+/// place (e.g. flip a GFM task-list `[ ]`/`[x]`). It is `None` for items that
+/// have no offset in the document the caller holds: a NESTED list's items (a
+/// nested list is rendered inside its parent item's `html` against a synthesized
+/// de-indented string, and never reaches this channel at all).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ListItemData {
     pub html: String,
+    /// Opt-in absolute source offset of the item's marker; omitted when absent so
+    /// the wire stays `{"html":…}` for items with no document position.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<usize>,
 }
 
 /// Structured container payload for the opt-in `kind.data` channel (the `Some`

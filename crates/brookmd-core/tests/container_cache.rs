@@ -323,14 +323,16 @@ fn lazy_continuation_matches_full_render() {
 
 #[test]
 fn lazy_continuation_exact_bytes() {
-    // Pin the glue shape: the lazy line joins the previous one with a single
-    // space (soft break), left-trimmed — `blockquote_inner`'s exact transform.
+    // Pin the glue shape: the lazy line keeps its OWN line — the soft break
+    // between it and the line above is a `\n`, exactly like a `>`-marked
+    // continuation (CommonMark examples 233, 247) — and its leading whitespace
+    // is stripped. `blockquote_inner`'s exact transform.
     let mut p = alerts(StreamParser::new());
     p.append("> a\n");
     p.append("lazy tail\n");
     p.append("> c\n");
     p.finalize();
-    assert_eq!(collect(&p), "<blockquote>\n<p>a lazy tail\nc</p>\n</blockquote>");
+    assert_eq!(collect(&p), "<blockquote>\n<p>a\nlazy tail\nc</p>\n</blockquote>");
 }
 
 #[test]
@@ -386,7 +388,9 @@ fn quote_hosted_ref_def_resolves_after_close_exact_bytes() {
     p.finalize();
     assert_eq!(
         collect(&p),
-        "<blockquote></blockquote><p>see <a href=\"https://example.com/x\" title=\"T\" \
+        // A quote holding only a ref def renders no body sub-block, but still
+        // opens with cmark's unconditional `cr()` (spec examples 218/239/240).
+        "<blockquote>\n</blockquote><p>see <a href=\"https://example.com/x\" title=\"T\" \
          target=\"_blank\" rel=\"noopener noreferrer nofollow\">it</a></p>"
     );
 }

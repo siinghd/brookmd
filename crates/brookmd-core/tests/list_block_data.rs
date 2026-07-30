@@ -70,10 +70,11 @@ fn on_path_carries_start_and_keeps_ordered() {
         .map(|b| serde_json::to_string(&b.kind).unwrap())
         .next()
         .unwrap();
-    // `items` (the keyed-renderer channel) rides after `start` when on.
+    // `items` (the keyed-renderer channel) rides after `start` when on; each
+    // entry carries its inner `<li>` HTML plus the item's absolute source offset.
     assert_eq!(
         json,
-        r#"{"type":"List","data":{"ordered":true,"start":5,"items":[{"html":"five"},{"html":"six"}]}}"#
+        r#"{"type":"List","data":{"ordered":true,"start":5,"items":[{"html":"five","start":0},{"html":"six","start":8}]}}"#
     );
 }
 
@@ -93,7 +94,7 @@ fn unordered_list_start_is_one() {
         .unwrap();
     assert_eq!(
         json,
-        r#"{"type":"List","data":{"ordered":false,"start":1,"items":[{"html":"a"},{"html":"b"}]}}"#
+        r#"{"type":"List","data":{"ordered":false,"start":1,"items":[{"html":"a","start":0},{"html":"b","start":4}]}}"#
     );
 }
 
@@ -150,9 +151,10 @@ fn items_carry_inner_li_html_tight() {
 #[test]
 fn items_carry_inner_li_html_loose() {
     // A loose list (blank line between siblings) wraps each item's paragraph in
-    // <p>…</p> — the item HTML mirrors that.
+    // <p>…</p> — the item HTML mirrors that, block-bracketed by `\n` on BOTH
+    // sides (cmark's `cr()` around every non-tight-paragraph child).
     let items = first_list_items(&finalize("- a\n\n- b\n", true)).expect("a List");
-    assert_eq!(items, vec!["\n<p>a</p>".to_string(), "\n<p>b</p>".to_string()]);
+    assert_eq!(items, vec!["\n<p>a</p>\n".to_string(), "\n<p>b</p>\n".to_string()]);
 }
 
 #[test]
@@ -162,8 +164,8 @@ fn items_carry_task_checkbox() {
     assert_eq!(
         items,
         vec![
-            "<input type=\"checkbox\" disabled> todo".to_string(),
-            "<input type=\"checkbox\" checked disabled> done".to_string(),
+            "<input disabled=\"\" type=\"checkbox\"> todo".to_string(),
+            "<input checked=\"\" disabled=\"\" type=\"checkbox\"> done".to_string(),
         ]
     );
 }

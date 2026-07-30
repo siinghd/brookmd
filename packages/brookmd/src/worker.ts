@@ -28,6 +28,8 @@ const core = new WorkerCore({
     p.setGfmFootnotes(c?.gfmFootnotes ?? false);
     p.setGfmMath(c?.gfmMath ?? false);
     p.setDirAuto(c?.dirAuto ?? false);
+    p.setLenientLists(c?.lenientLists ?? false);
+    p.setSoftBreaks(c?.softBreaks ?? false);
     p.setA11y(c?.a11y ?? false);
     p.setUnsafeHtml(c?.unsafeHtml ?? false);
     p.setComponentTags(c?.componentTags ?? []);
@@ -38,6 +40,8 @@ const core = new WorkerCore({
       c?.htmlAllowlist ?? [],
       c?.dropHtmlTags ?? [],
     );
+    p.setBlockHtml(c?.blockHtml ?? false);
+    p.setAllowSchemes(c?.allowSchemes ?? []);
     p.setBlockData(c?.blockData ?? false);
     // Wire delta mode (WIRE.md §11) is always on for OUR worker↔client pair:
     // active re-emits cross the WASM and postMessage boundaries as splices

@@ -63,6 +63,11 @@ class BrookConfig {
     this.htmlAllowlist,
     this.dropHtmlTags,
     this.blockData,
+    this.wireDelta,
+    this.softBreaks,
+    this.allowSchemes,
+    this.lenientLists,
+    this.blockHtml,
   });
 
   /// GFM extended autolinks (bare `www.`/`http(s)://`/`ftp://` + emails). Default on.
@@ -106,6 +111,30 @@ class BrookConfig {
   /// Opt-in structured `kind.data` channel (Heading/CodeBlock/Table/… payloads).
   final bool? blockData;
 
+  /// Opt-in wire delta mode (WIRE.md §11): active blocks re-emitted across
+  /// appends serialize as `html_delta` splices against their previous emit
+  /// instead of full `html`. Enabling it obliges you to reconstruct active html
+  /// per WIRE.md §11. Default off (v1 wire bytes).
+  final bool? wireDelta;
+
+  /// Render a CommonMark SOFT line break (a bare `\n`) as a `<br>` — the
+  /// `remark-breaks` convention. Default off (strict CommonMark).
+  final bool? softBreaks;
+
+  /// Un-block URL schemes blocked by DEFAULT — bare scheme names without the
+  /// colon (`['file']`), case-insensitive. Never restricts; the script-executing
+  /// tier is non-overridable.
+  final List<String>? allowSchemes;
+
+  /// Lenient list indentation: a marker followed by 6+ columns of SPACE padding
+  /// yields the item's text instead of an indented code block. Default off.
+  final bool? lenientLists;
+
+  /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML. Takes effect
+  /// only when the sanitizer is engaged ([htmlAllowlist] or [dropHtmlTags]), and
+  /// only for HTML block types 6 and 7. Default off.
+  final bool? blockHtml;
+
   /// JSON object with only the explicitly-set keys (omitted keys → native default).
   Map<String, Object?> toJson() {
     final map = <String, Object?>{};
@@ -126,6 +155,11 @@ class BrookConfig {
     put('html_allowlist', htmlAllowlist);
     put('drop_html_tags', dropHtmlTags);
     put('block_data', blockData);
+    put('wire_delta', wireDelta);
+    put('soft_breaks', softBreaks);
+    put('allow_schemes', allowSchemes);
+    put('lenient_lists', lenientLists);
+    put('block_html', blockHtml);
     return map;
   }
 }

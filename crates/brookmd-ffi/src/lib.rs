@@ -28,9 +28,10 @@ uniffi::setup_scaffolding!();
 ///
 /// The record's field defaults reproduce the worker's `?? default` behavior
 /// exactly: GFM autolinks and alerts default **on** (LLM output is full of bare
-/// URLs and `> [!NOTE]` callouts), everything else off. The four tag/allowlist
-/// fields are optional arrays (`Option<Vec<String>>`), matching the `?:` optional
-/// arrays on the TypeScript side — `None` (omitted) is the "feature off" state.
+/// URLs and `> [!NOTE]` callouts), everything else off. The five tag/allowlist/
+/// scheme fields are optional arrays (`Option<Vec<String>>`), matching the `?:`
+/// optional arrays on the TypeScript side — `None` (omitted) is the "feature off"
+/// state.
 ///
 /// Setting `html_allowlist` **or** `drop_html_tags` (even to an empty array)
 /// engages the safe raw-HTML sanitizer, exactly as the worker derives its
@@ -87,6 +88,38 @@ pub struct BrookConfig {
     /// layer does). Off by default — wire bytes identical to contract v1.1.0.
     #[uniffi(default = false)]
     pub wire_delta: bool,
+    // ── APPEND-ONLY ZONE ───────────────────────────────────────────────────────
+    // uniffi serializes a record's fields POSITIONALLY, in declaration order, and
+    // the generated foreign readers (`FfiConverterBool.read(from)`, …) decode them
+    // in that same sequence. Inserting a field anywhere above shifts every later
+    // read and silently corrupts the wire for any binding not regenerated in
+    // lockstep. New fields therefore go HERE, at the end — which is why the order
+    // below no longer tracks `build_parser`'s setter order (that one mirrors the JS
+    // worker's `makeParser`; see below).
+    /// Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+    /// `<br>` — the `remark-breaks` convention. Off by default (strict CommonMark:
+    /// a soft break is whitespace). Only ever ADDS breaks; hard breaks are `<br>`
+    /// either way.
+    #[uniffi(default = false)]
+    pub soft_breaks: bool,
+    /// Un-block URL schemes that are blocked by DEFAULT — bare scheme names
+    /// without the colon (`["file"]`), matched case-insensitively. `None` = the
+    /// built-in policy is unchanged. This never RESTRICTS anything, and the
+    /// script-executing tier (`javascript:`, `data:text/html`, …) is
+    /// non-overridable — listing one here is a no-op.
+    #[uniffi(default = None)]
+    pub allow_schemes: Option<Vec<String>>,
+    /// Lenient list indentation: a list marker followed by 6+ columns of SPACE
+    /// padding yields the item's text instead of an indented code block. Off by
+    /// default (strict CommonMark §5.2); useful for over-indenting model output.
+    #[uniffi(default = false)]
+    pub lenient_lists: bool,
+    /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML (a
+    /// `<details><summary>…` block renders as real elements). Takes effect ONLY
+    /// when the sanitizer is engaged (`html_allowlist`/`drop_html_tags`), and only
+    /// for CommonMark HTML block types 6 and 7. Off by default.
+    #[uniffi(default = false)]
+    pub block_html: bool,
 }
 
 /// Build a [`StreamParser`] from a [`BrookConfig`], applying the same
@@ -101,6 +134,8 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
     p.set_gfm_footnotes(config.gfm_footnotes);
     p.set_gfm_math(config.gfm_math);
     p.set_dir_auto(config.dir_auto);
+    p.set_lenient_lists(config.lenient_lists);
+    p.set_soft_breaks(config.soft_breaks);
     p.set_a11y(config.a11y);
     p.set_unsafe_html(config.unsafe_html);
     p.set_component_tags(config.component_tags.clone().unwrap_or_default());
@@ -113,6 +148,8 @@ fn build_parser(config: &BrookConfig) -> StreamParser {
         config.html_allowlist.clone().unwrap_or_default(),
         config.drop_html_tags.clone().unwrap_or_default(),
     );
+    p.set_block_html(config.block_html);
+    p.set_allow_schemes(config.allow_schemes.clone().unwrap_or_default());
     p.set_block_data(config.block_data);
     p.set_wire_delta(config.wire_delta);
     p

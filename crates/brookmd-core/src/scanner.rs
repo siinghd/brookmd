@@ -25,6 +25,12 @@ pub struct ScanCtx<'a> {
     /// `<Tag>…</Tag>` whose name is listed scans as a `ComponentBlock` whose body
     /// is markdown. Empty (the default) means the feature is off.
     pub component_tags: &'a [Box<str>],
+    /// Treat a list marker followed by 6+ columns of SPACE padding as the item's
+    /// text rather than as an indented code block (§5.2 would keep only one
+    /// column and make the rest code). Off by default, so strict CommonMark is
+    /// unchanged. See [`scan_marker`] for the exact rule and its deliberate
+    /// non-fixes.
+    pub lenient_lists: bool,
     /// Opt-in allowlist of INLINE component tag names. A bare `<tik>` line for
     /// such a tag (when it is not also a block `component_tag`) must NOT be
     /// captured as a type-7 HTML block (which would escape it) — it falls through
@@ -405,7 +411,7 @@ fn fence_marker(content: &[u8]) -> Option<(u8, usize)> {
 /// See through nested container markers (blockquote `>` and list markers) to
 /// the innermost content, so we can tell whether a line leaves a paragraph
 /// open even when it's wrapped in containers (e.g. `> 1. > text`).
-fn strip_container_markers(mut c: &[u8]) -> &[u8] {
+fn strip_container_markers<'a>(mut c: &'a [u8], ctx: ScanCtx<'_>) -> &'a [u8] {
     loop {
         let mut i = 0;
         while i < c.len() && i < 3 && c[i] == b' ' {
@@ -415,7 +421,7 @@ fn strip_container_markers(mut c: &[u8]) -> &[u8] {
             c = quote_content(c);
             continue;
         }
-        if let Some(m) = scan_marker(c) {
+        if let Some(m) = scan_marker(c, ctx) {
             c = &c[m.content_byte..];
             continue;
         }
@@ -466,7 +472,7 @@ fn scan_blockquote(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBl
             // See through nested quotes to decide paragraph state. Plain text
             // opens/continues a paragraph; an interrupting block closes it;
             // indented code only continues an already-open paragraph.
-            let inner = strip_container_markers(content);
+            let inner = strip_container_markers(content, ctx);
             let inner_blank = inner.iter().all(|&b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'));
             if inner_blank || would_start_other_block(inner, 0, ctx) {
                 para_open = false;
@@ -482,7 +488,7 @@ fn scan_blockquote(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBl
 
 fn scan_list(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBlock> {
     let first_line = line_slice(bytes, start);
-    let first = scan_marker(first_line)?;
+    let first = scan_marker(first_line, ctx)?;
     let ordered = first.ordered;
     let delim = first.delim;
     let edge = first.marker_indent;
@@ -530,7 +536,7 @@ fn scan_list(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBlock> {
                 continue;
             }
             // A same-family marker at this list's level resumes the list.
-            if let Some(m) = scan_marker(line) {
+            if let Some(m) = scan_marker(line, ctx) {
                 if m.ordered == ordered && m.delim == delim && m.marker_indent <= edge + 3 {
                     cur_ci = m.content_indent;
                     cur_empty = line
@@ -557,7 +563,7 @@ fn scan_list(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBlock> {
         }
         // A marker at this list's level: same family → new sibling; different
         // family → a new list begins, so this one ends.
-        if let Some(m) = scan_marker(line) {
+        if let Some(m) = scan_marker(line, ctx) {
             if m.marker_indent <= edge + 3 {
                 if m.ordered == ordered && m.delim == delim {
                     cur_ci = m.content_indent;
@@ -695,9 +701,33 @@ pub(crate) struct MarkerScan {
     pub delim: u8,
     /// Byte offset just past the consumed marker + content spaces.
     pub content_byte: usize,
+    /// Columns the marker skipped past that `content_byte` cannot express —
+    /// materialize this many SPACES before the `[content_byte..]` slice to get
+    /// the item body's true geometry.
+    ///
+    /// Non-zero only when a TAB pads the marker (§2.2). A tab's stop is measured
+    /// from its column on the ORIGINAL line, so slicing the line at a byte and
+    /// re-basing it to column 0 re-expands every following tab from the wrong
+    /// place: `-\t\tfoo` is `foo` at column 8 with content starting at column 2,
+    /// i.e. SIX columns of body indent — indented code — but the bare
+    /// `[content_byte..]` slice `\tfoo` re-expands to only four (CommonMark
+    /// example 7). Every space-padded marker leaves this 0 and slices exactly as
+    /// before.
+    pub content_overflow: usize,
 }
 
-pub(crate) fn scan_marker(line: &[u8]) -> Option<MarkerScan> {
+/// With [`ScanCtx::lenient_lists`] on, the "≥ 5 columns ⇒ N := 1" rule above is
+/// relaxed to "= 5 columns", so a marker padded with 6+ SPACES keeps all of that
+/// padding as the content column and the text reads as the item's own paragraph
+/// instead of an indented code block. Three cases stay strictly conformant by
+/// design: exactly 5 columns (still code), tab-padded markers (`-\t\tfoo`, still
+/// code — see below), and anything that only becomes code on a LATER line.
+///
+/// Tabs are excluded because tab-padding is a deliberate authoring choice, while
+/// the pattern this flag rescues (an LLM over-indenting after a bullet) is always
+/// literal spaces. Excluding them keeps the divergence from CommonMark down to a
+/// single spec example (274) instead of also taking example 7.
+pub(crate) fn scan_marker(line: &[u8], ctx: ScanCtx<'_>) -> Option<MarkerScan> {
     let mut col = 0;
     let mut i = 0;
     while i < line.len() {
@@ -735,6 +765,8 @@ pub(crate) fn scan_marker(line: &[u8]) -> Option<MarkerScan> {
             ordered,
             delim,
             content_byte: i,
+            // Empty content — nothing to re-base.
+            content_overflow: 0,
         });
     }
     if line[i] != b' ' && line[i] != b'\t' {
@@ -742,10 +774,12 @@ pub(crate) fn scan_marker(line: &[u8]) -> Option<MarkerScan> {
     }
     let mut k = i;
     let mut spcol = 0;
+    let mut has_tab = false;
     while k < line.len() && (line[k] == b' ' || line[k] == b'\t') {
         if line[k] == b' ' {
             spcol += 1;
         } else {
+            has_tab = true;
             spcol += 4 - ((col + spcol) % 4);
         }
         k += 1;
@@ -757,15 +791,36 @@ pub(crate) fn scan_marker(line: &[u8]) -> Option<MarkerScan> {
             ordered,
             delim,
             content_byte: i,
+            // Empty content — nothing to re-base.
+            content_overflow: 0,
         });
     }
-    let (n, content_byte) = if spcol >= 5 { (1, i + 1) } else { (spcol, k) };
+    // Lenient mode spares 6+ columns of all-space padding from the code-block
+    // rule; everything else (and every strict-mode scan) is unchanged.
+    let lenient = ctx.lenient_lists && !has_tab && spcol >= 6;
+    let (n, content_byte, content_overflow) = if spcol >= 5 && !lenient {
+        if has_tab {
+            // The padding run holds a tab, so it cannot be split at a byte
+            // without re-basing that tab's stop. Slice past the WHOLE run and
+            // re-materialize the skipped columns as spaces instead: the content
+            // sits at column `marker_indent + w + spcol` and the body starts at
+            // `content_indent`, so `spcol - 1` columns of it are body indent.
+            (1, k, spcol - 1)
+        } else {
+            (1, i + 1, 0)
+        }
+    } else {
+        // N = spcol puts `content_indent` exactly at the first content column,
+        // so the slice already carries the right geometry — never any overflow.
+        (spcol, k, 0)
+    };
     Some(MarkerScan {
         marker_indent,
         content_indent: marker_indent + w + n,
         ordered,
         delim,
         content_byte,
+        content_overflow,
     })
 }
 

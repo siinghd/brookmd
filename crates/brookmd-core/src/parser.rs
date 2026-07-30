@@ -5,13 +5,16 @@ use std::rc::Rc;
 
 use crate::blocks::Block;
 use crate::render::{
-    alert_head, blockquote_inner, classify, collect_footnote_defs, collect_footnote_refs,
+    alert_head, blockquote_inner, chop_trailing_blank_lines, classify, collect_footnote_defs,
+    collect_footnote_refs, cr,
     collect_footnote_refs_overlay, extend_footnote_refs, is_fence_close_line,
     is_footnote_def_block, item_body, item_directly_loose, last_footnote_def_opener,
-    normalize_label, parse_alignments, push_code_fence_open, push_table_cell,
-    push_table_cell_open, push_tagfiltered, render_block, render_footnote_section,
-    render_item_body, resolve_footnote_ids, resolve_footnote_ids_overlay, split_table_cells,
-    trim_trailing_newlines, Enrichment, LinkRef, RenderOpts,
+    fence_indent, fold_block_html, html_block_sanitizes, normalize_label, parse_alignments,
+    push_code_fence_open, push_html_closers, push_table_cell,
+    push_lazy_line, push_table_cell_open, push_tagfiltered, render_block, render_footnote_section,
+    render_item_body, resolve_footnote_ids, resolve_footnote_ids_overlay, split_cols,
+    split_table_cells,
+    trim_trailing_newlines, Enrichment, HtmlPolicy, LinkRef, RenderOpts,
 };
 use crate::blocks::{BlockKind, ContainerData, ListItemData, NestedBlock, TableCell, TableData};
 use crate::scanner::{
@@ -33,7 +36,7 @@ fn container_inner_breaks_paragraph(stripped: &[u8], ctx: ScanCtx<'_>) -> bool {
         // any list marker, including an ordered list starting at a number other
         // than 1 (which `would_start_other_block` rejects because it cannot
         // *interrupt* a paragraph — yet it starts a list at the top of a body).
-        || scan_marker(stripped).is_some()
+        || scan_marker(stripped, ctx).is_some()
         || is_setext_underline(stripped, 0).is_some()
         || is_table_delimiter_row(stripped)
         // a link reference definition produces no visible output; the cache would
@@ -67,7 +70,10 @@ fn first_line_alert_undecided(stripped: &[u8]) -> bool {
             || core.strip_prefix(m).is_some_and(|rest| rest.chars().all(char::is_whitespace))
     })
 }
-use crate::inline::{open_tag_streaming_quote, render_inline, render_inline_boundary};
+use crate::inline::{
+    open_tag_streaming_quote, render_inline, render_inline_boundary, render_inline_para,
+    render_inline_para_boundary,
+};
 use crate::url::{escape_attr, escape_html, sanitize_attrs};
 
 /// Collect link reference definitions from `text` into `refs`, recursing into
@@ -129,8 +135,8 @@ fn collect_refs(
             RawBlockKind::List { .. } => {
                 // Re-split the list into items and recurse into each body.
                 let slice = &text[raw.range.clone()];
-                for item in split_list_items(slice) {
-                    if let Some(body) = item_body(item.as_bytes()) {
+                for item in split_list_items(slice, ctx) {
+                    if let Some(body) = item_body(item.as_bytes(), ctx) {
                         collect_refs(&body, refs, ctx, alerts, depth + 1);
                     }
                 }
@@ -190,7 +196,8 @@ fn resolve_block_footnotes(
         }
         BlockKind::List { items, .. } => {
             for it in items {
-                *it = Rc::new(ListItemData { html: resolve_one(&it.html) });
+                // Only `html` is re-resolved; the source offset carries through.
+                *it = Rc::new(ListItemData { html: resolve_one(&it.html), start: it.start });
             }
         }
         BlockKind::Blockquote(Some(cd)) => {
@@ -210,7 +217,7 @@ fn resolve_block_footnotes(
 /// Split a list slice into its item slices (by lines that begin a sibling
 /// marker at the list's own indentation). A light re-implementation used only
 /// for ref-def harvesting; rendering does its own item splitting.
-fn split_list_items(slice: &str) -> Vec<&str> {
+fn split_list_items<'a>(slice: &'a str, ctx: ScanCtx<'_>) -> Vec<&'a str> {
     use crate::scanner::{indent_cols, line_end, scan_marker};
     let bytes = slice.as_bytes();
     let mut starts = Vec::new();
@@ -224,13 +231,13 @@ fn split_list_items(slice: &str) -> Vec<&str> {
         if !is_blank {
             let ind = indent_cols(line);
             if starts.is_empty() {
-                if let Some(m) = scan_marker(line) {
+                if let Some(m) = scan_marker(line, ctx) {
                     edge = m.marker_indent;
                     cur_ci = m.content_indent;
                     starts.push(pos);
                 }
             } else if ind < cur_ci && ind <= edge + 3 {
-                if let Some(m) = scan_marker(line) {
+                if let Some(m) = scan_marker(line, ctx) {
                     cur_ci = m.content_indent;
                     starts.push(pos);
                 }
@@ -285,6 +292,12 @@ pub struct StreamParser {
     gfm_footnotes: bool,
     gfm_math: bool,
     dir_auto: bool,
+    /// Treat a list marker followed by 6+ columns of SPACE padding as the item's
+    /// text instead of an indented code block. Off by default (strict CommonMark).
+    lenient_lists: bool,
+    /// Render a soft line break as `<br>` (`remark-breaks` parity). Off by
+    /// default (strict CommonMark: a soft break is whitespace).
+    soft_breaks: bool,
     a11y: bool,
     /// Opt-in structured `kind.data` channel for Table blocks (`setBlockData`).
     /// Off by default — when off, Table serializes as `{"type":"Table"}` (no
@@ -310,6 +323,15 @@ pub struct StreamParser {
     html_sanitize: bool,
     html_allowlist: Vec<Box<str>>,
     html_drop: Vec<Box<str>>,
+    /// Extend the sanitizer to BLOCK-level raw HTML (see
+    /// [`StreamParser::set_block_html`]). Only meaningful with `html_sanitize`
+    /// on, and only for HTML block types 6/7. Off by default (block raw HTML
+    /// stays escaped, byte-identical to before).
+    block_html: bool,
+    /// Opt-in URL-scheme un-blocklist (see [`StreamParser::set_allow_schemes`]).
+    /// BARE scheme names, no colon (`["file"]`), matched case-insensitively.
+    /// Empty by default — every default-blocked scheme stays blocked.
+    allow_schemes: Vec<Box<str>>,
     /// Fast path for a long open code/math fence at the tail (see [`FenceCache`]).
     fence_cache: Option<FenceCache>,
     /// Fast path for a long open paragraph at the tail (see [`ParagraphCache`]).
@@ -504,8 +526,21 @@ struct FenceCache {
     /// plus the trailing trim, so the opt-in `kind.data` source derives from this
     /// RAW slice directly — no per-append whole-body entity decode.
     body_start: usize,
+    /// Columns of indentation on the OPENER line, which every body line sheds
+    /// (§4.5 — see [`crate::render::fence_indent`]). 0 for math fences and for
+    /// the overwhelmingly common flush-left code fence, which is the only case
+    /// where the folds below stay pure `escape_html`.
+    fence_indent: usize,
     /// Escaped HTML of the complete body lines, joined by `\n`, no trailing `\n`.
     escaped_lines: String,
+    /// RAW (unescaped) twin of `escaped_lines`, de-indented identically —
+    /// `Some` iff `fence_indent > 0`. When the opener is flush left the decoded
+    /// source is just the buffer slice `[body_start..end]`, so nothing is kept;
+    /// once lines are being de-indented that slice no longer matches the HTML,
+    /// and re-deriving it per append would be an O(body) rescan (an O(n²) wall),
+    /// so the de-indented raw text folds in line-by-line right beside the
+    /// escaped one.
+    decoded_lines: Option<String>,
     /// Whether ≥1 complete body line has been folded in. Drives the `\n` line
     /// JOIN separator — NOT `!escaped_lines.is_empty()`, which would swallow a
     /// LEADING blank body line (` ```\n\nx ` must keep its `\n` before `x`).
@@ -957,12 +992,6 @@ struct ContainerCache {
     /// Wrapper opener that always appears: `<blockquote dir?>\n` for blockquote,
     /// or `<div class="...">\n<p class="...title">Title</p>\n` for an alert.
     wrapper_open: String,
-    /// True for a blockquote: the trailing `\n` of `wrapper_open` is the
-    /// CONDITIONAL body-leading newline (`render_blockquote`'s
-    /// `if !sub.is_empty()`), which must vanish for a totally empty body so the
-    /// output is `<blockquote></blockquote>`, not `<blockquote>\n</blockquote>`.
-    /// False for an alert (that `\n` is the always-present title separator).
-    body_leading_nl: bool,
     /// Body paragraph opener: `<p dir?>` — emitted only when the current
     /// paragraph has content. An empty current paragraph must produce no
     /// `<p></p>` (matches the full renderer's per-sub-block contract).
@@ -1062,9 +1091,10 @@ struct ContainerBlockCache {
     wrapper_open: String,
     /// Wrapper closer: `</blockquote>` or `</div>`.
     wrapper_close: String,
-    /// Whether a `\n` is pushed before the body iff it is non-empty — true for a
-    /// blockquote (`if !sub.is_empty() { '\n' }`), false for an alert (the title
-    /// line's trailing `\n` already separates it from the body).
+    /// `assemble_wrapped_body`'s `lead_when_empty`: true for a blockquote, whose
+    /// body-leading `\n` is unconditional (`<blockquote>\n</blockquote>` for an
+    /// empty quote); false for an alert, whose title line already ends in `\n`
+    /// (so the `cr()` is a no-op either way).
     body_leading_nl: bool,
     /// The recursive parser rendering the `>`-stripped inner markdown. Fed only
     /// the per-append delta; its `all_blocks()` are the inner sub-blocks.
@@ -1247,7 +1277,7 @@ struct ListCache {
     /// item.
     open_stream: Option<Box<OpenItemStream>>,
     /// `true` when the open item's body cannot stream through a nested parser
-    /// (a lazy continuation line needs `item_body`'s space-glue, or the arm
+    /// (a lazy continuation line needs `item_body`'s lazy re-indent, or the arm
     /// failed) — the per-append fold owns the item until it closes. Reset per
     /// item.
     stream_disabled: bool,
@@ -1314,8 +1344,8 @@ const OPEN_ITEM_STREAM_MIN: usize = 1024;
 ///   - trailing whitespace (blank lines / a content line's final spaces) is
 ///     HELD BACK from the feed — `render_item_body` truncates it before
 ///     scanning, so the nested buffer must end at the last non-whitespace byte,
-///   - a lazy continuation line (shallow, non-blank) needs `item_body`'s
-///     space-glue, which can't be re-fed — the stream is dropped for this item
+///   - a lazy continuation line (shallow, non-blank) needs `item_body`'s lazy
+///     re-indent, which can't be re-fed — the stream is dropped for this item
 ///     (`stream_disabled`) and the per-append fold takes over (today's cost),
 ///   - the checkbox prefix `[x] ` is stripped from the feed and re-emitted by
 ///     the assembly (mirroring `render_item_body`),
@@ -1428,6 +1458,16 @@ struct IndentedCodeCache {
 /// shared [`crate::scanner::html_block_line_closes`]) or a blank line (types 6/7)
 /// ends the block, so the cache bails there and the full path commits it. A `\r`
 /// byte also bails (CRLF routes through the full renderer in both modes).
+///
+/// THIRD MODE — `sanitize` (`block_html` + the sanitizer, types 6/7). The output
+/// is no longer a per-byte map of the source, so a per-LINE fold is impossible:
+/// a tag legitimately spans lines. The fold moves to TOKEN boundaries instead
+/// (`render::fold_block_html`), carrying the offset after the last fully
+/// consumed token/text run (`tokens_upto`) and the open-element stack there
+/// (`open_tags`). Per append only the new complete tokens are sanitized; only
+/// the speculative-closer suffix (bounded by `MAX_BLOCK_HTML_DEPTH`) and the
+/// trailing partial are regenerated. Re-sanitizing the whole block per append is
+/// the O(n²) this mode exists to avoid — `tests/scaling.rs` pins it.
 struct HtmlBlockCache {
     /// Absolute byte offset of the block's first line in `buffer`.
     start: usize,
@@ -1443,12 +1483,25 @@ struct HtmlBlockCache {
     /// re-processed partial run through the GFM tagfilter — per NEW line only,
     /// so filtering stays O(new bytes) and byte-identical to the full path.
     tagfilter: bool,
+    /// When `true` (`block_html` + the sanitizer + type 6/7), the block renders
+    /// through the raw-HTML sanitizer and the fold is at TOKEN boundaries: see
+    /// `tokens_upto` / `open_tags`. Locked at arm time, re-validated per append.
+    sanitize: bool,
     /// Pre-rendered prefix of the completed lines: for pass-through, the raw
     /// source bytes verbatim (including their `\n`); for the escaped path, their
-    /// `escape_html` output (newlines survive escaping unchanged). No closer.
+    /// `escape_html` output (newlines survive escaping unchanged). In sanitize
+    /// mode, the sanitized output of everything up to `tokens_upto`. No closer.
     cached_prefix: String,
-    /// Absolute offset just past the last complete folded line's `\n`.
+    /// Absolute offset just past the last complete folded line's `\n`. Drives
+    /// close detection in every mode; drives the FOLD in all but sanitize mode.
     lines_upto: usize,
+    /// Sanitize mode only: absolute offset just past the last fully consumed
+    /// token / settled text byte. Everything from here to the buffer end is a
+    /// still-streaming `<…` (suppressed until it completes).
+    tokens_upto: usize,
+    /// Sanitize mode only: the open-element stack at `tokens_upto` (outermost
+    /// first, source spelling), regenerated into speculative closers per append.
+    open_tags: Vec<String>,
 }
 
 /// Incremental render state for a single open COMPONENT block (`<Tag>` whose
@@ -1582,7 +1635,11 @@ struct RuleCache {
 /// full-rescans every append. The rendered block (`push_code_fence_open` +
 /// `</code></pre>`, empty body) and its classified kind depend ONLY on the first
 /// info word; once that word is settled (whitespace follows it) both are frozen,
-/// and each append just validates the new bytes. Bails on the newline that
+/// and each append just validates the new bytes. Nothing that grows with the
+/// line is re-derived here — including the info string's `meta`, which
+/// `classify` deliberately withholds until the opener line is terminated (or the
+/// stream finalizes), so the frozen kind stays correct for every prefix this
+/// cache covers. Bails on the newline that
 /// completes the opener (the normal fence cache arms on the next reparse) and on
 /// a backtick in a backtick fence's info (the scanner then rejects the fence).
 struct FenceInfoCache {
@@ -1623,6 +1680,8 @@ impl StreamParser {
             gfm_footnotes: false,
             gfm_math: false,
             dir_auto: false,
+            lenient_lists: false,
+            soft_breaks: false,
             a11y: false,
             block_data: false,
             component_tags: Vec::new(),
@@ -1630,6 +1689,8 @@ impl StreamParser {
             html_sanitize: false,
             html_allowlist: Vec::new(),
             html_drop: Vec::new(),
+            block_html: false,
+            allow_schemes: Vec::new(),
             fence_cache: None,
             para_cache: None,
             table_cache: None,
@@ -1728,6 +1789,24 @@ impl StreamParser {
         self.gfm_math = on;
     }
 
+    /// Lenient list indentation: a list marker followed by 6 or more columns of
+    /// SPACE padding yields the item's text, where strict CommonMark (§5.2) keeps
+    /// only one column and renders the remainder as an indented code block. Off by
+    /// default. Aimed at model output, which routinely over-indents after a bullet
+    /// (`-       const value = 1;`) and would otherwise render as a code block.
+    ///
+    /// Deliberately NOT relaxed (each stays strictly conformant): exactly 5 columns
+    /// of padding, a fenced code block opened on the marker line itself, indented
+    /// code that starts on a line AFTER the marker, and tab-padded markers.
+    pub fn with_lenient_lists(mut self, on: bool) -> Self {
+        self.lenient_lists = on;
+        self
+    }
+
+    pub fn set_lenient_lists(&mut self, on: bool) {
+        self.lenient_lists = on;
+    }
+
     /// Emit `dir="auto"` on block-level text elements (`<p>`, `<h1>`–`<h6>`,
     /// `<blockquote>`, `<ul>`/`<ol>`/`<li>`, `<table>`) so the browser detects
     /// each block's text direction independently (LTR/RTL) via the Unicode bidi
@@ -1741,6 +1820,20 @@ impl StreamParser {
 
     pub fn set_dir_auto(&mut self, on: bool) {
         self.dir_auto = on;
+    }
+
+    /// Render a CommonMark SOFT line break (a bare `\n` in inline content) as a
+    /// `<br>` — the `remark-breaks` convention, where one Enter is one visual
+    /// line. Off by default (strict CommonMark treats a soft break as
+    /// whitespace). Hard breaks (two trailing spaces / trailing `\`) are `<br>`
+    /// either way, so turning this on only ADDS breaks; it never removes one.
+    pub fn with_soft_breaks(mut self, on: bool) -> Self {
+        self.soft_breaks = on;
+        self
+    }
+
+    pub fn set_soft_breaks(&mut self, on: bool) {
+        self.soft_breaks = on;
     }
 
     /// Opt-in accessibility markup that deviates from strict GFM byte-output:
@@ -1825,6 +1918,61 @@ impl StreamParser {
 
     pub fn with_html_sanitize(mut self, on: bool, allow: Vec<String>, drop: Vec<String>) -> Self {
         self.set_html_sanitize(on, allow, drop);
+        self
+    }
+
+    /// Extend the safe raw-HTML sanitizer to BLOCK-level raw HTML. Takes effect
+    /// ONLY when the sanitizer is engaged ([`Self::set_html_sanitize`]); on its
+    /// own it does nothing. When on, an HTML block of CommonMark type 6 (a
+    /// known block-level tag: `<details>`, `<div>`, `<table>`, …) or type 7 (any
+    /// other complete tag alone on its line) renders through the same
+    /// allow/drop/dangerous decision and hardened attribute policy as inline raw
+    /// HTML, instead of being escaped into a `<pre><code>` block.
+    ///
+    /// Types 1–5 are deliberately NOT covered: type 1 is the raw-text family
+    /// (`<script>`, `<pre>`, `<style>`, `<textarea>`) — a browser reads
+    /// everything after such a tag as unparsed text, so a speculative mid-stream
+    /// close is mXSS-prone — and types 2–5 (comments, PIs, CDATA, declarations)
+    /// carry no renderable element. They stay escaped/dropped exactly as before.
+    ///
+    /// While the block streams, still-open elements get SPECULATIVE closers so
+    /// what the reader has seen so far is always a complete tree; a half-arrived
+    /// tag is suppressed until it completes (and renders as escaped text if the
+    /// stream ends on it). Off by default — output is byte-identical to before.
+    pub fn set_block_html(&mut self, on: bool) {
+        self.block_html = on;
+    }
+
+    pub fn with_block_html(mut self, on: bool) -> Self {
+        self.block_html = on;
+        self
+    }
+
+    /// Un-block specific URL schemes that are blocked by DEFAULT. Takes BARE
+    /// scheme names without the colon (`["file"]`), matched case-insensitively.
+    /// Empty (default) = the built-in policy is unchanged.
+    ///
+    /// This is NOT a general allowlist: it never restricts anything. Schemes
+    /// outside the built-in blocklist (`vscode:`, `ftp:`, `mailto:`, …) already
+    /// pass and are unaffected by this setting — the only thing it can reach is
+    /// the OVERRIDABLE-blocked tier, today just `file:`.
+    ///
+    /// The script-executing tier (`javascript:`, `vbscript:`, `data:text/html`,
+    /// `data:text/javascript`, and the scriptable `data:` media types) is
+    /// NON-OVERRIDABLE: naming one of those here is a silent no-op, exactly as
+    /// allowlisting `<script>` cannot re-enable it in the raw-HTML sanitizer.
+    ///
+    /// Enabling `file:` is only safe in a host that does not actually navigate
+    /// to the href (an Electron/extension UI that intercepts link clicks and
+    /// opens the path in an editor). Applies to links, URI autolinks, images,
+    /// and sanitized URL attributes alike.
+    pub fn set_allow_schemes(&mut self, schemes: Vec<String>) {
+        self.allow_schemes = schemes.into_iter().map(String::into_boxed_str).collect();
+    }
+
+    /// Builder form of [`Self::set_allow_schemes`].
+    pub fn with_allow_schemes(mut self, schemes: Vec<String>) -> Self {
+        self.set_allow_schemes(schemes);
         self
     }
 
@@ -2070,6 +2218,7 @@ impl StreamParser {
             math: self.gfm_math,
             component_tags: &self.component_tags,
             inline_component_tags: &self.inline_component_tags,
+            lenient_lists: self.lenient_lists,
         };
         let raw_blocks = scan(tail, ctx);
 
@@ -2128,6 +2277,8 @@ impl StreamParser {
             gfm_tagfilter: self.gfm_tagfilter,
             gfm_math: self.gfm_math,
             dir_auto: self.dir_auto,
+            lenient_lists: self.lenient_lists,
+            soft_breaks: self.soft_breaks,
             a11y: self.a11y,
             block_data: self.block_data,
             gfm_footnotes,
@@ -2147,6 +2298,8 @@ impl StreamParser {
             html_sanitize: self.html_sanitize,
             html_allowlist: self.html_allowlist.clone(),
             html_drop: self.html_drop.clone(),
+            block_html: self.block_html,
+            allow_schemes: self.allow_schemes.clone(),
         };
 
         // Parity load-bearer for speculative open-tail links. `one_shot_open(md)`
@@ -2164,7 +2317,13 @@ impl StreamParser {
 
         let mut produced: Vec<Block> = Vec::with_capacity(renderable.len());
         for (bi, raw) in renderable.iter().enumerate() {
-            let mut kind = classify(&raw.kind, &tail[raw.range.clone()], self.gfm_alerts);
+            let mut kind = classify(
+                &raw.kind,
+                &tail[raw.range.clone()],
+                self.gfm_alerts,
+                &self.allow_schemes,
+                finalizing,
+            );
             let mut html = String::with_capacity(64);
             // Per-block open_tail: the final block that abuts buffer EOF and is
             // not blank-line-closed. Clone opts with the flag set only for it.
@@ -2190,15 +2349,19 @@ impl StreamParser {
             // with an opt-in payload (Table, Heading) when block_data is on —
             // fold it onto the matching `Option` carrier field. Off ⇒ None ⇒ kind
             // unchanged (byte-identical wire).
-            match render_block(tail, raw, block_opts_ref, &mut html) {
+            // `tail_start` is `tail`'s absolute offset in the buffer, so the
+            // structured channel can stamp document-absolute source offsets
+            // (list items) that agree with the `Block::start` computed below.
+            match render_block(tail, raw, Some(tail_start), block_opts_ref, &mut html) {
                 Some(Enrichment::Table(td)) => kind = BlockKind::Table(Some(td)),
                 Some(Enrichment::Heading(h)) => {
                     kind = BlockKind::Heading { level: h.level, rich: Some(h) }
                 }
-                // CodeBlock keeps its classified `lang`; only `code` is folded on.
+                // CodeBlock keeps its classified `lang`/`meta`; only `code` is
+                // folded on.
                 Some(Enrichment::CodeBlock(code)) => {
-                    if let BlockKind::CodeBlock { lang, .. } = kind {
-                        kind = BlockKind::CodeBlock { lang, code: Some(Rc::new(code)) };
+                    if let BlockKind::CodeBlock { lang, meta, .. } = kind {
+                        kind = BlockKind::CodeBlock { lang, meta, code: Some(Rc::new(code)) };
                     }
                 }
                 Some(Enrichment::MathBlock(md)) => kind = BlockKind::MathBlock(Some(md)),
@@ -2843,11 +3006,16 @@ impl StreamParser {
                     }
                     if cache.has_body_line {
                         cache.escaped_lines.push('\n');
+                        if let Some(d) = &mut cache.decoded_lines {
+                            d.push('\n');
+                        }
                     }
                     cache.has_body_line = true;
-                    escape_html(
-                        std::str::from_utf8(&bytes[pos..content_end]).unwrap_or(""),
+                    push_fence_body_line(
+                        &bytes[pos..content_end],
+                        cache.fence_indent,
                         &mut cache.escaped_lines,
+                        cache.decoded_lines.as_mut(),
                     );
                     cache.lines_upto = next;
                     pos = next;
@@ -2882,7 +3050,10 @@ impl StreamParser {
             html.push('\n');
         }
         if !partial.is_empty() {
-            escape_html(std::str::from_utf8(partial).unwrap_or(""), &mut html);
+            // The partial starts at a line start, so it sheds the opener's
+            // indent exactly like a folded line does — O(partial), the same
+            // re-escape this line already paid.
+            push_fence_body_line(partial, cache.fence_indent, &mut html, None);
         }
         if cache.trim_body {
             // Math: trim the body's surrounding whitespace. Whitespace bytes survive
@@ -2915,7 +3086,25 @@ impl StreamParser {
         let kind = if self.block_data
             && matches!(cache.kind, BlockKind::CodeBlock { .. } | BlockKind::MathBlock(_))
         {
-            let raw_body = &self.buffer[cache.body_start..end];
+            // Flush-left opener: the HTML body is exactly `escape_html` of the
+            // buffer slice, so the decoded source IS that slice. An indented
+            // opener de-indents every line, so the slice no longer matches —
+            // assemble from the `decoded_lines` twin instead (already folded
+            // line-by-line), plus this append's short partial.
+            let deindented_body;
+            let raw_body: &str = match &cache.decoded_lines {
+                None => &self.buffer[cache.body_start..end],
+                Some(d) => {
+                    let mut s = String::with_capacity(d.len() + partial.len() + 2);
+                    s.push_str(d);
+                    if cache.has_body_line {
+                        s.push('\n');
+                    }
+                    crate::render::strip_cols_into(partial, cache.fence_indent, &mut s);
+                    deindented_body = s;
+                    &deindented_body
+                }
+            };
             let src = if cache.trim_body {
                 // Math: mirror the whitespace trim above (leading whitespace was
                 // already skipped at arm time via `body_start`).
@@ -2932,9 +3121,14 @@ impl StreamParser {
                 s
             };
             match &cache.kind {
-                BlockKind::CodeBlock { lang, .. } => {
-                    BlockKind::CodeBlock { lang: lang.clone(), code: Some(Rc::new(src)) }
-                }
+                // `lang`/`meta` were parsed ONCE from the opener line at arm time
+                // and live in `cache.kind`; the per-append re-emit is just a small
+                // `String` clone of each, never a re-parse of the info string.
+                BlockKind::CodeBlock { lang, meta, .. } => BlockKind::CodeBlock {
+                    lang: lang.clone(),
+                    meta: meta.clone(),
+                    code: Some(Rc::new(src)),
+                },
                 _ => BlockKind::MathBlock(Some(crate::blocks::MathBlockData {
                     latex: Rc::new(src),
                 })),
@@ -3021,10 +3215,11 @@ impl StreamParser {
         if !partial_blank && !indented_code_line(partial) {
             return None;
         }
-        // Assemble: <pre><code> + trim_end(body[+ "\n" + partial]) + "\n" +
-        // </code></pre>. Whitespace survives escape_html unchanged, so trimming
-        // the escaped output equals trimming the decoded source — exactly what
-        // render_indented_code does.
+        // Assemble: <pre><code> + chop_blank_lines(body[+ "\n" + partial]) + "\n"
+        // + </code></pre>. Whitespace survives escape_html unchanged, so chopping
+        // the escaped output equals chopping the decoded source — exactly what
+        // render_indented_code does (trailing blank LINES go; trailing spaces on
+        // the last content line stay — CommonMark example 118).
         let mut html = String::with_capacity(
             cache.escaped_lines.len() + partial.len() + 32,
         );
@@ -3037,9 +3232,9 @@ impl StreamParser {
             }
             push_indented_content(partial, &mut html);
         }
-        let trimmed = html.trim_end_matches([' ', '\t', '\n', '\r']).len();
-        html.truncate(trimmed.max(body_start));
-        // Opt-in structured channel: the decoded source is the trimmed body + "\n".
+        let trimmed = chop_trailing_blank_lines(&html[body_start..]).len();
+        html.truncate(body_start + trimmed);
+        // Opt-in structured channel: the decoded source is the chopped body + "\n".
         // The HTML body is `escape_html(decoded_lines [+ '\n' + stripped partial])`
         // with the same trailing trim, and whitespace passes `escape_html`
         // unchanged, so assembling from the RAW `decoded_lines` twin is
@@ -3055,12 +3250,13 @@ impl StreamParser {
                 }
                 code.push_str(std::str::from_utf8(indented_strip(partial)).unwrap_or(""));
             }
-            let t = code.trim_end_matches([' ', '\t', '\n', '\r']).len();
+            let t = chop_trailing_blank_lines(&code).len();
             code.truncate(t);
             code.push('\n');
-            BlockKind::CodeBlock { lang: None, code: Some(Rc::new(code)) }
+            // Indented code has no info string — never a lang or meta.
+            BlockKind::CodeBlock { lang: None, meta: None, code: Some(Rc::new(code)) }
         } else {
-            BlockKind::CodeBlock { lang: None, code: None }
+            BlockKind::CodeBlock { lang: None, meta: None, code: None }
         };
         html.push('\n');
         html.push_str("</code></pre>");
@@ -3080,15 +3276,19 @@ impl StreamParser {
 
     /// O(new bytes) extension of a long open raw-HTML block at the tail. Folds
     /// each newly-complete line into the cached prefix (pass-through or escaped)
-    /// and re-processes only the trailing partial. Returns `None` (dropping the
-    /// cache) the moment the block's type-specific close condition is met (so the
-    /// full reparse closes + commits it), or on a `\r`.
+    /// — or, in sanitize mode, each newly-complete TOKEN — and re-processes only
+    /// the trailing partial. Returns `None` (dropping the cache) the moment the
+    /// block's type-specific close condition is met (so the full reparse closes +
+    /// commits it), or on a `\r`.
     fn try_incremental_html(&mut self) -> Option<Patch> {
         let mut cache = self.html_cache.take()?;
-        // The pass-through decision must still hold (options don't change mid-
-        // stream, but stay defensive: a changed setting voids the cache).
+        // The pass-through / sanitize decisions must still hold (options don't
+        // change mid-stream, but stay defensive: a changed setting voids the
+        // cache).
         if cache.pass_through != (self.unsafe_html && !self.html_sanitize)
             || cache.tagfilter != (cache.pass_through && self.gfm_tagfilter)
+            || cache.sanitize
+                != html_block_sanitizes(self.block_html, self.html_sanitize, cache.html_type)
         {
             return None;
         }
@@ -3117,12 +3317,16 @@ impl StreamParser {
                     if html_block_closes_here(line, html_type, &bytes[pos..content_end]) {
                         return None;
                     }
-                    fold_html_line(
-                        &bytes[pos..next],
-                        cache.pass_through,
-                        cache.tagfilter,
-                        &mut cache.cached_prefix,
-                    );
+                    // Sanitize mode folds at token boundaries after this loop —
+                    // a tag spans lines, so there is no per-line output here.
+                    if !cache.sanitize {
+                        fold_html_line(
+                            &bytes[pos..next],
+                            cache.pass_through,
+                            cache.tagfilter,
+                            &mut cache.cached_prefix,
+                        );
+                    }
                     cache.lines_upto = next;
                     pos = next;
                 }
@@ -3138,7 +3342,34 @@ impl StreamParser {
             return None;
         }
         let mut html = String::with_capacity(cache.cached_prefix.len() + partial.len() + 32);
-        if cache.pass_through {
+        if cache.sanitize {
+            // Token fold: only the bytes past `tokens_upto` are sanitized, and
+            // only complete tokens/settled text advance it. The lists are
+            // borrowed (no per-append clone) via the same `HtmlPolicy` the full
+            // path projects out of its `RenderOpts`.
+            let policy = HtmlPolicy {
+                allowlist: &self.html_allowlist,
+                drop: &self.html_drop,
+                allow_schemes: &self.allow_schemes,
+            };
+            cache.tokens_upto = fold_block_html(
+                &self.buffer,
+                cache.tokens_upto,
+                policy,
+                &mut cache.open_tags,
+                &mut cache.cached_prefix,
+            );
+            // The region past `tokens_upto` is a still-streaming `<…`: suppressed
+            // (pending-invisible), exactly as the full path renders the open tail.
+            // Trailing newlines are not content; the closers and the block's
+            // single `\n` follow them. Same assembled shape as the full path's
+            // `render_sanitized_html_block`.
+            html.push_str(&cache.cached_prefix);
+            let trimmed = html.trim_end_matches(['\n', '\r']).len();
+            html.truncate(trimmed);
+            push_html_closers(&cache.open_tags, &mut html);
+            html.push('\n');
+        } else if cache.pass_through {
             // Pass-through: prefix + partial verbatim, trailing newlines trimmed,
             // then a single `\n` (matches render_html_block's pass-through). With
             // the tagfilter on, the partial is filtered per append (end-of-chunk
@@ -3200,6 +3431,8 @@ impl StreamParser {
             gfm_tagfilter: self.gfm_tagfilter,
             gfm_math: self.gfm_math,
             dir_auto: self.dir_auto,
+            lenient_lists: self.lenient_lists,
+            soft_breaks: self.soft_breaks,
             a11y: self.a11y,
             block_data: self.block_data,
             gfm_footnotes: self.gfm_footnotes,
@@ -3218,6 +3451,8 @@ impl StreamParser {
             html_sanitize: self.html_sanitize,
             html_allowlist: self.html_allowlist.clone(),
             html_drop: self.html_drop.clone(),
+            block_html: self.block_html,
+            allow_schemes: self.allow_schemes.clone(),
         }
     }
 
@@ -3231,21 +3466,35 @@ impl StreamParser {
             math: self.gfm_math,
             component_tags: &self.component_tags,
             inline_component_tags: &self.inline_component_tags,
+            lenient_lists: self.lenient_lists,
         };
         let bytes = self.buffer.as_bytes();
         let len = bytes.len();
-        // The paragraph must still be the tail (only whitespace before it) and
-        // must still run to EOF (no blank line / interrupting block / setext
-        // underline appeared after the committed cut).
+        // The paragraph must still be the tail (only whitespace before it).
         if cache.start < self.committed_offset
             || bytes[self.committed_offset..cache.start]
                 .iter()
                 .any(|&b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
-            || paragraph_ends_before_eof(bytes, cache.cut, ctx)
         {
             return None;
         }
-        let mut content_end = len;
+        // …and must still run to EOF (no blank line / interrupting block /
+        // setext underline appeared after the committed cut). One end is
+        // TRANSIENT and gets suspended instead of dropped: see
+        // [`ParaEnd::OpenBlank`]. Keep the cache and render the paragraph as it
+        // stands, stopping at that line — byte-for-byte the closed view the full
+        // path produces.
+        let mut suspended = false;
+        let mut block_end = len;
+        match paragraph_end(bytes, cache.cut, ctx) {
+            ParaEnd::No => {}
+            ParaEnd::OpenBlank(s) => {
+                suspended = true;
+                block_end = s;
+            }
+            ParaEnd::Settled => return None,
+        }
+        let mut content_end = block_end;
         while content_end > cache.start && matches!(bytes[content_end - 1], b'\n' | b'\r') {
             content_end -= 1;
         }
@@ -3258,12 +3507,21 @@ impl StreamParser {
             cache.fn_nums.extend(&self.buffer, content_end, &self.committed_footnotes);
         }
         let opts = self.build_inline_opts(&cache.fn_nums);
+        // While suspended the paragraph no longer abuts buffer EOF (the blank
+        // line follows it), so the full path renders it with `open_tail` OFF —
+        // an incomplete `[x](`/`` `code ``/`$math` at its end is literal, not
+        // speculative. Match that or the suspended view diverges. The frozen
+        // `committed_inner` is unaffected either way: every open-tail
+        // speculation site marks `unstable`, and `compute_cut` never returns a
+        // cut past `unstable`, so no construct in `[start, cut)` ever reached a
+        // slice end unresolved.
+        let opts = if suspended { RenderOpts { open_tail: false, ..opts } } else { opts };
         // Render the active region and learn how far of it is now settled — past
         // closed emphasis / code spans / inline links, but not an unpaired opener
         // or unclosed construct. `boundary_rel` is relative to the active slice.
         let mut active = String::new();
         let boundary_rel =
-            render_inline_boundary(&self.buffer[cache.cut..content_end], &opts, &mut active);
+            render_inline_para_boundary(&self.buffer[cache.cut..content_end], &opts, &mut active);
         let new_cut = cache.cut + boundary_rel;
         if new_cut > cache.cut {
             // Commit [cut..new_cut] by rendering that segment on its own — a clean
@@ -3272,11 +3530,11 @@ impl StreamParser {
             // segment's footnote tokens into `committed_inner`, advancing the
             // frozen-prefix occurrence map (resolve-on-commit; never re-touched).
             let mut seg = String::new();
-            render_inline(&self.buffer[cache.cut..new_cut], &opts, &mut seg);
+            render_inline_para(&self.buffer[cache.cut..new_cut], &opts, &mut seg);
             resolve_footnote_ids(&seg, &mut cache.fn_occ, &mut cache.committed_inner);
             cache.cut = new_cut;
             active.clear();
-            render_inline(&self.buffer[cache.cut..content_end], &opts, &mut active);
+            render_inline_para(&self.buffer[cache.cut..content_end], &opts, &mut active);
         }
         // Resolve the speculative active tail per-append from a discarded
         // OVERLAY seeded lazily from the frozen-prefix occurrence map (does NOT
@@ -3314,7 +3572,13 @@ impl StreamParser {
             id: cache.id,
             kind: BlockKind::Paragraph,
             start: cache.start,
-            end: len,
+            // While suspended the block stops at the trailing blank line, exactly
+            // like the raw block the full scan produces. It stays open +
+            // speculative either way — the full path does NOT commit a paragraph
+            // at a trailing whitespace-only line (verified: a blank line only
+            // settles it once a following block arrives), which is what makes
+            // resuming safe: nothing a consumer was told is final gets retracted.
+            end: block_end,
             html,
             open: true,
             speculative: true,
@@ -3584,6 +3848,7 @@ impl StreamParser {
             math: self.gfm_math,
             component_tags: &self.component_tags,
             inline_component_tags: &self.inline_component_tags,
+            lenient_lists: self.lenient_lists,
         };
         // Build inline opts once for the whole append: the same shared RenderOpts
         // backs cached-row rendering and the speculative partial-row render. The
@@ -3634,7 +3899,7 @@ impl StreamParser {
             }
             let cells = split_table_cells(line_str);
             if !cache.tbody_opened {
-                cache.cached_prefix.push_str("<tbody>");
+                cache.cached_prefix.push_str("<tbody>\n");
                 cache.tbody_opened = true;
             }
             // Render the row into a scratch buffer (placeholder tokens when
@@ -3645,7 +3910,7 @@ impl StreamParser {
             // overlay seeded lazily off it (same pre-row counts as the old
             // full-map clone, without copying the growing map).
             let mut row_html = String::with_capacity(line_str.len() + 16);
-            row_html.push_str("<tr>");
+            row_html.push_str("<tr>\n");
             let mut row: Vec<TableCell> = Vec::new();
             for i in 0..cache.ncol {
                 let cell = push_table_cell(
@@ -3659,7 +3924,7 @@ impl StreamParser {
                     row.push(c);
                 }
             }
-            row_html.push_str("</tr>");
+            row_html.push_str("</tr>\n");
             // Structured channel: fold this committed row's cells in lock-step
             // with its `<tr>` — once folded it's never re-rendered (HTML
             // invariant). Resolved first (pre-advance `fn_occ` = the row's seed).
@@ -3707,7 +3972,7 @@ impl StreamParser {
                 if !line_str.trim().is_empty() {
                     let cells = split_table_cells(line_str);
                     let mut raw_partial = String::with_capacity(line_str.len() + 16);
-                    raw_partial.push_str("<tr>");
+                    raw_partial.push_str("<tr>\n");
                     let mut row: Vec<TableCell> = Vec::new();
                     for i in 0..cache.ncol {
                         let cell = push_table_cell(
@@ -3721,7 +3986,7 @@ impl StreamParser {
                             row.push(c);
                         }
                     }
-                    raw_partial.push_str("</tr>");
+                    raw_partial.push_str("</tr>\n");
                     // Resolve the speculative partial row from a discarded
                     // OVERLAY over the frozen-prefix occurrence map (does NOT
                     // advance it and never clones the growing map). Byte-copy
@@ -3758,11 +4023,11 @@ impl StreamParser {
         );
         html.push_str(&cache.cached_prefix);
         if need_tbody_for_partial {
-            html.push_str("<tbody>");
+            html.push_str("<tbody>\n");
         }
         html.push_str(&partial_html);
         if cache.tbody_opened || need_tbody_for_partial {
-            html.push_str("</tbody>");
+            html.push_str("</tbody>\n");
         }
         html.push_str("</table>");
 
@@ -3912,7 +4177,7 @@ impl StreamParser {
 
         // Assemble the speculative row: frozen cells + the open cell + empty
         // padding to `ncol` (extra cells were counted but never rendered).
-        out.push_str("<tr>");
+        out.push_str("<tr>\n");
         out.push_str(&p.html);
         if p.ncells < cache.ncol {
             push_table_cell_open("td", cache.aligns.get(p.ncells), opts, out);
@@ -3956,12 +4221,14 @@ impl StreamParser {
             } else {
                 out.push_str(&active);
             }
-            out.push_str("</td>");
+            // The open cell's own line terminator — `push_table_cell` supplies
+            // it for every other cell; this one is assembled by hand.
+            out.push_str("</td>\n");
             for i in p.ncells + 1..cache.ncol {
                 push_table_cell("td", "", cache.aligns.get(i), opts, out);
             }
         }
-        out.push_str("</tr>");
+        out.push_str("</tr>\n");
         true
     }
 
@@ -4000,7 +4267,7 @@ impl StreamParser {
         // Fold every newly-complete `> `-marker line. A blank `>` line closes
         // the current paragraph (rendered once into `committed_paras_html`)
         // and starts a fresh one; a marker-less line that the scanner keeps as a
-        // LAZY paragraph continuation glues onto the previous line; any other
+        // LAZY paragraph continuation is re-emitted at `LAZY_INDENT`; any other
         // line is folded into the current paragraph's `inner_buffer`. Bails on
         // `\r` or a marker-less line that ends the quote.
         let mut pos = cache.lines_upto;
@@ -4030,15 +4297,12 @@ impl StreamParser {
                     {
                         return None;
                     }
-                    // Glue exactly like `blockquote_inner`: the previous line's
-                    // `\n` becomes a single space and the lazy line is
-                    // left-trimmed, so the re-scan can't reinterpret it as a new
-                    // block and a soft break renders as a space anyway.
-                    let lazy = std::str::from_utf8(line).ok()?.trim_start();
+                    // Emit exactly like `blockquote_inner`: the lazy line keeps
+                    // its own line (the soft break is a `\n`) at `LAZY_INDENT`
+                    // columns, which is what stops the re-scan reinterpreting it
+                    // as a new block.
                     debug_assert!(cache.inner_buffer.ends_with('\n'));
-                    cache.inner_buffer.pop();
-                    cache.inner_buffer.push(' ');
-                    cache.inner_buffer.push_str(lazy);
+                    push_lazy_line(&mut cache.inner_buffer, std::str::from_utf8(line).ok()?);
                     cache.inner_buffer.push('\n');
                     cache.lines_upto = next;
                     pos = next;
@@ -4079,7 +4343,6 @@ impl StreamParser {
         // see the same committed state.
         let partial = &bytes[cache.lines_upto..end];
         let mut partial_pushed = 0usize;
-        let mut partial_glued = false;
         if !partial.is_empty() {
             if partial.contains(&b'\r') {
                 return None;
@@ -4114,18 +4377,14 @@ impl StreamParser {
                 return None;
             } else {
                 // Speculative LAZY continuation, mirroring the one-shot scan of
-                // this exact prefix: glue like the complete-line path (the
-                // previous `\n` becomes a space). Truncated back — and the `\n`
-                // restored — after rendering, so committed state is unchanged.
-                let lazy = std::str::from_utf8(partial).ok()?.trim_start();
+                // this exact prefix: emitted like the complete-line path, minus
+                // the terminator it hasn't grown yet. Truncated back after
+                // rendering, so committed state is unchanged — and since the
+                // previous line's `\n` is no longer consumed, nothing has to be
+                // put back.
                 debug_assert!(cache.inner_buffer.ends_with('\n'));
-                cache.inner_buffer.pop();
-                cache.inner_buffer.push(' ');
-                cache.inner_buffer.push_str(lazy);
-                // Counts the replaced `\n` too, so `committed_inner_end` lands
-                // just before the glue space.
-                partial_pushed = lazy.len() + 1;
-                partial_glued = true;
+                partial_pushed =
+                    push_lazy_line(&mut cache.inner_buffer, std::str::from_utf8(partial).ok()?);
             }
         }
         let post_partial_len = cache.inner_buffer.len();
@@ -4143,11 +4402,11 @@ impl StreamParser {
         // and footnote occurrence advance are unchanged.
         let active_slice = trim_trailing_newlines(&cache.inner_buffer[cache.inner_cut..]);
         let mut active_html = String::new();
-        let boundary_rel = render_inline_boundary(active_slice, &opts, &mut active_html);
+        let boundary_rel = render_inline_para_boundary(active_slice, &opts, &mut active_html);
         let new_cut = (cache.inner_cut + boundary_rel).min(committed_inner_end);
         if new_cut > cache.inner_cut {
             let mut seg = String::new();
-            render_inline(&cache.inner_buffer[cache.inner_cut..new_cut], &opts, &mut seg);
+            render_inline_para(&cache.inner_buffer[cache.inner_cut..new_cut], &opts, &mut seg);
             // Resolve the just-settled segment into the open paragraph's frozen
             // prefix, advancing its (discard-on-close) occurrence overlay.
             resolve_footnote_ids_overlay(
@@ -4158,7 +4417,7 @@ impl StreamParser {
             );
             cache.inner_cut = new_cut;
             active_html.clear();
-            render_inline(
+            render_inline_para(
                 trim_trailing_newlines(&cache.inner_buffer[cache.inner_cut..]),
                 &opts,
                 &mut active_html,
@@ -4221,28 +4480,20 @@ impl StreamParser {
             // the full renderer, which emits no body sub-block for an empty
             // inner — true whether or not closed paragraphs precede it).
             html.truncate(body_p_start);
-            // …and if there are NO closed paragraphs either, the body is totally
-            // empty: a blockquote's wrapper_open carries the conditional
-            // body-leading `\n` (`render_blockquote`'s `if !sub.is_empty()`), which
-            // must then vanish → `<blockquote></blockquote>` not
-            // `<blockquote>\n</blockquote>`. (An alert's `\n` is its title
-            // separator and always stays.)
-            if cache.body_leading_nl && cache.committed_paras_html.is_empty() {
-                debug_assert!(html.ends_with('\n'));
-                html.pop();
-            }
+            // The body-leading `\n` baked into `wrapper_open` STAYS even when the
+            // body is totally empty: `render_blockquote` opens with cmark's
+            // unconditional `cr()`, so an empty quote is `<blockquote>\n</blockquote>`
+            // (examples 218, 239, 240) — and an alert's `\n` is its title
+            // separator, which always stayed.
         } else {
             html.push_str(&cache.body_p_close);
         }
         html.push_str(&cache.wrapper_close);
 
         // Drop the speculative partial bytes so the cache's committed state is
-        // unchanged for the next append (a glued lazy partial also consumed the
-        // previous line's `\n` — put it back).
+        // unchanged for the next append. Every partial shape appends only —
+        // none consumes a committed byte — so the truncate alone restores it.
         cache.inner_buffer.truncate(committed_inner_end);
-        if partial_glued {
-            cache.inner_buffer.push('\n');
-        }
 
         // Assemble the opt-in `nested` channel: the stable committed paragraphs
         // (O(paras) Rc refcount bumps) plus the current open paragraph.
@@ -4489,7 +4740,7 @@ impl StreamParser {
                             cache.settled.push_str(&cache.wrapper_open);
                             cache.settled.push('\n');
                             cache.settled.push_str(&body);
-                            cache.settled.push('\n');
+                            cr(&mut cache.settled);
                         }
                         cache.open_depth = want;
                         cache.open = self.make_nested_parser();
@@ -4554,6 +4805,8 @@ impl StreamParser {
         inner.gfm_footnotes = false;
         inner.gfm_math = self.gfm_math;
         inner.dir_auto = self.dir_auto;
+        inner.lenient_lists = self.lenient_lists;
+        inner.soft_breaks = self.soft_breaks;
         inner.a11y = self.a11y;
         inner.block_data = false;
         inner.component_tags = self.component_tags.clone();
@@ -4561,6 +4814,8 @@ impl StreamParser {
         inner.html_sanitize = self.html_sanitize;
         inner.html_allowlist = self.html_allowlist.clone();
         inner.html_drop = self.html_drop.clone();
+        inner.block_html = self.block_html;
+        inner.allow_schemes = self.allow_schemes.clone();
         inner.committed_refs = Rc::new((*self.committed_refs).clone());
         inner.force_open_tail = true;
         inner.container_depth = self.container_depth + 1;
@@ -4751,7 +5006,10 @@ impl StreamParser {
         } else {
             &cache.inner
         };
-        let html = assemble_wrapped_body(&cache.wrapper_open, true, body, &cache.wrapper_close);
+        // `false`: a component keeps `render_component`'s `!sub.is_empty()`
+        // guard, so an empty body stays `<Tag></Tag>` (only `<blockquote>` opens
+        // unconditionally).
+        let html = assemble_wrapped_body(&cache.wrapper_open, false, body, &cache.wrapper_close);
         let block = Block {
             id: cache.id,
             kind: cache.kind.clone(),
@@ -4789,7 +5047,7 @@ impl StreamParser {
         // Wrapper opener, byte-identical to `render_component`.
         let slice = &self.buffer[start..end];
         let open = slice.trim_start_matches([' ', '\t']);
-        let attrs = sanitize_attrs(open);
+        let attrs = sanitize_attrs(open, &self.allow_schemes);
         let mut wrapper_open = String::with_capacity(tag.len() + 16);
         wrapper_open.push('<');
         wrapper_open.push_str(tag);
@@ -4818,6 +5076,8 @@ impl StreamParser {
         inner.gfm_footnotes = false;
         inner.gfm_math = self.gfm_math;
         inner.dir_auto = self.dir_auto;
+        inner.lenient_lists = self.lenient_lists;
+        inner.soft_breaks = self.soft_breaks;
         inner.a11y = self.a11y;
         inner.block_data = false;
         inner.component_tags = self.component_tags.clone();
@@ -4825,6 +5085,8 @@ impl StreamParser {
         inner.html_sanitize = self.html_sanitize;
         inner.html_allowlist = self.html_allowlist.clone();
         inner.html_drop = self.html_drop.clone();
+        inner.block_html = self.block_html;
+        inner.allow_schemes = self.allow_schemes.clone();
         inner.committed_refs = Rc::new((*self.committed_refs).clone());
         inner.force_open_tail = true;
         inner.container_depth = self.container_depth + 1;
@@ -5017,6 +5279,13 @@ impl StreamParser {
             return None;
         }
         cache.scanned_upto = len;
+        // Everything re-emitted here is FROZEN — no part of the growing opener
+        // line is re-derived per append (that would be quadratic in the line
+        // length; `fence_opener_line_growth_is_wall_linear` gates it). The kind's
+        // `meta` is `None` for as long as this cache is armed, and provably so:
+        // `classify` only fills `meta` once the opener line has its `\n` or the
+        // stream is finalizing, and this cache is armed only while the line holds
+        // NO newline (it bails on one) and never during finalize.
         let block = Block {
             id: cache.id,
             kind: cache.kind.clone(),
@@ -5159,7 +5428,7 @@ impl StreamParser {
                     cache.prev_blank = false;
                 }
                 cache.item_empty = false;
-            } else if let Some(m) = scan_marker(line) {
+            } else if let Some(m) = scan_marker(line, opts.scan_ctx()) {
                 if ind <= c_edge + 3 && same_family(&m) {
                     // SIBLING: the current open item [open_item_start..pos] is now
                     // complete. A blank between siblings — or a §5.3 "directly
@@ -5180,6 +5449,7 @@ impl StreamParser {
                         let s = cache.open_item_start;
                         fold_item_body(
                             &bytes[s..pos],
+                            s,
                             cache.loose,
                             &opts,
                             &mut cache.cached_prefix,
@@ -5247,7 +5517,7 @@ impl StreamParser {
                     }
                     cache.item_blank = true;
                 }
-            } else if let Some(m) = scan_marker(partial) {
+            } else if let Some(m) = scan_marker(partial, opts.scan_ctx()) {
                 if p_ind <= c_edge + 3 && same_family(&m) {
                     partial_is_sibling = true;
                 } else {
@@ -5287,6 +5557,7 @@ impl StreamParser {
             let mut partial_over: HashMap<String, usize> = HashMap::new();
             fold_item_body(
                 &bytes[cache.open_item_start..cache.lines_upto],
+                cache.open_item_start,
                 cache.loose,
                 &opts,
                 &mut partial_html,
@@ -5296,6 +5567,7 @@ impl StreamParser {
             )?;
             fold_item_body(
                 partial,
+                cache.lines_upto,
                 cache.loose,
                 &opts,
                 &mut partial_html,
@@ -5354,6 +5626,7 @@ impl StreamParser {
                 let mut partial_over: HashMap<String, usize> = HashMap::new();
                 fold_item_body(
                     &bytes[cache.open_item_start..end],
+                    cache.open_item_start,
                     cache.loose,
                     &opts,
                     &mut partial_html,
@@ -5476,7 +5749,13 @@ impl StreamParser {
         // A complete first line settles the marker + content byte.
         let nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
         let first_line_end = start + nl + 1;
-        let m = scan_marker(&bytes[start..first_line_end])?;
+        let ctx = ScanCtx {
+            math: self.gfm_math,
+            component_tags: &self.component_tags,
+            inline_component_tags: &self.inline_component_tags,
+            lenient_lists: self.lenient_lists,
+        };
+        let m = scan_marker(&bytes[start..first_line_end], ctx)?;
         if m.content_indent != cache.cur_ci {
             return None;
         }
@@ -5486,7 +5765,12 @@ impl StreamParser {
         // so the complete first line always decides.)
         let content = &bytes[start + m.content_byte..first_line_end];
         let mut task = None;
-        if content.len() >= 4 && content[0] == b'[' && content[2] == b']' && content[3] == b' ' {
+        // `m.content_overflow > 0` means the body opens with re-materialized
+        // spaces (a tab-padded marker), so `render_item_body` sees whitespace at
+        // byte 0 and finds no checkbox — match that, or the two paths diverge.
+        if m.content_overflow == 0
+            && content.len() >= 4
+            && content[0] == b'[' && content[2] == b']' && content[3] == b' ' {
             match content[1] {
                 b' ' => task = Some(false),
                 b'x' | b'X' => task = Some(true),
@@ -5502,7 +5786,10 @@ impl StreamParser {
             // "indent" is the marker itself — already consumed), exactly
             // `item_body`'s first-line handling.
             fed_outer: start + m.content_byte + if task.is_some() { 4 } else { 0 },
-            held_ws: String::new(),
+            // The marker's unrepresentable columns are not in the buffer, so
+            // they seed the held-whitespace run — which flushes ahead of the
+            // first content bytes, exactly `item_body`'s leading spaces.
+            held_ws: " ".repeat(m.content_overflow),
             mid_line: true,
             para_start: usize::MAX,
             para_cut: 0,
@@ -5541,6 +5828,7 @@ fn rebuild_loose(cache: &mut ListCache, bytes: &[u8], opts: &RenderOpts) -> Opti
     for &(s, e) in &spans {
         if fold_item_body(
             &bytes[s..e],
+            s,
             true,
             opts,
             &mut cache.cached_prefix,
@@ -5636,7 +5924,25 @@ fn strip_container_delta(
             if i >= end {
                 break; // bare `>` at EOF — wait to resolve the optional space
             }
-            if bytes[i] == b' ' {
+            // §2.2 twin of `quote_tab_content`: the marker's optional space is
+            // one COLUMN, so a tab here is only partly consumed and the whole
+            // whitespace run re-materializes as spaces (example 6).
+            let mut lead_spaces = 0usize;
+            if bytes[i] == b'\t' {
+                let mut col = sp + 1;
+                while i < end {
+                    match bytes[i] {
+                        b' ' => col += 1,
+                        b'\t' => col += 4 - (col % 4),
+                        _ => break,
+                    }
+                    i += 1;
+                }
+                if i >= end {
+                    break; // run still growing — its width isn't settled yet
+                }
+                lead_spaces = col - (sp + 2);
+            } else if bytes[i] == b' ' {
                 i += 1;
             }
             let cs = i;
@@ -5645,6 +5951,9 @@ fn strip_container_delta(
                     if bytes[cs..ce].contains(&b'\r') {
                         return None;
                     }
+                    for _ in 0..lead_spaces {
+                        delta.push(' ');
+                    }
                     delta.push_str(std::str::from_utf8(&bytes[cs..ce]).ok()?);
                     delta.push('\n');
                     pos = ce + 1;
@@ -5652,6 +5961,9 @@ fn strip_container_delta(
                 None => {
                     if bytes[cs..end].contains(&b'\r') {
                         return None;
+                    }
+                    for _ in 0..lead_spaces {
+                        delta.push(' ');
                     }
                     delta.push_str(std::str::from_utf8(&bytes[cs..end]).ok()?);
                     pos = end;
@@ -5677,9 +5989,10 @@ fn strip_container_delta(
 }
 
 /// Assemble a [`ContainerBlockCache`]'s active-block HTML: wrapper opener, the
-/// `\n`-joined inner sub-block fragments (each nested block's `.html` is exactly
-/// `render_block`'s output, with no trailing `\n`), and the wrapper closer —
-/// byte-identical to `render_blockquote` / `render_alert`.
+/// `cr()`-separated inner sub-block fragments (each nested block's `.html` is
+/// exactly `render_block`'s output — usually with no trailing `\n`, though a raw
+/// HTML block carries its own, which `cr()` must not double), and the wrapper
+/// closer — byte-identical to `render_blockquote` / `render_alert`.
 fn assemble_container_block(cache: &ContainerBlockCache) -> String {
     assemble_wrapped_body(
         &cache.wrapper_open,
@@ -5695,9 +6008,7 @@ fn assemble_container_block(cache: &ContainerBlockCache) -> String {
 fn dq_collect(open: &StreamParser) -> String {
     let mut s = String::new();
     for b in open.all_blocks() {
-        if !s.is_empty() {
-            s.push('\n');
-        }
+        cr(&mut s);
         s.push_str(&b.html);
     }
     s
@@ -5706,18 +6017,19 @@ fn dq_collect(open: &StreamParser) -> String {
 /// Assemble a [`DeepQuoteCache`]'s active-block HTML: the frozen settled-level
 /// openers, then the deepest (open) level's `<blockquote>` + prose paragraph, then
 /// one `</blockquote>` per level joined by `\n` — byte-identical to the nested
-/// `render_blockquote` chain, which wraps its body in a leading `\n` (non-empty
-/// body) and a `\n` after every sub-block before the closer (so the deepest
-/// paragraph's trailing `\n` is present whether or not its line is complete).
+/// `render_blockquote` chain, which opens its body with an unconditional `\n`
+/// (an empty quote is still `<blockquote>\n</blockquote>`) and `cr()`s after
+/// every sub-block before the closer (so the deepest paragraph's trailing `\n`
+/// is present whether or not its line is complete).
 fn assemble_deep_quote(cache: &DeepQuoteCache) -> String {
     let body = dq_collect(&cache.open);
     let mut html = String::with_capacity(cache.settled.len() + body.len() + 32 + cache.open_depth * 14);
     html.push_str(&cache.settled);
     html.push_str(&cache.wrapper_open);
+    html.push('\n');
     if !body.is_empty() {
-        html.push('\n');
         html.push_str(&body);
-        html.push('\n');
+        cr(&mut html);
     }
     for i in 0..cache.open_depth {
         if i > 0 {
@@ -5728,14 +6040,17 @@ fn assemble_deep_quote(cache: &DeepQuoteCache) -> String {
     html
 }
 
-/// Assemble a wrapper + nested-parser body: wrapper opener, a leading `\n` iff
-/// `body_leading_nl` and the body is non-empty (`render_blockquote` /
-/// `render_component`'s `!sub.is_empty()` newline; an alert's title line already
-/// supplied its separator), the inner sub-blocks each followed by `\n`, and the
-/// wrapper closer.
+/// Assemble a wrapper + nested-parser body: wrapper opener, the body-leading
+/// `cr()`, the inner sub-blocks each followed by `cr()`, and the wrapper closer.
+///
+/// `lead_when_empty` picks which container's empty-body rule applies:
+/// `render_blockquote` opens with an UNCONDITIONAL `\n` (`<blockquote>\n</blockquote>`
+/// for an empty quote), while `render_component` keeps its `!sub.is_empty()`
+/// guard (`<Tag></Tag>`). An alert passes either — its opener is the title line,
+/// which already ends in `\n`, so the `cr()` is a no-op.
 fn assemble_wrapped_body(
     wrapper_open: &str,
-    body_leading_nl: bool,
+    lead_when_empty: bool,
     inner: &StreamParser,
     wrapper_close: &str,
 ) -> String {
@@ -5744,12 +6059,12 @@ fn assemble_wrapped_body(
     let mut html =
         String::with_capacity(wrapper_open.len() + 1 + body_len + wrapper_close.len());
     html.push_str(wrapper_open);
-    if body_leading_nl && !blocks.is_empty() {
-        html.push('\n');
+    if lead_when_empty || !blocks.is_empty() {
+        cr(&mut html);
     }
     for b in &blocks {
         html.push_str(&b.html);
-        html.push('\n');
+        cr(&mut html);
     }
     html.push_str(wrapper_close);
     html
@@ -5976,6 +6291,31 @@ fn strip_blockquote_marker(line: &[u8]) -> Option<&[u8]> {
     Some(&line[i..])
 }
 
+/// Fold ONE fence body line into the cache buffers: shed the opener's indent
+/// (§4.5), escape into `escaped`, and mirror the same de-indented RAW bytes into
+/// `decoded` when the `block_data` twin is live. O(line) — the de-indent is a
+/// bounded (≤3-column) walk at the line's head, paid once as the line folds in,
+/// never on a later append.
+fn push_fence_body_line(
+    line: &[u8],
+    indent: usize,
+    escaped: &mut String,
+    decoded: Option<&mut String>,
+) {
+    let (spaces, rest) = if indent == 0 { (0, line) } else { split_cols(line, indent) };
+    let rest = std::str::from_utf8(rest).unwrap_or("");
+    for _ in 0..spaces {
+        escaped.push(' ');
+    }
+    escape_html(rest, escaped);
+    if let Some(d) = decoded {
+        for _ in 0..spaces {
+            d.push(' ');
+        }
+        d.push_str(rest);
+    }
+}
+
 /// Build the incremental cache for an open code fence at `start`, walking its
 /// body once. Returns `None` (no caching) if the body isn't plain — any `\r`
 /// or fence-looking line — so those keep going through the full renderer.
@@ -5991,7 +6331,9 @@ fn build_code_fence_cache(
     // Body begins after the opener line's newline; bail if it hasn't arrived.
     let nl = bytes[start..end].iter().position(|&b| b == b'\n')?;
     let body_start = start + nl + 1;
+    let indent = fence_indent(&bytes[start..body_start]);
     let mut escaped_lines = String::new();
+    let mut decoded_lines = if indent > 0 { Some(String::new()) } else { None };
     let mut has_body_line = false;
     let mut lines_upto = body_start;
     let mut pos = body_start;
@@ -6006,11 +6348,16 @@ fn build_code_fence_cache(
                 }
                 if has_body_line {
                     escaped_lines.push('\n');
+                    if let Some(d) = &mut decoded_lines {
+                        d.push('\n');
+                    }
                 }
                 has_body_line = true;
-                escape_html(
-                    std::str::from_utf8(&bytes[pos..content_end]).unwrap_or(""),
+                push_fence_body_line(
+                    &bytes[pos..content_end],
+                    indent,
                     &mut escaped_lines,
+                    decoded_lines.as_mut(),
                 );
                 lines_upto = next;
                 pos = next;
@@ -6031,7 +6378,9 @@ fn build_code_fence_cache(
         close: FenceClose::CodeFence,
         trim_body: false,
         body_start,
+        fence_indent: indent,
         escaped_lines,
+        decoded_lines,
         has_body_line,
         lines_upto,
     })
@@ -6109,6 +6458,10 @@ fn build_math_fence_cache(buffer: &str, start: usize, id: u64, kind: BlockKind) 
         close: FenceClose::MathCloser(closer),
         trim_body: true,
         body_start,
+        // `$$…$$` / `\[…\]` are not CommonMark fences and carry no §4.5
+        // de-indent; the body path stays a verbatim buffer slice.
+        fence_indent: 0,
+        decoded_lines: None,
         escaped_lines,
         has_body_line,
         lines_upto,
@@ -6165,7 +6518,7 @@ fn build_table_cache(
     let mut raw_prefix = String::with_capacity(64 + ncol * 32);
     raw_prefix.push_str("<table");
     raw_prefix.push_str(opts.dir());
-    raw_prefix.push_str("><thead><tr>");
+    raw_prefix.push_str(">\n<thead>\n<tr>\n");
     // Structured channel: capture the header cells at the exact step the `<th>`s
     // are written, from the same `push_table_cell` (so DATA matches HTML).
     let mut td_header_cells: Vec<TableCell> = Vec::new();
@@ -6181,7 +6534,7 @@ fn build_table_cache(
             td_header_cells.push(c);
         }
     }
-    raw_prefix.push_str("</tr></thead>");
+    raw_prefix.push_str("</tr>\n</thead>\n");
 
     // Resolve the header's placeholder footnote tokens into the frozen prefix
     // from the committed occurrence baseline, advancing the cache-local map. The
@@ -6223,7 +6576,7 @@ fn build_table_cache(
 fn close_container_paragraph(cache: &mut ContainerCache, opts: &RenderOpts) {
     let trimmed = cache.inner_buffer.trim_end_matches(|c: char| c == '\n' || c == '\r');
     let mut tmp = String::with_capacity(trimmed.len());
-    render_inline(trimmed, opts, &mut tmp);
+    render_inline_para(trimmed, opts, &mut tmp);
     let raw_text =
         tmp.trim_end_matches(|c: char| c == ' ' || c == '\t' || c == '\n' || c == '\r');
     // The paragraph is settled — re-render-from-scratch resolves its placeholder
@@ -6285,7 +6638,7 @@ fn build_container_cache(
     body_p_open.push_str(opts.dir());
     body_p_open.push('>');
     let body_p_close = String::from("</p>\n");
-    let (kind, wrapper_open, wrapper_close, body_leading_nl, lines_upto) = match block_kind {
+    let (kind, wrapper_open, wrapper_close, lines_upto) = match block_kind {
         BlockKind::Blockquote(_) => {
             // Mid-line arm: no newline yet. Bail unless the partial first line can
             // no longer become an alert marker (`first_line_alert_undecided`) AND
@@ -6304,7 +6657,7 @@ fn build_container_cache(
             w.push_str("<blockquote");
             w.push_str(opts.dir());
             w.push_str(">\n");
-            (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), true, start)
+            (ContainerCacheKind::Blockquote, w, String::from("</blockquote>"), start)
         }
         BlockKind::Alert { kind: ak, .. } => {
             // An alert's body starts on line 2, so the `[!KIND]` marker line must
@@ -6323,7 +6676,7 @@ fn build_container_cache(
             w.push_str(ak.title());
             w.push_str("</p>\n");
             // Alert: skip past the `[!KIND]` marker line — body starts on line 2.
-            (ContainerCacheKind::Alert(*ak), w, String::from("</div>"), false, first_line_end + 1)
+            (ContainerCacheKind::Alert(*ak), w, String::from("</div>"), first_line_end + 1)
         }
         _ => return None,
     };
@@ -6332,7 +6685,7 @@ fn build_container_cache(
     // renders plain paragraphs, so arming would re-arm-then-bail every append.
     // Marker-less lines are fine when they are lazy paragraph continuations
     // (the scanner's rule: inner paragraph open, non-blank, not a block start —
-    // `try_incremental_container` glues them); a marker-less line that instead
+    // `try_incremental_container` re-emits them); a marker-less line that instead
     // ENDS the quote means the tail isn't a single growing container, so arming
     // would bail every append. Let the full reparse own both bad shapes.
     {
@@ -6367,7 +6720,6 @@ fn build_container_cache(
         id,
         kind,
         wrapper_open,
-        body_leading_nl,
         body_p_open,
         body_p_close,
         wrapper_close,
@@ -6406,7 +6758,7 @@ fn build_list_cache(
         return None;
     }
     let first_line = &bytes[start..start + first_nl];
-    let m = scan_marker(first_line)?;
+    let m = scan_marker(first_line, opts.scan_ctx())?;
     if m.ordered != ordered {
         return None;
     }
@@ -6472,8 +6824,13 @@ fn build_list_cache(
 /// caller can bail) on the invalid-UTF-8 / no-marker path. `out`/`html_sink`
 /// are passed separately so the speculative open/partial item can capture into
 /// a scratch buffer without committing it to the cache.
+///
+/// `item_start` is `item`'s own offset in the (append-only, never-drained) buffer,
+/// i.e. document-absolute — recorded verbatim on the `ListItemData` so a consumer
+/// can index the source back to this item's marker. Every caller already holds it.
 fn fold_item_body(
     item: &[u8],
+    item_start: usize,
     loose: bool,
     opts: &RenderOpts,
     out: &mut String,
@@ -6481,7 +6838,7 @@ fn fold_item_body(
     base: &HashMap<String, usize>,
     over: &mut HashMap<String, usize>,
 ) -> Option<()> {
-    let body = item_body(item)?;
+    let body = item_body(item, opts.scan_ctx())?;
     let mut tmp = String::new();
     // `span` is `Some((lo, hi))` only when `block_data` is on.
     let span = render_item_body(body, loose, opts, &mut tmp);
@@ -6489,7 +6846,7 @@ fn fold_item_body(
         let mut seed = over.clone();
         let mut inner = String::with_capacity(hi - lo);
         resolve_footnote_ids_overlay(&tmp[lo..hi], base, &mut seed, &mut inner);
-        sink.push(Rc::new(ListItemData { html: inner }));
+        sink.push(Rc::new(ListItemData { html: inner, start: Some(item_start) }));
     }
     resolve_footnote_ids_overlay(&tmp, base, over, out);
     out.push('\n');
@@ -6505,8 +6862,8 @@ fn fold_item_body(
 /// proves it interior. An undecided leading indent at EOF (fewer than `ci`
 /// whitespace columns and no content byte yet) simply waits.
 ///
-/// Returns `None` on a shallow non-blank line — `item_body`'s lazy space-glue,
-/// which an append-only feed can't reproduce — the caller then disables the
+/// Returns `None` on a shallow non-blank line — `item_body` re-indents those
+/// (lazy continuation), which an append-only feed can't reproduce — the caller then disables the
 /// stream for this item.
 fn feed_open_item(st: &mut OpenItemStream, bytes: &[u8], end: usize) -> Option<()> {
     let mut pos = st.fed_outer;
@@ -6529,11 +6886,12 @@ fn feed_open_item(st: &mut OpenItemStream, bytes: &[u8], end: usize) -> Option<(
             }
             continue;
         }
-        // At a source line start: replicate `strip_cols(line, ci)` — consume up
+        // At a source line start: replicate `split_cols(line, ci)` — consume up
         // to `ci` columns; a tab crossing the boundary re-emits its overflow.
         let mut i = pos;
         let mut col = 0usize;
         let mut overflow = 0usize;
+        let mut straddled = false;
         while i < end && col < st.ci {
             match bytes[i] {
                 b' ' => {
@@ -6541,24 +6899,40 @@ fn feed_open_item(st: &mut OpenItemStream, bytes: &[u8], end: usize) -> Option<(
                     i += 1;
                 }
                 b'\t' => {
-                    let w = 4 - (col % 4);
+                    col += 4 - (col % 4);
                     i += 1;
-                    if col + w <= st.ci {
-                        col += w;
-                    } else {
-                        overflow = (col + w) - st.ci;
-                        col = st.ci;
+                    if col > st.ci {
+                        straddled = true;
+                        break;
                     }
                 }
                 _ => break,
             }
         }
+        if straddled {
+            // `split_cols`' straddle rule: finish the whitespace run in true
+            // columns. The stops of the tabs after the boundary were measured
+            // from the ORIGINAL column, so they cannot stay literal once the
+            // line is re-based — the whole run materializes as spaces.
+            while i < end {
+                match bytes[i] {
+                    b' ' => col += 1,
+                    b'\t' => col += 4 - (col % 4),
+                    _ => break,
+                }
+                i += 1;
+            }
+            if i >= end {
+                break; // run still growing — its width isn't settled yet
+            }
+            overflow = col - st.ci;
+        }
         if i >= end && col < st.ci {
             break; // undecided leading whitespace at EOF — wait for more bytes
         }
         if col < st.ci && bytes[i] != b'\n' {
-            // Shallow non-blank line: `item_body` glues it with a space (lazy
-            // continuation) — not reproducible append-only. Disable the stream.
+            // Shallow non-blank line: `item_body` re-indents it to `LAZY_INDENT`
+            // (lazy continuation) — not reproducible append-only. Disable the stream.
             return None;
         }
         for _ in 0..overflow {
@@ -6687,9 +7061,10 @@ fn open_item_gap_blank(st: &mut OpenItemStream) -> bool {
 ///   - empty body ⇒ nothing,
 ///   - tight single paragraph ⇒ its inline render, no `<p>` (settled-prefix cut
 ///     for the growing tail),
-///   - otherwise `\n` before every sub-block; tight paragraphs render inline
-///     from SOURCE (memoized once committed; the trailing one via the cut),
-///     everything else is the nested block's `render_block` html verbatim.
+///   - otherwise, per child: tight paragraphs render inline from SOURCE with no
+///     separator on either side (memoized once committed; the trailing one via
+///     the cut), every other child is the nested block's `render_block` html
+///     verbatim bracketed by `cr()` — the same rule, byte for byte.
 fn assemble_open_item(
     st: &mut OpenItemStream,
     loose: bool,
@@ -6721,12 +7096,12 @@ fn assemble_open_item(
         let content_end = buf.len(); // feed holds trailing whitespace back
         let mut active = String::new();
         let boundary =
-            render_inline_boundary(&buf[*para_cut..content_end], opts, &mut active);
+            render_inline_para_boundary(&buf[*para_cut..content_end], opts, &mut active);
         if boundary > 0 {
-            render_inline(&buf[*para_cut..*para_cut + boundary], opts, para_settled);
+            render_inline_para(&buf[*para_cut..*para_cut + boundary], opts, para_settled);
             *para_cut += boundary;
             active.clear();
-            render_inline(&buf[*para_cut..content_end], opts, &mut active);
+            render_inline_para(&buf[*para_cut..content_end], opts, &mut active);
         }
         out.push_str(para_settled);
         out.push_str(&active);
@@ -6742,10 +7117,12 @@ fn assemble_open_item(
         out.push_str("<label>");
     }
     if let Some(checked) = *task {
+        // Byte-identical to the full renderer's checkbox (see `render_list_item`
+        // in render.rs): GFM's attribute order and `=""` boolean spelling.
         out.push_str(if checked {
-            "<input type=\"checkbox\" checked disabled> "
+            "<input checked=\"\" disabled=\"\" type=\"checkbox\"> "
         } else {
-            "<input type=\"checkbox\" disabled> "
+            "<input disabled=\"\" type=\"checkbox\"> "
         });
     }
     if blocks.is_empty() {
@@ -6755,7 +7132,6 @@ fn assemble_open_item(
     } else {
         let last = blocks.len() - 1;
         for (bi, b) in blocks.iter().enumerate() {
-            out.push('\n');
             if !loose && matches!(b.kind, BlockKind::Paragraph) {
                 if bi == last {
                     push_tail_para(b, out);
@@ -6763,17 +7139,19 @@ fn assemble_open_item(
                     // Settled interior paragraph — rendered once.
                     let html = tight_memo.entry((b.start, b.end)).or_insert_with(|| {
                         let mut s = String::new();
-                        render_inline(trim_trailing_newlines(&buf[b.start..b.end]), opts, &mut s);
+                        render_inline_para(trim_trailing_newlines(&buf[b.start..b.end]), opts, &mut s);
                         s
                     });
                     out.push_str(html);
                 } else {
                     // A held-back (still-active, non-last) paragraph — transient
                     // and line-bounded; re-render fresh.
-                    render_inline(trim_trailing_newlines(&buf[b.start..b.end]), opts, out);
+                    render_inline_para(trim_trailing_newlines(&buf[b.start..b.end]), opts, out);
                 }
             } else {
+                cr(out);
                 out.push_str(&b.html);
+                cr(out);
             }
         }
     }
@@ -6957,6 +7335,12 @@ fn mod3_body_scan(bytes: &[u8], from: usize, to: usize) -> Option<usize> {
 /// open and close, keeping the mod-3 rule live), then a body that
 /// [`mod3_body_scan`] settles. Callers gate this only on `ParagraphCache` having
 /// failed to arm (the pin condition); emphasis is always on, so no config gate.
+/// Byte length of the leading spaces/tabs run — a paragraph's non-content
+/// indent (mirrors `inline::para_indent` for the escape-only fast paths).
+fn leading_para_ws(bytes: &[u8]) -> usize {
+    bytes.iter().take_while(|&&b| matches!(b, b' ' | b'\t')).count()
+}
+
 fn build_mod3_tail_cache(buffer: &str, start: usize, id: u64) -> Option<Mod3TailCache> {
     let bytes = buffer.as_bytes();
     let len = bytes.len();
@@ -6981,8 +7365,14 @@ fn build_mod3_tail_cache(buffer: &str, start: usize, id: u64) -> Option<Mod3Tail
         _ => return None,
     }
     let settled = mod3_body_scan(bytes, i + 2, len)?;
-    let mut body = String::with_capacity(settled - start);
-    escape_html(&buffer[start..settled], &mut body);
+    // The escaped body starts past the paragraph's leading spaces/tabs — the
+    // full path drops them (`render_inline_para`) and this cache renders the
+    // paragraph's inner itself, so it must drop them too. The single-line
+    // invariant (`mod3_body_scan` rejects `\n`) means there is no continuation
+    // line or line-final run to trim here.
+    let body_start = start + leading_para_ws(&bytes[start..settled]);
+    let mut body = String::with_capacity(settled - body_start);
+    escape_html(&buffer[body_start..settled], &mut body);
     Some(Mod3TailCache { start, id, settled, body })
 }
 
@@ -7003,7 +7393,7 @@ fn build_paragraph_cache(
         content_end -= 1;
     }
     let mut tmp = String::new();
-    let cut = start + render_inline_boundary(&buffer[start..content_end], opts, &mut tmp);
+    let cut = start + render_inline_para_boundary(&buffer[start..content_end], opts, &mut tmp);
     if cut <= start {
         return None;
     }
@@ -7011,7 +7401,7 @@ fn build_paragraph_cache(
     // resolve them into `committed_inner` from the committed occurrence baseline,
     // advancing the cache-local `fn_occ` map. The frozen prefix never re-renders.
     let mut raw = String::new();
-    render_inline(&buffer[start..cut], opts, &mut raw);
+    render_inline_para(&buffer[start..cut], opts, &mut raw);
     let mut fn_occ = fn_base.clone();
     let mut committed_inner = String::with_capacity(raw.len());
     resolve_footnote_ids(&raw, &mut fn_occ, &mut committed_inner);
@@ -7176,6 +7566,7 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
     let (_, html_type) = detect_html_block_open(bytes, start)?;
     let pass_through = opts.unsafe_html && !opts.html_sanitize;
     let tagfilter = pass_through && opts.gfm_tagfilter;
+    let sanitize = html_block_sanitizes(opts.block_html, opts.html_sanitize, html_type);
     let mut cached_prefix = String::new();
     let mut lines_upto = start;
     let mut pos = start;
@@ -7189,11 +7580,25 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
                 if html_block_closes_here(line, html_type, &bytes[pos..content_end]) {
                     return None;
                 }
-                fold_html_line(line, pass_through, tagfilter, &mut cached_prefix);
+                // Sanitize mode folds at token boundaries below instead — a tag
+                // spans lines, so there is no per-line output to fold here.
+                if !sanitize {
+                    fold_html_line(line, pass_through, tagfilter, &mut cached_prefix);
+                }
                 lines_upto = next;
                 pos = next;
             }
         }
+    }
+    // The cache LOCKS `html_type` at arm time, but the type is a function of the
+    // opener line alone — and while that line is still arriving it can change
+    // under us (`<p` reads as type 6; `<pre` is type 1). Refuse to arm until the
+    // opener line is complete (`lines_upto` has advanced past it), so the locked
+    // type is final. Load-bearing in sanitize mode, where the type decides
+    // whether the block renders as elements at all: without this, a streaming
+    // `<pre>`/`<textarea>` block would sanitize through the type-6 lock.
+    if lines_upto == start {
+        return None;
     }
     // An EMPTY partial (buffer ends exactly at `\n`) is "no next line yet", not
     // the type-6/7 closing blank line — keep arming (mirrors try_incremental_html).
@@ -7201,14 +7606,66 @@ fn build_html_cache(buffer: &str, start: usize, id: u64, opts: &RenderOpts) -> O
     if !partial.is_empty() && html_block_closes_here(partial, html_type, partial) {
         return None;
     }
-    Some(HtmlBlockCache { start, id, html_type, pass_through, tagfilter, cached_prefix, lines_upto })
+    // No line in [start, end) closes the block, so every byte of it is content:
+    // fold the whole region's settled tokens in one pass (the per-append fold
+    // then only ever sees NEW bytes).
+    let mut open_tags = Vec::new();
+    let tokens_upto = if sanitize {
+        fold_block_html(buffer, start, opts.html_policy(), &mut open_tags, &mut cached_prefix)
+    } else {
+        start
+    };
+    Some(HtmlBlockCache {
+        start,
+        id,
+        html_type,
+        pass_through,
+        tagfilter,
+        sanitize,
+        cached_prefix,
+        lines_upto,
+        tokens_upto,
+        open_tags,
+    })
 }
 
-/// True if the open paragraph beginning before `cut` actually ends somewhere in
-/// `[cut, EOF)` — a blank line, an interrupting block start, or a setext
-/// underline (which would change the block's kind). The line containing `cut`
-/// is a continuation (it began as paragraph text), so it's skipped.
-fn paragraph_ends_before_eof(bytes: &[u8], cut: usize, ctx: ScanCtx) -> bool {
+/// Why (or whether) the open paragraph beginning before `cut` stops before EOF.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParaEnd {
+    /// It doesn't — the paragraph still runs all the way to EOF.
+    No,
+    /// A PERMANENT terminator: a completed blank line, an interrupting block
+    /// start, a setext underline, or a table delimiter row under a matching
+    /// header (the last two retroactively change the block's kind). The
+    /// incremental path must drop its cache and let the full scan re-form it.
+    Settled,
+    /// A TRANSIENT terminator, carrying the offending line's start: the only
+    /// thing ending the paragraph is the buffer's FINAL line being
+    /// whitespace-only and not terminated yet.
+    ///
+    /// A chunk boundary landing inside a continuation line's leading indent
+    /// leaves the buffer in exactly this shape, and it is a real end — the
+    /// block scanner splits the whitespace line off, so the open view drops
+    /// back to the paragraph without it (`"a\n b\n "` renders `<p>a\n b</p>`,
+    /// and a preceding hard break's `<br>` disappears with the line it belonged
+    /// to). But the very next byte almost always undoes it by continuing the
+    /// line, so paying a full re-scan + re-render is waste: it made word-wrapped
+    /// prose with indented continuation lines O(n²), one append in `indent
+    /// period` (110x the cost of the same flush prose at 512 KB / 128-byte
+    /// chunks). [`StreamParser::try_incremental_paragraph`] SUSPENDS on this
+    /// verdict — it renders the same closed view straight from the cache and
+    /// keeps the cache, so resuming costs nothing.
+    OpenBlank(usize),
+}
+
+/// Where the open paragraph beginning before `cut` ends, if it ends in
+/// `[cut, EOF)`. The line containing `cut` is a continuation (it began as
+/// paragraph text), so it is only re-examined once it has completed.
+///
+/// Single pass: the scan returns at the FIRST terminator it meets, so a
+/// trailing whitespace-only line is [`ParaEnd::OpenBlank`] exactly when nothing
+/// permanent precedes it — no second walk needed to establish that.
+fn paragraph_end(bytes: &[u8], cut: usize, ctx: ScanCtx) -> ParaEnd {
     let len = bytes.len();
 
     // Phase 1: re-check the line containing `cut` if it has just completed.
@@ -7225,14 +7682,14 @@ fn paragraph_ends_before_eof(bytes: &[u8], cut: usize, ctx: ScanCtx) -> bool {
                     || is_setext_underline(bytes, cur_line_start).is_some()
                     || would_start_other_block(bytes, cur_line_start, ctx)
                 {
-                    return true;
+                    return ParaEnd::Settled;
                 }
                 if is_table_delimiter_row(line_slice(bytes, cur_line_start)) {
                     let prev = prev_line_start(bytes, cur_line_start);
                     if prev != cur_line_start
                         && forms_table_header(bytes, prev, cur_line_start)
                     {
-                        return true;
+                        return ParaEnd::Settled;
                     }
                 }
             }
@@ -7257,22 +7714,32 @@ fn paragraph_ends_before_eof(bytes: &[u8], cut: usize, ctx: ScanCtx) -> bool {
     // nothing — no per-append backward scan.
     let mut prev: Option<usize> = None;
     while pos < len {
-        if is_blank_line(bytes, pos)
-            || is_setext_underline(bytes, pos).is_some()
-            || would_start_other_block(bytes, pos, ctx)
-        {
-            return true;
+        let end = line_end(bytes, pos);
+        if is_blank_line(bytes, pos) {
+            // Blank AND unterminated AND last ⇒ transient (see
+            // [`ParaEnd::OpenBlank`]). Reaching here at all means nothing
+            // permanent precedes it, since the scan returns at the first
+            // terminator. `pos > cut` holds for any blank line (the cut sits on
+            // a word), but assert the intent: the retained prefix must be left
+            // wholly inside the paragraph.
+            if end == len && bytes[len - 1] != b'\n' && pos > cut {
+                return ParaEnd::OpenBlank(pos);
+            }
+            return ParaEnd::Settled;
         }
-        if is_table_delimiter_row(line_slice(bytes, pos)) {
+        if is_setext_underline(bytes, pos).is_some() || would_start_other_block(bytes, pos, ctx) {
+            return ParaEnd::Settled;
+        }
+        if is_table_delimiter_row(&bytes[pos..end]) {
             let header = prev.unwrap_or_else(|| prev_line_start(bytes, pos));
             if header != pos && forms_table_header(bytes, header, pos) {
-                return true;
+                return ParaEnd::Settled;
             }
         }
         prev = Some(pos);
-        pos = line_end(bytes, pos);
+        pos = end;
     }
-    false
+    ParaEnd::No
 }
 
 /// Start of the line immediately before `pos` (which must be a line start), or 0.
@@ -7522,7 +7989,7 @@ mod tests {
     #[test]
     fn task_list_checkboxes() {
         let html = render("- [x] done\n- [ ] todo\n\n");
-        assert!(html.contains("checkbox\" checked disabled"));
+        assert!(html.contains("checked=\"\" disabled=\"\" type=\"checkbox\""));
     }
 
     #[test]

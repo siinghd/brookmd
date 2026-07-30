@@ -8,7 +8,8 @@
 with speculative closure for mid-stream constructs, stable block identities so
 unchanged blocks never re-reconcile — compiled to WASM for the web and to
 native libraries for mobile and desktop. Every boundary emits the same
-versioned JSON wire, byte-for-byte. 100% CommonMark 0.31 + GFM.
+versioned JSON wire, byte-for-byte. 100% CommonMark 0.31 + GFM — 652/652 and
+24/24 **byte-exact** against the reference renderers.
 
 In the browser, wire each LLM stream to a `BrookClient` and the markdown
 renders incrementally **off the main thread**, block by block — so many
@@ -94,8 +95,18 @@ bun run build:wasm        # compile the Rust core → WASM
 cd packages/brookmd && bun test
 ```
 
-CI enforces the CommonMark 652/652 + GFM conformance floors, the JS test suite, a
-fresh-process SSR cold-import check, and that the published tarball ships the WASM.
+CI enforces the conformance floors — **652/652 CommonMark 0.31 and 24/24 GFM,
+byte-exact**, not merely structurally normalized — as the harnesses' default
+floors (`CMARK_MIN_EXACT` / `GFM_MIN_EXACT`, pinned explicitly in the
+workflows), plus the JS test suite, a fresh-process SSR cold-import check, and
+that the published tarball ships the WASM.
+
+The only differences from the reference output are deliberate brookmd choices,
+folded by a documented `canonicalize` step applied to **both** sides before the
+byte comparison (so it can never hide a structural divergence): the security-only
+`target="_blank" rel="noopener noreferrer nofollow"` on links, `data-lang` on code
+blocks, HTML5 void elements (`<br>`) where the spec prints XHTML (`<br />`), and
+the modern `style="text-align:…"` in place of GFM's deprecated `align="…"`.
 
 ## License
 

@@ -85,12 +85,13 @@ fn every_variant_matches_pre_refactor_golden() {
     // field is OMITTED when `None` (off) via `skip_serializing_if`, so the off
     // wire is byte-identical to before; present (on) it carries the source/number.
     assert_eq!(
-        j(&BlockKind::CodeBlock { lang: None, code: None }),
+        j(&BlockKind::CodeBlock { lang: None, meta: None, code: None }),
         r#"{"type":"CodeBlock","data":{"lang":null}}"#
     );
     assert_eq!(
         j(&BlockKind::CodeBlock {
             lang: Some("rust".into()),
+            meta: None,
             code: None,
         }),
         r#"{"type":"CodeBlock","data":{"lang":"rust"}}"#
@@ -99,6 +100,7 @@ fn every_variant_matches_pre_refactor_golden() {
     assert_eq!(
         j(&BlockKind::CodeBlock {
             lang: Some("rust".into()),
+            meta: None,
             code: Some(Rc::new("fn main() {}\n".into())),
         }),
         r#"{"type":"CodeBlock","data":{"lang":"rust","code":"fn main() {}\n"}}"#
@@ -106,6 +108,7 @@ fn every_variant_matches_pre_refactor_golden() {
     assert_eq!(
         j(&BlockKind::CodeBlock {
             lang: None,
+            meta: None,
             code: Some(Rc::new("plain\n".into())),
         }),
         r#"{"type":"CodeBlock","data":{"lang":null,"code":"plain\n"}}"#
@@ -135,8 +138,8 @@ fn every_variant_matches_pre_refactor_golden() {
             ordered: true,
             start: Some(1),
             items: vec![
-                Rc::new(ListItemData { html: "first".into() }),
-                Rc::new(ListItemData { html: "<strong>second</strong>".into() }),
+                Rc::new(ListItemData { html: "first".into(), start: None }),
+                Rc::new(ListItemData { html: "<strong>second</strong>".into(), start: None }),
             ],
         }),
         r#"{"type":"List","data":{"ordered":true,"start":1,"items":[{"html":"first"},{"html":"<strong>second</strong>"}]}}"#
