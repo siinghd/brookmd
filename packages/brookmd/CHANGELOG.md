@@ -4,6 +4,219 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.26.0 — 2026-07-30
+
+**Rendered HTML bytes change in this release.** Everything new below is opt-in
+and default-off — with the flags off those paths are byte-identical to 0.25.2 —
+but the output-fidelity work is unconditional: container framing newlines,
+paragraph whitespace, table line breaks, fenced-code indentation, and the
+task-list checkbox form now match the CommonMark and GFM reference renderers
+exactly. No API is removed, and the wire envelope, ids, and commit semantics are
+untouched — but HTML snapshots taken against 0.25.x will need regenerating.
+That, not the new features, is why this is a minor bump.
+
+What it buys: **652/652 CommonMark 0.31 and 24/24 GFM, byte-exact** against the
+reference renderers, where before the suites passed only after structural
+normalization. Byte-exactness is now the harnesses' default floor and is pinned
+in CI, so one regressed byte fails the build.
+
+Requires `brookmd-core` 0.25.0.
+
+### Added
+
+- **`softBreaks` — a soft line break renders as `<br>`.** Strict CommonMark
+  treats a bare `\n` inside a paragraph as whitespace, so a model that writes one
+  thought per line gets one reflowed blob. This is the `remark-breaks` /
+  chat-comment convention where one Enter is one visual line, and it is what most
+  chat UIs actually want. Off by default; it only ever *adds* breaks (a hard break
+  is `<br>` either way), so no existing output loses a line.
+- **`allowSchemes` — un-block a URL scheme brookmd blocks by default.** Bare
+  scheme names, no colon (`allowSchemes: ["file"]`), matched case-insensitively.
+  It reaches exactly one tier: the *overridable*-blocked schemes, today `file:`.
+  The script-executing tier (`javascript:`, `data:text/html`, …) is
+  non-overridable — listing one is a silent no-op, not an escape hatch — and the
+  encoded-evasion neutralization (percent- and entity-encoded scheme prefixes) is
+  unchanged and runs before the check. This exists for privileged embedders —
+  Electron shells, extensions, editor preview panes — that intercept link clicks
+  instead of navigating.
+- **`lenientLists` — rescue an over-indented list item from becoming a code
+  block.** CommonMark §5.2 says a marker followed by 5+ columns of whitespace
+  starts an indented code block, so a model emitting `-       const value = 1;`
+  renders a `<pre><code>` instead of a list item. With the flag on, a marker
+  followed by **6 or more columns of literal spaces** absorbs the padding into the
+  content column and the text parses as the item's own markdown. Deliberately
+  narrow: exactly 5 spaces still opens code (that column is the spec boundary
+  itself), a fence on the marker line stays a fence, an indent on a *later* line
+  stays code, and **tab** padding stays code — tabs are an authoring choice, model
+  over-indentation is always literal spaces. Excluding tabs is what holds the
+  divergence to a single spec example (274) and only while the flag is on; the
+  conformance suites run strict and are unaffected.
+- **`blockHtml` — block-level raw HTML through the safe sanitizer.** A
+  `<details><summary>…</summary>…</details>` block rendered as an escaped code
+  block before; now it renders as real elements, sanitized. Only CommonMark HTML
+  block **types 6 and 7** qualify — types 1–5 (`<script>`/`<pre>`/`<style>`/
+  `<textarea>`, comments, processing instructions, declarations, CDATA) stay
+  escaped by design, so the constructs that can execute or swallow the rest of
+  the document never take effect.
+  It shares its token core with the inline raw-HTML path (one policy, not two),
+  tracks an open-tag stack with speculative closers so a half-streamed
+  `<details` never leaks a broken element, carries a void-element table so `<hr>`
+  and friends are not pushed onto that stack, and caps nesting depth at 100.
+  Half-streamed tags are suppressed while open and settle at finalize. Takes
+  effect only when the sanitizer is engaged (`htmlAllowlist` or `dropHtmlTags`);
+  on its own it does nothing.
+- **`CodeBlockData.meta` — the fence info string's remainder.**
+  ```` ```ts title="src/main.ts" ```` now yields `lang: "ts"` **and**
+  `meta: 'title="src/main.ts"'` on the data channel and as a `meta` prop on
+  `components.CodeBlock`. Always-on like `lang` (no `blockData` needed) and
+  omitted entirely when the fence carried none, so a fence without meta is
+  byte-identical to before. It is deliberately **not** in the rendered HTML —
+  there is no `data-meta` attribute — because a filename header is a component's
+  job, not the parser's. While streaming it appears only once it can no longer
+  change (the opening fence line terminated by a newline, or at finalize), so a
+  header never flickers through a half-typed `title="src/ma`.
+- **`ListItemData.start` — a source byte offset per list item.** Under
+  `blockData`, each top-level `items[]` entry carries the document-absolute offset
+  of the byte where its marker begins, same origin as `Block.start` and stable as
+  the document grows. That is enough to build task-checkbox writeback: locate the
+  `[ ]` from the item's offset and flip it in the original markdown, no HTML
+  round-trip. **Nested** items carry no offset rather than a wrong one — a nested
+  list is not a separate block, it renders against a synthesized de-indented
+  string with no document offset — and that limitation is documented on the type.
+- Together `meta` and `start` bump the **wire contract to 1.3.0** (WIRE.md §9):
+  purely additive optional `data` keys, byte-identical when unexercised.
+- All four flags are plumbed through every surface: client/worker config, the
+  server renderer, the `<brook-markdown>` element (`soft-breaks`,
+  `lenient-lists`, `block-html`, `allow-schemes`), React Native, Kotlin, Swift,
+  and the Flutter hand-written config.
+- **Byte-exact conformance mode in the spec harnesses**, with default ratchet
+  floors `CMARK_MIN_EXACT=652` / `GFM_MIN_EXACT=24` — pinned explicitly in both
+  the CI and publish workflows alongside the older normalized floors. The four
+  deliberate differences from the reference (`target`/`rel` on links, `data-lang`
+  on code blocks, HTML5 void `<br>`, `style="text-align:…"` instead of GFM's
+  deprecated `align`) are folded by a documented `canonicalize` step applied to
+  **both** sides — the only transform on the byte-exact path, so it can erase our
+  intentional extras but never hide a structural divergence.
+- **An unconditional `bindings` CI job** — FFI and C-ABI crate tests plus
+  regeneration-freshness checks for the React Native, Kotlin, and Swift bindings.
+  The existing binding workflows only ran on `pull_request` behind `paths:`
+  filters, so a push to main or a JS-only PR gated on nothing; that is how stale
+  binding goldens survived.
+
+### Changed
+
+- **Container inner newlines now match the reference exactly** (cmark's `cr()`
+  rule): `<li>` / `<blockquote>` / alert framing newlines land where the
+  reference puts them, an empty blockquote gets its newline, and a `<li>` opening
+  with a tight paragraph no longer emits a spurious `\n`.
+- **Paragraph whitespace follows the spec line by line.** Leading indentation is
+  stripped on *every* line, not just the first; trailing spaces and tabs are
+  dropped before a soft break; a hard-break line sheds the *next* line's indent.
+  Lazy continuation lines in blockquotes and lists keep their `\n` instead of
+  being glued with a space.
+- **GFM tables emit one element per line**, matching the reference's framing, and
+  task-list checkboxes emit the reference byte-form
+  (`checked="" disabled="" type="checkbox"`).
+- **Fenced code**: the body is de-indented by the opening fence's own indent (so
+  a fence at columns 1–3 no longer carries that indent into every line);
+  significant trailing spaces inside the last line are preserved; interior blank
+  lines before the closer are preserved. Tab-column arithmetic is fixed after
+  blockquote markers, across item-content boundaries, and after list markers.
+- **Document assembly is now defined and documented** ([WIRE.md
+  §12](../../crates/brookmd-core/WIRE.md)): a block's `html` carries **no
+  trailing newline** — the terminator after a top-level block belongs to the
+  document, not the block — and concatenating blocks is a `cr()`-join.
+  `renderToString` follows that rule, so a server-rendered document and a
+  reference render agree byte-for-byte.
+- **Native `BrookConfig` gained four fields** (`soft_breaks`, `allow_schemes`,
+  `lenient_lists`, `block_html`), appended in a newly documented **append-only
+  zone**: uniffi serializes a record's fields *positionally*, so inserting a field
+  anywhere above shifts every later read. The wire was verified to be
+  exact-consumption — a binding built against the old record fails loudly on a
+  version mismatch rather than silently mis-decoding — and the RN, Kotlin, and
+  Swift bindings are regenerated, with the Flutter hand-written config synced
+  (it also gained the previously-missing `wire_delta`). Stale wire goldens across
+  all four languages were re-synced. `brookmd-ffi` and `brookmd-cabi` go to
+  **0.3.0**: the native library and its generated bindings must ship in lockstep.
+
+### Performance
+
+Every item below is pinned by a **wall-time** regression guard in
+`crates/brookmd-core/tests/scaling.rs`, each paired with a flush-control twin
+that isolates the shape from its chunking. That pairing is the point: work
+counters alone provably miss the allocation-class quadratics below — the parser
+was doing O(n) *counted* work while re-allocating O(n) bytes per append, so only
+the clock could see it.
+
+| Shape | Measured as | Before | After |
+| --- | --- | --- | --- |
+| growing fence opener line | growth over an 8× input span | 50.5× | **9.1×** |
+| indented continuation lines | vs the unindented control | 304.6× | **1.1×** |
+| ragged chunks parked on a blank partial line | vs control | 110.2× | **1.1×** |
+| the same, inside a list item | work counters | 212× | **12.8×** |
+| block-HTML sanitize | vs the escaped control | 247× | **1.3×** |
+
+- **Fence opener-line growth** re-sliced the whole opener on every append —
+  quadratic in the info string's length. Now linear-ish: 9.1× over an 8× span.
+- **Indented continuation lines** made `is_boundary` produce *zero* cut
+  candidates, so every append re-rendered the entire paragraph from its start. A
+  new indent-led boundary rule (with a hard-break-straddle exclusion) restores
+  cutting; the shape now costs 1.1× its unindented control.
+- **Ragged chunking that parks on a whitespace-only partial line** dropped the
+  paragraph cache outright, forcing a full rebuild per append. The cache now
+  **suspends instead of dropping**: the closed view stays byte-identical and the
+  parse resumes when the line completes. List items inherit the fix through the
+  nested parser.
+- **Block-level raw HTML** would otherwise re-sanitize its whole body per append
+  (measured 247×); the sanitize cache folds at token boundaries, shipping at 1.3×
+  the cost of the escaped control. Container, table-cell, and heading caches were
+  proven structurally immune to the same class and are pinned so they stay that
+  way.
+
+### Security
+
+- **The raw-HTML attribute policy is now an explicit dropped-attribute table**
+  rather than scheme-checking alone: `srcdoc`, `is`, `autofocus`,
+  `contenteditable`, the DOM-clobbering `id` / `name`, the shadow-piercing
+  `slot` / `part` / `exportparts`, the `form*` family, the `xmlns:` / `xlink:`
+  prefixes, and `ping`. `formaction` and `ping` are **dropped outright** — for a
+  URL carrier that re-targets a form or fires a background beacon, dropping is
+  strictly stronger than validating its scheme. Component-tag props stay
+  permissive by design (they are consumer-mediated — your component decides what
+  to do with them, and they never become DOM attributes); that asymmetry is now
+  documented rather than incidental.
+- **The web component's `gfm-tagfilter` attribute was never observed.** It was in
+  the element's config map but missing from `observedAttributes`, so it applied at
+  mount and then silently ignored every later change — a security-relevant flag
+  that could not be turned on after the fact. Fixed, and the list now carries a
+  comment tying it to the map so the next flag cannot repeat it.
+
+### Fixed
+
+- **A mid-stream committed-view divergence**: a cut taken after a *single*
+  inter-word space could straddle the hard-break lookbehind, so a paragraph
+  containing entity-produced spaces rendered differently mid-stream than it did
+  one-shot. The streamed view now matches the one-shot render at every chunk
+  boundary again.
+
+## brookmd-react-native 0.1.7 — 2026-07-30
+
+### Added
+
+- `softBreaks`, `allowSchemes`, `lenientLists`, and `blockHtml` on the native
+  `BrookConfig`, reaching the on-device parser through the same JSI path as the
+  existing flags. The generated TS/C++ bindings are regenerated from
+  `brookmd-ffi` 0.3.0 and are now freshness-checked on every push by the new CI
+  `bindings` job.
+
+### Changed
+
+- `brookmd` dependency range `^0.25.0` → `^0.26.0`, and the vendored native
+  binaries are built against `brookmd-core` 0.25.0 — so the on-device renderer
+  produces the same reference-exact bytes as the browser. Native and JS must move
+  together here: uniffi records are positional, and the four new `BrookConfig`
+  fields land in the record's append-only zone.
+
 ## 0.25.2 — 2026-07-27
 
 Performance only. Rendered output is unchanged — byte-identical mid-stream, not
