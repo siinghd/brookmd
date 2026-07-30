@@ -4,6 +4,47 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.26.1 — 2026-07-30
+
+Two fixes found by benchmarking 0.26.0 against real chat traffic. Requires
+`brookmd-core` 0.25.1.
+
+### Fixed
+
+- **A GFM table could not interrupt an open paragraph — anywhere.**
+  `scan_paragraph` had no table arm, so `item\n| a | b |\n|---|---|` swallowed
+  the delimiter row as paragraph text. The visible symptom was "tables inside
+  list items don't parse" (an item's de-indented body opens with a paragraph),
+  but the bug was position-independent and hit top level and blockquotes the
+  same way. The fix is an O(2-line) gate — header row with a pipe, delimiter
+  row next, matching cell counts, both rows indented ≤ 3 columns — checked once
+  per line as it arrives, on both the full-reparse and streaming paths, so a
+  scan started at a commit boundary renders byte-identically to a cold one.
+  Verified against GitHub's rendering for every non-pathological shape; the
+  deliberate exception (both rows must be ≤ 3-indented, so two exotic
+  mixed-indent shapes stay paragraphs) is pinned in `tests/nested_tables.rs`.
+  A nested table renders inside the item's `html` and — like nested lists —
+  carries no structured `blockData` of its own.
+
+### Performance
+
+- **Close-time syntax highlighting no longer blocks the main thread.** The
+  built-in highlighter ran as one synchronous task when a block closed —
+  ~110 ms for a large fence on a mid desktop. The tokenizer loop was already
+  resumable at any offset with no carried state, so it now runs in ~5 ms
+  slices (`scheduler.yield()` where available, `MessageChannel` otherwise),
+  with the first slice synchronous so small blocks render highlighted in the
+  same tick with no flash. Output is byte-identical — pinned by a chunked ==
+  one-shot property test across all 20 languages at chunk sizes down to 1,
+  plus a 6,556-case differential fuzz against the previous implementation.
+  Also: the renderers now reuse the parser's already-decoded source
+  (`CodeBlockData.code`) when `blockData` is on instead of re-deriving it from
+  the HTML, and `escapeHtml` no longer concatenates per character. A 49 KB
+  block's longest main-thread task drops from ~38 ms to ≤ 6 ms on the same
+  hardware; `highlight()`'s public signature and bytes are unchanged, SSR
+  stays synchronous, and `components.CodeBlock`/`pre`/`code` overrides are
+  unaffected.
+
 ## 0.26.0 — 2026-07-30
 
 **Rendered HTML bytes change in this release.** Everything new below is opt-in
