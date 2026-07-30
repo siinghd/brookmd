@@ -173,32 +173,88 @@ const LANGS: Record<string, { pats: Pat[]; kw?: Set<string> }> = {
   css: { pats: cssPats },
 };
 
+// `<`, `>`, `&`, `"` — the only characters escapeHtml rewrites. It used to
+// build its result one character at a time (`out += c`), which costs a string
+// append per character of every token and of every byte of an escape-fallback
+// block. Now it scans for the next special character and copies the run before
+// it in one slice: the overwhelmingly common "nothing to escape" case returns
+// the input untouched, and the rest costs one append per SPECIAL character
+// instead of one per character. Same bytes out.
 function escapeHtml(s: string): string {
-  let out = "";
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    if (c === "<") out += "&lt;";
-    else if (c === ">") out += "&gt;";
-    else if (c === "&") out += "&amp;";
-    else if (c === '"') out += "&quot;";
-    else out += c;
+  const n = s.length;
+  let i = 0;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 60 || c === 62 || c === 38 || c === 34) break;
   }
-  return out;
+  if (i === n) return s; // nothing to escape: zero copies, zero allocations
+  let out = s.slice(0, i);
+  let last = i;
+  for (; i < n; i++) {
+    const c = s.charCodeAt(i);
+    let esc: string;
+    if (c === 60) esc = "&lt;";
+    else if (c === 62) esc = "&gt;";
+    else if (c === 38) esc = "&amp;";
+    else if (c === 34) esc = "&quot;";
+    else continue;
+    out += s.slice(last, i) + esc;
+    last = i + 1;
+  }
+  return out + s.slice(last);
 }
 
-export function highlight(code: string, lang: string): string {
-  // Defense-in-depth: never tokenize a pathologically huge block on the main
-  // thread — fall back to plain escaped text.
-  if (code.length > 50_000) return escapeHtml(code);
-  const conf = LANGS[lang.toLowerCase()];
-  if (!conf) return escapeHtml(code);
+/**
+ * The resumable tokenizer's cursor: `pos` is the next source index to consume,
+ * `out` the markup emitted so far. Start a run at `{ pos: 0, out: "" }`.
+ */
+export interface HighlightState {
+  pos: number;
+  out: string;
+}
 
-  let out = "";
-  let pos = 0;
+/**
+ * One resumable slice of {@link highlight}. Consumes WHOLE tokens from
+ * `state.pos` until at least `chars` source characters have been taken (or the
+ * input ends), appending to `state.out`; returns true once the input is fully
+ * consumed.
+ *
+ * The pass carries NO state between tokens beyond `pos` — every pattern is
+ * sticky and matched against the immutable `code` — so stopping and resuming is
+ * invisible: for ANY sequence of chunk sizes the final `state.out` is
+ * byte-identical to `highlight(code, lang)` (test/hi-chunked.test.ts proves it
+ * over the language corpus, down to one token per slice). That is what lets a
+ * renderer spread a big block's highlight across several tasks without changing
+ * a byte of markup.
+ *
+ * @internal Not part of the semver surface — use {@link highlight}.
+ */
+export function stepHighlight(
+  code: string,
+  lang: string,
+  state: HighlightState,
+  chars: number,
+): boolean {
+  // Defense-in-depth: never tokenize a pathologically huge block — fall back to
+  // plain escaped text. An unknown language is the same fallback. Both are
+  // sliced through the same cursor, so even a 2 MB block escapes incrementally.
+  const conf = code.length > 50_000 ? undefined : LANGS[lang.toLowerCase()];
+  // `chars` is a floor, not a cap: the token straddling the boundary is emitted
+  // whole. A non-positive budget would make no progress, so it counts as one.
+  const stop = state.pos + (chars > 0 ? chars : 1);
+  if (!conf) {
+    const end = stop < code.length ? stop : code.length;
+    state.out += escapeHtml(code.slice(state.pos, end));
+    state.pos = end;
+    return state.pos >= code.length;
+  }
+
+  let out = state.out;
+  let pos = state.pos;
   const pats = conf.pats;
   const kw = conf.kw;
   // Linear pass with sticky regex tracking lastIndex.
-  while (pos < code.length) {
+  while (pos < code.length && pos < stop) {
     let matched = false;
     for (let i = 0; i < pats.length; i++) {
       const [cls, re] = pats[i];
@@ -239,7 +295,19 @@ export function highlight(code: string, lang: string): string {
       pos += 1;
     }
   }
-  return out;
+  state.out = out;
+  state.pos = pos;
+  return pos >= code.length;
+}
+
+export function highlight(code: string, lang: string): string {
+  // One unbounded slice: `chars = code.length` reaches the end of the input on
+  // the first call, so this is the same single linear pass it always was.
+  const state: HighlightState = { pos: 0, out: "" };
+  while (!stepHighlight(code, lang, state, code.length)) {
+    /* a slice that big always finishes; the loop is belt-and-braces */
+  }
+  return state.out;
 }
 
 export function supportedLangs(): string[] {

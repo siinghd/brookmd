@@ -1,5 +1,5 @@
 import type { BrookClient } from "./client";
-import { highlight } from "./hi";
+import { highlightDeferred, type DeferredHighlight } from "./hi-defer";
 import { morph } from "./morph";
 import type { Align, Block, BlockComponentProps, BlockKindTag, Decorator, ListData, RenderMetricsHook, TableData, UrlTransform } from "./types-core";
 import { blockProps, extractLang } from "./block-props";
@@ -155,6 +155,10 @@ interface MountedBlock {
   // Lets a later patch update just the growing trailing row in place instead of
   // rebuilding the whole node.
   table?: KeyedTable;
+  // Set only while a code block too big for one slice is still tokenizing (see
+  // hi-defer.ts). Cancelled when the node is rebuilt/dropped or the renderer is
+  // destroyed, and used as the token that proves a landed result is not stale.
+  highlight?: DeferredHighlight;
   // True when `node` is the generic `<div class="brook-block…">` whose entire
   // `innerHTML` is exactly `html` (no special wrapper, no sanitizer transform).
   // Only such a node is eligible for the prefix-extension tail-append fast path.
@@ -334,6 +338,11 @@ export function mountBrookMarkdown(
       // Changed → rebuild and swap in place. A table that just closed (or whose
       // data vanished) drops its keyed manager and re-renders the full HTML once.
       existing.table = undefined;
+      // A half-finished highlight belongs to the node about to be replaced.
+      if (existing.highlight) {
+        existing.highlight.cancel();
+        existing.highlight = undefined;
+      }
       const node = renderBlock(b, existing);
       existing.node.replaceWith(node);
       existing.node = node;
@@ -350,6 +359,7 @@ export function mountBrookMarkdown(
     if (mounted.size > seen.size) {
       for (const [id, mb] of mounted) {
         if (!seen.has(id)) {
+          if (mb.highlight) mb.highlight.cancel();
           mb.node.remove();
           mounted.delete(id);
         }
@@ -432,7 +442,7 @@ export function mountBrookMarkdown(
     // 2. Dedicated default renderers.
     switch (kind) {
       case "CodeBlock":
-        if (highlightCode) return renderCodeBlock(b);
+        if (highlightCode) return renderCodeBlock(b, mb);
         break; // fall through to the generic path
       case "MathBlock":
         return renderMathBlock(b);
@@ -677,13 +687,18 @@ export function mountBrookMarkdown(
     return result;
   }
 
-  function renderCodeBlock(b: Block): HTMLElement {
+  function renderCodeBlock(b: Block, mb: MountedBlock): HTMLElement {
     const lang = extractLang(b.html) || "text";
     // Mirror CodeBlock.tsx: text is "" while open, so the body falls to the raw
     // `<div>` path; a closed block decodes once and highlights once. The node is
     // frozen once closed, so highlight runs exactly once (no re-tokenize).
-    const text = b.open ? "" : decodeCodeText(b.html);
-    const highlighted = text ? highlight(text, lang) : null;
+    const text = b.open ? "" : codeText(b);
+    // The first slice runs HERE, before the node is inserted: an ordinary block
+    // is highlighted in the same paint as always. Only a fence too big for the
+    // budget shows the plain body first and swaps its markup in a few tasks
+    // later — same bytes, one extra paint, no frozen main thread.
+    const run = text ? highlightDeferred(text, lang) : null;
+    const highlighted = run ? run.html : null;
 
     const block = document.createElement("div");
     block.className = "brook-code-block" + (b.open ? " brook-streaming" : "");
@@ -707,15 +722,8 @@ export function mountBrookMarkdown(
 
     const body = document.createElement("div");
     body.className = "brook-code-body";
-    if (highlighted) {
-      const pre = document.createElement("pre");
-      pre.tabIndex = 0;
-      pre.setAttribute("role", "region");
-      pre.setAttribute("aria-label", `${lang} code`);
-      const code = document.createElement("code");
-      code.innerHTML = highlighted;
-      pre.appendChild(code);
-      body.appendChild(pre);
+    if (highlighted !== null) {
+      body.appendChild(highlightedPre(lang, highlighted));
     } else {
       const div = document.createElement("div");
       div.tabIndex = 0;
@@ -723,9 +731,36 @@ export function mountBrookMarkdown(
       div.setAttribute("aria-label", `${lang} code`);
       div.innerHTML = b.html;
       body.appendChild(div);
+      if (run !== null && run.rest !== null) {
+        // Remember the run on the mount so a rebuild/removal can cancel it, and
+        // so a landed result can prove it still belongs to what is on screen.
+        mb.highlight = run;
+        run.rest.then((markup) => {
+          if (markup === null || dead) return;
+          // Stale guard: the block was rebuilt (new node), dropped, or its run
+          // was superseded while we tokenized — never paint the old tokens.
+          if (mb.highlight !== run || mb.node !== block) return;
+          mb.highlight = undefined;
+          body.replaceChild(highlightedPre(lang, markup), div);
+        });
+      }
     }
     block.appendChild(body);
     return block;
+  }
+
+  // The highlighted body: `<pre tabindex=0 role=region><code>…</code></pre>`.
+  // Shared by the synchronous build and the deferred swap so both produce the
+  // identical subtree.
+  function highlightedPre(lang: string, markup: string): HTMLElement {
+    const pre = document.createElement("pre");
+    pre.tabIndex = 0;
+    pre.setAttribute("role", "region");
+    pre.setAttribute("aria-label", `${lang} code`);
+    const code = document.createElement("code");
+    code.innerHTML = markup;
+    pre.appendChild(code);
+    return pre;
   }
 
   function renderMathBlock(b: Block): HTMLElement {
@@ -834,6 +869,13 @@ export function mountBrookMarkdown(
         frame = 0;
       }
       unsubscribe();
+      // Abandon any code block still tokenizing — its node is going away.
+      for (const mb of mounted.values()) {
+        if (mb.highlight) {
+          mb.highlight.cancel();
+          mb.highlight = undefined;
+        }
+      }
       // The caller owns the worker/stream — never call client.destroy() here
       // (same contract as the JSX renderer: unmounting never destroys the client).
       root.remove();
@@ -955,6 +997,14 @@ function isDepth0Boundary(prefix: string, full: string): boolean {
 export function tailOpenBlockId(snapshot: readonly Block[]): number | null {
   const tail = snapshot.length > 0 ? snapshot[snapshot.length - 1] : undefined;
   return tail && tail.open ? tail.id : null;
+}
+
+// A code block's DECODED source. Prefers the structured `kind.data.code` the
+// core emits under `blockData` — the same string the HTML decoder rebuilds,
+// without the whole-body regex + five entity passes.
+function codeText(b: Block): string {
+  const data = b.kind.data as { code?: string } | undefined;
+  return typeof data?.code === "string" ? data.code : decodeCodeText(b.html);
 }
 
 // Local copy of the canonical code-text decoder (kept here so dom.ts depends

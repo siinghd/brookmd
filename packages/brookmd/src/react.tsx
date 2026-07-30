@@ -1144,7 +1144,19 @@ function renderBlockContent({
   switch (kind) {
     case "CodeBlock": {
       const wantsCodeOverride = !!components && (!!components.pre || !!components.code);
-      if (!wantsCodeOverride) return <CodeBlock html={block.html} open={block.open} />;
+      if (!wantsCodeOverride) {
+        // Hand the renderer the structured decoded source when `blockData` is on
+        // — it is the same string `decodeText(html)` would rebuild, so the
+        // renderer skips a whole-body regex + five entity replaces per block.
+        const source = (block.kind.data as { code?: string } | undefined)?.code;
+        return (
+          <CodeBlock
+            html={block.html}
+            open={block.open}
+            code={typeof source === "string" ? source : undefined}
+          />
+        );
+      }
       break; // fall through to generic override-aware rendering
     }
     case "MathBlock":

@@ -837,25 +837,46 @@ pub(crate) fn indent_cols(line: &[u8]) -> usize {
     col
 }
 
-fn scan_table(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBlock> {
-    // Quick gate: needs `|` in the first line, AND second line must be a
-    // delimiter row (`|---|---|` with optional alignment colons).
-    let line = line_slice(bytes, start);
-    if !line.contains(&b'|') {
+/// The two-line gate every GFM table opens with: the line at `header` carries a
+/// `|`, and the line right after it is a delimiter row (`|---|:-:|`) with the
+/// same cell count. Returns that delimiter line's start.
+///
+/// Neither row may be indented 4+ columns — that is indented code, which no
+/// table opens under. GitHub gates only the DELIMITER row this way (a table
+/// interrupting a paragraph can have an indented header, since the header is
+/// paragraph continuation text); we gate both, deliberately. `scan` commits
+/// settled blocks and re-scans only the bytes after them, so a "the previous
+/// block ended for a table" hint cannot survive that boundary — the header line
+/// has to be able to open the table on its own, from a cold block start, or the
+/// streamed and one-shot renders would disagree. Gating both rows is also what
+/// keeps a container's lazy continuation lines inert: they are re-emitted at
+/// [`crate::render::LAZY_INDENT`] (4 columns) precisely so a re-scan can start
+/// no block there.
+///
+/// O(the two lines), and it never walks the table body: `scan_paragraph` can
+/// consult it once per line without turning the paragraph scan quadratic.
+fn table_delim_after(bytes: &[u8], header: usize) -> Option<usize> {
+    let line = line_slice(bytes, header);
+    if indent_cols(line) > 3 || !line.contains(&b'|') {
         return None;
     }
-    let next = line_end(bytes, start);
-    if next >= bytes.len() {
+    let delim_start = line_end(bytes, header);
+    if delim_start >= bytes.len() {
         return None;
     }
-    let delim = line_slice(bytes, next);
-    if !is_table_delimiter_row(delim) {
+    let delim = line_slice(bytes, delim_start);
+    if indent_cols(delim) > 3 || !is_table_delimiter_row(delim) {
         return None;
     }
     // §GFM: the header and delimiter rows must have the same number of cells.
     if count_table_columns(line) != count_table_columns(delim) {
         return None;
     }
+    Some(delim_start)
+}
+
+fn scan_table(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> Option<RawBlock> {
+    let next = table_delim_after(bytes, start)?;
     let mut pos = line_end(bytes, next);
     while pos < bytes.len() {
         // A blank line or a line that starts another block ends the table; any
@@ -938,6 +959,17 @@ fn scan_paragraph(bytes: &[u8], start: usize, ctx: ScanCtx<'_>) -> RawBlock {
             };
         }
         if would_start_other_block(bytes, pos, ctx) {
+            break;
+        }
+        // §GFM tables: a delimiter row directly under this line turns THIS line
+        // into a table header, so the paragraph ends one line early and `scan`'s
+        // next pass opens the table at it. That is the whole fix for a table
+        // nested in a list item / blockquote — those bodies are de-indented and
+        // re-scanned as mini-documents, where the item's own first line is an
+        // open paragraph the table has to interrupt. Probed AFTER the block
+        // starts above, so a pipe-carrying heading / quote / fence line still
+        // opens its own block instead of being eaten as a header row.
+        if table_delim_after(bytes, pos).is_some() {
             break;
         }
         pos = line_end(bytes, pos);

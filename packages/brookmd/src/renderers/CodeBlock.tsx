@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { highlight } from "../hi";
+import { highlightDeferred, highlightWithin } from "../hi-defer";
 import { extractLang } from "../block-props";
 
 /**
@@ -7,6 +8,12 @@ import { extractLang } from "../block-props";
  * the moment the parser commits the block (open=false), we run our in-house
  * tokenizer on the source and swap in highlighted HTML. Highlighting is
  * memoized on html identity so closed blocks never re-tokenize.
+ *
+ * The tokenizer runs in BUDGETED SLICES (see hi-defer.ts). The first slice runs
+ * during this render, so an ordinary block is highlighted in its very first
+ * paint exactly as before; a big block gets the plain escaped body immediately
+ * and swaps in its markup a few tasks later, instead of freezing the main
+ * thread for the whole pass. The markup is byte-identical either way.
  */
 
 function decodeText(html: string): string {
@@ -24,16 +31,68 @@ function decodeText(html: string): string {
 interface Props {
   html: string;
   open: boolean;
+  /**
+   * The block's DECODED source, carried by `kind.data.code` when `blockData` is
+   * on. Identical to `decodeText(html)` — supplying it skips that whole-body
+   * regex + five entity passes, which on a big fence is the same order of work
+   * as the highlight itself. Absent (blockData off) the HTML is decoded here.
+   */
+  code?: string;
 }
 
-function CodeBlockImpl({ html, open }: Props) {
+/** A deferred highlight result, tagged with the source it was produced from. */
+interface Slow {
+  text: string;
+  lang: string;
+  html: string;
+}
+
+function CodeBlockImpl({ html, open, code }: Props) {
   const lang = extractLang(html) || "text";
   // Decode once: highlighter and copy handler share the same source.
-  const text = useMemo(() => (open ? "" : decodeText(html)), [html, open]);
-  const highlighted = useMemo(() => {
+  const text = useMemo(() => (open ? "" : (code ?? decodeText(html))), [html, open, code]);
+  // The first slice, in this render pass. It finishes the whole block for all
+  // but the largest fences, so the usual case still paints highlighted on the
+  // first commit. A SERVER render has no later task to swap into (and its bytes
+  // are the response), so there it runs the whole pass synchronously.
+  const sync = useMemo(() => {
     if (!text) return null;
-    return highlight(text, lang);
+    return typeof window === "undefined" ? highlight(text, lang) : highlightWithin(text, lang);
   }, [text, lang]);
+
+  const [slow, setSlow] = useState<Slow | null>(null);
+
+  // Only a block that outran the first slice reaches the driver; everything
+  // else short-circuits and drops any result left over from superseded text.
+  useEffect(() => {
+    if (!text || sync !== null) {
+      setSlow((prev) => (prev === null ? prev : null)); // same value = no re-render
+      return;
+    }
+    const run = highlightDeferred(text, lang);
+    if (run.html !== null) {
+      setSlow({ text, lang, html: run.html });
+      return;
+    }
+    let live = true;
+    const rest = run.rest;
+    if (rest) {
+      rest.then((out) => {
+        if (live && out !== null) setSlow({ text, lang, html: out });
+      });
+    }
+    return () => {
+      live = false;
+      run.cancel();
+    };
+  }, [text, lang, sync]);
+
+  // The swap is gated on the source the markup came from, so a block whose text
+  // changes while a highlight is in flight falls back to the plain body rather
+  // than flashing the previous block's tokens. (The run itself is cancelled by
+  // the effect cleanup; this is the render-side half of the same guard.)
+  const highlighted =
+    sync ?? (slow !== null && slow.text === text && slow.lang === lang ? slow.html : null);
 
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
