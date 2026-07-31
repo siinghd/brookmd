@@ -4,6 +4,45 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.29.0 — 2026-07-31
+
+**Sublinear resources.** Total parse work has an Ω(n) floor and stays exactly
+there — but retained memory and reopen latency don't have to be O(n), and now
+they aren't. Requires `brookmd-core` 0.26.0. Both features are **web-path**
+(WASM + TS client); the native bindings (React Native / Kotlin / Swift /
+Flutter) share every parser-core improvement but consume `allBlocks()` and so
+keep full retention — see the platform matrix in the root README.
+
+### Added
+
+- **Instant thread reopen — `getPersistable()` / `hydrate()` /
+  `sourceFingerprint()`.** A finished (or in-flight) stream can be persisted
+  as a small JSON envelope — the blocks `getSnapshot()` showed plus a source
+  length/hash and a `done` flag — and a fresh `BrookClient` hydrates from it
+  with **no worker, no WASM, no parsing**: 1 MB / 2,250 blocks re-streams in
+  ~110 ms, hydrates in **~5.5 ms** (and a real browser reopen also skips
+  worker spin-up and WASM init). To *continue* a non-finalized thread, pass
+  the original source to `beginResume()`: the UI keeps showing hydrated
+  blocks while a background re-parse catches up — reusing the existing
+  divergence/adoption machinery, so every hydrated block keeps its exact id
+  across the swap and nothing visible remounts; appends stream live once
+  caught up. The envelope is a versioned **package** format
+  (`hydrateVersion`), deliberately not the wire contract; the README's
+  "Instant thread reopen" section documents the persistence and invalidation
+  contract.
+- **`retainCommittedHtml` — the parser no longer hoards the rendered
+  document.** The core kept every committed block's HTML alive for
+  `allBlocks()` — which the web worker path never calls. The worker now
+  defaults the flag **off**: retained memory beyond the source buffer drops
+  to the open tail only (measured: **53–70% less total retention** on 1 MB
+  streams, with the flag-off overhead above the raw source staying under
+  300 bytes at every point). Patches are byte-identical either way — committed
+  blocks are emitted exactly once and never re-read. Rust-side default stays
+  ON, so native bindings and `allBlocks()` consumers are unaffected;
+  `renderToString` pins it on (it assembles from `allBlocks`). Set
+  `retainCommittedHtml: true` in `ParserConfig` if you drive the worker and
+  want `allBlocks` fidelity.
+
 ## 0.28.0 — 2026-07-31
 
 **Browser-side linearity.** The parser and wire have been O(new bytes) per
