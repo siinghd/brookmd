@@ -4,6 +4,49 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.27.0 — 2026-07-31
+
+### Added
+
+- **Streaming syntax highlighting — open code blocks now highlight live, on by
+  default.** Since 0.19 the built-in highlighter deliberately waited for a
+  fence to close; a streaming block showed plain text. Open blocks now render
+  highlighted as they grow, and the mechanism preserves every guarantee the
+  deferred design existed to protect:
+
+  - **Byte-identical at settle.** All committed markup comes from seeded runs
+    of the same resumable tokenizer that `highlight()` uses — the frozen
+    prefix is only ever extended at *checkpoints* (positions provably outside
+    any future token: after a newline in whitespace, ≥ 3 bytes behind the
+    stream head, with no unterminated string/comment/template live; HTML
+    checkpoints after `>` instead). When the block closes, one seeded run
+    finishes the tail, so the final bytes equal a one-shot `highlight()` —
+    pinned by a ~44,000-case fuzz (all languages, chunk sizes down to 1 byte,
+    plus speculative-revision streams) asserting settle-identity and that
+    every intermediate frozen prefix is a byte-prefix of the final output.
+  - **Bounded work, independent of block size.** Between checkpoints, an
+    unterminated string/comment advances via an O(1)-state scanner over only
+    the new bytes; the tail re-scan is capped at 8 KB (past the cap the tail
+    renders plain until the next checkpoint — correctness unaffected). Total
+    tokenization work measures ≈ 5.7× the streamed bytes end-to-end against
+    the real parser, flat from 288 B to 23 KB blocks (naive re-highlighting
+    measures 812× more at 23 KB); a work-bound test enforces < 6×. The
+    50 000-char plain-escape guard still applies and discards streaming state.
+  - **The tail is speculative.** The few tokens nearest the stream head may
+    change color as bytes arrive (an unterminated `"` reads as plain until its
+    closer lands) — the same speculative-tail behavior brookmd's links and
+    emphasis already have. Frozen output never changes.
+
+  Opt out with `streamingHighlight={false}` on `BrookMarkdown` (React) or
+  `streamingHighlight: false` in `mountBrookMarkdown` options (DOM, and via it
+  the Web Component and Vue/Svelte/Solid adapters) — that restores 0.26.1's
+  plain-until-close exactly. Not a `ParserConfig` field: highlighting is a
+  renderer concern; the parser, wire, and WASM are untouched. SSR is
+  unchanged (closed blocks, synchronous), and `components.CodeBlock` /
+  `pre` / `code` overrides still bypass the built-in highlighter entirely.
+  Closing a block that streamed in now also highlights near-instantly: the
+  close-time pass reuses the accumulated prefix instead of starting over.
+
 ## 0.26.1 — 2026-07-30
 
 Two fixes found by benchmarking 0.26.0 against real chat traffic. Requires
