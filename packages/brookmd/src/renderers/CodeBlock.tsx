@@ -1,7 +1,10 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { highlight } from "../hi";
 import { highlightDeferred, highlightWithin } from "../hi-defer";
 import { createInc, incHighlight, incSeed, type IncState } from "../hi-inc";
+import { newIncCode, paintIncCode, type IncCode } from "../splice";
+import { useHtmlSplice } from "../react-splice";
+import type { Block } from "../types-core";
 import { extractLang } from "../block-props";
 
 /**
@@ -40,6 +43,18 @@ function decodeText(html: string): string {
 }
 
 
+/**
+ * `useLayoutEffect` on the client, `useEffect` on the server.
+ *
+ * The layout timing is load-bearing on the client — a passive effect would show
+ * one frame of stale (or empty) content per patch — but React warns when
+ * `useLayoutEffect` is called during SSR, where it cannot run at all. Chosen
+ * ONCE at module scope so hook order is identical in both environments; the
+ * server branch is inert either way, because the markup it renders is already
+ * the block's full html.
+ */
+const useIsoLayoutEffect = typeof window !== "undefined" ? useLayoutEffect : useEffect;
+
 interface Props {
   html: string;
   open: boolean;
@@ -52,6 +67,17 @@ interface Props {
   code?: string;
   /** Highlight the block while it is still open. Default true. */
   streamingHighlight?: boolean;
+  /**
+   * The block this markup came from, when the renderer is driven by the stream.
+   * Only used to apply the wire's `html_delta` to the PLAIN escaped body of an
+   * open fence (the `streamingHighlight: false` / no-language path) instead of
+   * re-setting its whole innerHTML each patch. Absent → that body rebuilds, as
+   * it always did.
+   */
+  block?: Block;
+  /** @internal TEST-ONLY: force the pre-mirror path (a full `innerHTML` set of
+   *  the whole markup on every patch) so the parity fuzz has a reference. */
+  __fullRebuild?: boolean;
 }
 
 /** A deferred highlight result, tagged with the source it was produced from. */
@@ -61,7 +87,7 @@ interface Slow {
   html: string;
 }
 
-function CodeBlockImpl({ html, open, code, streamingHighlight }: Props) {
+function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebuild }: Props) {
   const lang = extractLang(html) || "text";
   // Decode once: highlighter and copy handler share the same source.
   const text = useMemo(() => (open ? "" : (code ?? decodeText(html))), [html, open, code]);
@@ -81,6 +107,18 @@ function CodeBlockImpl({ html, open, code, streamingHighlight }: Props) {
   // state advances a cursor.
   const incRef = useRef<IncState | null>(null);
   const [inc, setInc] = useState<{ lang: string; html: string } | null>(null);
+  // The live `<code>` while the streaming markup is on screen, plus the
+  // frozen/tail mirror painted into it. React renders that element EMPTY (no
+  // children, no dangerouslySetInnerHTML) so it never touches its contents; the
+  // layout effect below owns them and appends only what hi-inc just settled
+  // plus the CAP-bounded tail. Without this the component re-set the whole
+  // highlighted body — on a 20 KB fence, ~7x its own size — every patch.
+  const codeRef = useRef<HTMLElement | null>(null);
+  const mirrorRef = useRef<IncCode | null>(null);
+  // The PLAIN body's host, for the same reason one level up: while a fence
+  // streams unhighlighted its `<div>`'s innerHTML is exactly `block.html`, so
+  // the generic delta splice applies to it verbatim.
+  const plainRef = useRef<HTMLDivElement | null>(null);
 
   // The first slice, in this render pass. It finishes the whole block for all
   // but the largest fences, so the usual case still paints highlighted on the
@@ -145,13 +183,54 @@ function CodeBlockImpl({ html, open, code, streamingHighlight }: Props) {
   // changes while a highlight is in flight falls back to the plain body rather
   // than flashing the previous block's tokens. (The run itself is cancelled by
   // the effect cleanup; this is the render-side half of the same guard.)
-  const highlighted =
-    sync ??
-    (slow !== null && slow.text === text && slow.lang === lang ? slow.html : null) ??
-    // The streaming tail. Not gated on `openText` identity: the markup lags the
-    // props by one commit, and showing last patch's spans beats flashing the
-    // whole block back to plain every tick. A language change does invalidate it.
-    (streaming && inc !== null && inc.lang === lang ? inc.html : null);
+  const settled = sync ?? (slow !== null && slow.text === text && slow.lang === lang ? slow.html : null);
+  // The streaming tail. Not gated on `openText` identity: the markup lags the
+  // props by one commit, and showing last patch's spans beats flashing the
+  // whole block back to plain every tick. A language change does invalidate it.
+  const streamed = streaming && inc !== null && inc.lang === lang ? inc.html : null;
+  const highlighted = settled ?? streamed;
+  // Only the STREAMING markup is mirrored: it is the one that is re-derived on
+  // every patch, and it is the only one hi-inc can split. A settled block writes
+  // its final markup through React exactly as before (once — its node is then
+  // memo-frozen), which is also what makes the handoff at close clean: the
+  // element goes back to `dangerouslySetInnerHTML` and React overwrites whatever
+  // the mirror left behind with the byte-identical one-shot result.
+  const mirrored = settled === null && streamed !== null && !__fullRebuild;
+
+  // Paint the mirror BEFORE the browser paints, in the same commit as the render
+  // that produced this markup — a passive effect here would show an empty
+  // `<code>` for one frame every time the element mounts. Server-side there is
+  // no commit at all: `streaming` gates on `typeof window`, so `mirrored` is
+  // never true during SSR and this is inert. Deliberately dependency-free: it
+  // must re-check the node identity on every commit, and its own bookkeeping
+  // makes a repeat run (React StrictMode's double-invoke) a no-op.
+  useIsoLayoutEffect(() => {
+    if (!mirrored) {
+      mirrorRef.current = null;
+      return;
+    }
+    const node = codeRef.current;
+    const st = incRef.current;
+    if (node === null || st === null || streamed === null) return;
+    let m = mirrorRef.current;
+    if (m === null || m.code !== node || m.lang !== lang) {
+      // A fresh (or replaced) element: nothing of ours is in it yet.
+      node.innerHTML = "";
+      m = newIncCode(node, lang, st);
+      mirrorRef.current = m;
+    }
+    if (!paintIncCode(m, st, streamed)) {
+      // The split invariant broke (see splice.ts). Fall back to the whole
+      // markup and drop the mirror so the next commit re-seeds it.
+      node.innerHTML = streamed;
+      mirrorRef.current = null;
+    }
+  });
+
+  // Hooks are unconditional; `enabled` decides whether it does anything. Only
+  // an OPEN fence with no highlighted markup renders the plain body, and only
+  // then is `block.html` what that node contains.
+  const plainSeed = useHtmlSplice(plainRef, block, open && highlighted === null && !__fullRebuild);
 
   const [copied, setCopied] = useState(false);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -221,10 +300,26 @@ function CodeBlockImpl({ html, open, code, streamingHighlight }: Props) {
           // tabIndex=0 + role/label so keyboard users can scroll long code and
           // screen readers announce the region with its language.
           <pre tabIndex={0} role="region" aria-label={`${lang} code`}>
-            <code dangerouslySetInnerHTML={{ __html: highlighted }} />
+            {mirrored ? (
+              // Rendered with NO children and NO dangerouslySetInnerHTML, so
+              // React never writes into it; the layout effect above owns it.
+              // Same element type and position as the settled form below, so
+              // the close-time swap updates this node in place rather than
+              // remounting it — and React's own innerHTML write at that point
+              // is what discards the mirror's nodes.
+              <code ref={codeRef} />
+            ) : (
+              <code dangerouslySetInnerHTML={{ __html: highlighted }} />
+            )}
           </pre>
         ) : (
-          <div tabIndex={0} role="region" aria-label={`${lang} code`} dangerouslySetInnerHTML={{ __html: html }} />
+          <div
+            tabIndex={0}
+            role="region"
+            aria-label={`${lang} code`}
+            ref={plainRef}
+            dangerouslySetInnerHTML={{ __html: plainSeed ?? html }}
+          />
         )}
       </div>
     </div>

@@ -2,7 +2,8 @@ import type { BrookClient } from "./client";
 import { highlightDeferred, type DeferredHighlight } from "./hi-defer";
 import { createInc, incHighlight, incSeed, type IncState } from "./hi-inc";
 import { morph } from "./morph";
-import type { Align, Block, BlockComponentProps, BlockKindTag, Decorator, ListData, RenderMetricsHook, TableData, UrlTransform } from "./types-core";
+import { newIncCode, paintIncCode, spliceHtml, spliceKeep, type IncCode } from "./splice";
+import type { Align, Block, BlockComponentProps, BlockKindTag, ContainerData, Decorator, ListData, RenderMetricsHook, TableData, UrlTransform } from "./types-core";
 import { blockProps, extractLang } from "./block-props";
 import { decorateSegments } from "./decorate";
 import { safeUrl } from "./url-safety";
@@ -140,6 +141,33 @@ export interface MountOptions {
    * `client.getMetrics().rebuildCount`.
    */
   onRenderMetrics?: RenderMetricsHook;
+  /**
+   * @internal TEST-ONLY. Turn off the incremental apply fast paths — the open
+   * code block's frozen/tail mirror and the delta-driven child splice — so every
+   * changed open block rebuilds its whole node, exactly as it did before those
+   * existed. The DOM-parity fuzz mounts one renderer with this on and one with it
+   * off over the same patch stream and asserts their `innerHTML` matches after
+   * every sync: correctness must never depend on a fast path firing. Not part of
+   * the supported API and never useful in an app.
+   */
+  __fullRebuild?: boolean;
+}
+
+// How often the keyed list / container syncs were tried and how often they
+// proved out. Same pattern (and same negligible cost) as splice.ts's
+// `__spliceStats`: the parity fuzz asserts the fast path actually FIRES, so a
+// change that quietly turns every patch back into a whole-node rebuild fails
+// loudly instead of just getting quadratic again.
+let keyedAttempts = 0;
+let keyedHits = 0;
+/** @internal Test-only. */
+export function __keyedStats(): { attempts: number; hits: number } {
+  return { attempts: keyedAttempts, hits: keyedHits };
+}
+/** @internal Test-only. */
+export function __resetKeyedStats(): void {
+  keyedAttempts = 0;
+  keyedHits = 0;
 }
 
 // Per-kind off-screen size estimate for `contain-intrinsic-size`. Duplicated
@@ -156,6 +184,11 @@ interface MountedBlock {
   id: number;
   node: HTMLElement;
   html: string;
+  /** The Block object `html` came from. `spliceKeep` is keyed on Block IDENTITY
+   *  (that is how it finds the wire delta that produced the new one), so the
+   *  renderer has to hold the object, not just its html. Always the same object
+   *  the store published — no extra retention. */
+  block: Block;
   open: boolean;
   speculative: boolean;
   kind: BlockKindTag;
@@ -167,6 +200,13 @@ interface MountedBlock {
   // Lets a later patch update just the growing trailing row in place instead of
   // rebuilding the whole node.
   table?: KeyedTable;
+  // Set only for an OPEN list rendered via the keyed-items path (blockData on).
+  // Lets a later patch rewrite just the items whose html changed.
+  list?: KeyedList;
+  // Set only for an OPEN Blockquote / Alert rendered via the keyed-nested path
+  // (blockData on). Lets a later patch replace just the nested sub-blocks whose
+  // html changed.
+  container?: KeyedContainer;
   // Set only while a code block too big for one slice is still tokenizing (see
   // hi-defer.ts). Cancelled when the node is rebuilt/dropped or the renderer is
   // destroyed, and used as the token that proves a landed result is not stale.
@@ -178,6 +218,16 @@ interface MountedBlock {
   // or stops being a code block; a revised (rather than extended) body is caught
   // by the state's own guard, which salvages or restarts it.
   inc?: IncState;
+  // Set only while an OPEN code block's `<code>` is being driven by the
+  // incremental highlighter: the live element plus how much of `inc.frozenHtml`
+  // is already mirrored into it. Lets a patch APPEND the newly-frozen markup and
+  // rewrite only the (CAP-bounded) speculative tail, instead of re-setting the
+  // whole `innerHTML`. Dropped whenever the node is rebuilt or removed.
+  codeInc?: IncCode;
+  // Set only for an OPEN code block rendered with the PLAIN escaped body: the
+  // `<div>` whose innerHTML is exactly `b.html`, so the generic delta splice
+  // applies to it too. Cleared when a deferred highlight replaces that div.
+  plainCode?: HTMLElement;
   // True when `node` is the generic `<div class="brook-block…">` whose entire
   // `innerHTML` is exactly `html` (no special wrapper, no sanitizer transform).
   // Only such a node is eligible for the prefix-extension tail-append fast path.
@@ -197,6 +247,64 @@ interface KeyedTable {
   committed: number;
   // The current open trailing `<tr>` (re-rendered each patch); replaced in place.
   lastRow: HTMLTableRowElement | null;
+}
+
+/**
+ * Incremental keyed state for one OPEN list (`blockData` on). Each `<li>` is
+ * stamped once from `ListData.items[i].html` and afterwards rewritten only when
+ * THAT item's html actually changes.
+ *
+ * ## The identity, and why html-equality is the whole key
+ *
+ * The items channel carries no id, so the key is the pair (index, html). That is
+ * sound because the core only ever appends items and revises the LAST one: an
+ * item's html, once a later item exists, is byte-stable for the rest of the
+ * stream (it is `Rc`-shared upstream and re-serialized verbatim into every
+ * patch). So "same index, same html" really does mean "the same item, unchanged",
+ * and comparing the strings is what proves it rather than assuming it — no
+ * committed-watermark heuristic that a rewrite could silently invalidate.
+ *
+ * That matters for the one case a watermark WOULD get wrong: a tight→loose flip.
+ * The moment a blank line makes the list loose, every item's html legitimately
+ * changes at once (`a` → `<p>a</p>`), and this resyncs all of them. It costs one
+ * O(current size) pass, once, when the flip happens — not on every patch, which
+ * is what the whole-node rebuild it replaces was doing.
+ *
+ * Per patch the scan compares `items.length` strings; the ones that are equal
+ * cost a memcmp and write NOTHING to the document, which is the term that
+ * actually dominates (an `innerHTML` set re-parses HTML; a compare does not).
+ */
+interface KeyedList {
+  /** The live `<ul>` / `<ol>`; its element children are the `<li>`s, in order. */
+  list: HTMLElement;
+  /** `<ul>` ⇄ `<ol>` is a different element, so a flip forces a rebuild. */
+  ordered: boolean;
+  /** The `start` currently reflected in the `start="N"` attribute. */
+  start?: number;
+  /** The html currently rendered into each `<li>`, index-aligned with them. */
+  items: string[];
+}
+
+/**
+ * Incremental keyed state for one OPEN Blockquote / Alert (`blockData` on).
+ * Same key as {@link KeyedList} — (index, html) over `ContainerData.nested` —
+ * and sound for the same reason: the core appends nested sub-blocks and revises
+ * only the last one, so an entry with an earlier index and unchanged html is the
+ * same sub-block untouched. A changed entry has its whole child node replaced
+ * (a nested entry's html carries its own root tag, unlike a list item's inner
+ * html), which is exactly what the full rebuild built for it.
+ */
+interface KeyedContainer {
+  /** The live `<blockquote>` / alert `<div>` inside the block node. */
+  wrapper: HTMLElement;
+  /** Wrapper children BEFORE the nested ones: 1 for an alert title, else 0. */
+  offset: number;
+  /** The wrapper's opening tag, whose attributes were applied at build time. */
+  openTag: string;
+  /** An alert's title markup, kept as the first child (never in `nested`). */
+  title: string;
+  /** The html currently rendered for each nested entry, index-aligned. */
+  nested: string[];
 }
 
 export function mountBrookMarkdown(
@@ -223,6 +331,7 @@ export function mountBrookMarkdown(
   const streamingHighlight = options.streamingHighlight !== false;
   const batch = options.batch !== false && typeof requestAnimationFrame === "function";
   const morphOpenBlocks = options.morphOpenBlocks === true;
+  const fullRebuild = options.__fullRebuild === true;
 
   const root = document.createElement("div");
   root.className = options.className ? `brook-md ${options.className}` : "brook-md";
@@ -272,7 +381,7 @@ export function mountBrookMarkdown(
         const t0 = onRenderMetrics && hasPerf ? performance.now() : 0;
         const mb: MountedBlock = {
           id: b.id, node: undefined as unknown as HTMLElement,
-          html: b.html, open: b.open, speculative: b.speculative, kind: b.kind.type,
+          html: b.html, block: b, open: b.open, speculative: b.speculative, kind: b.kind.type,
           renderCount: 0, toggleCount: 0, generic: false,
         };
         mb.node = renderBlock(b, mb);
@@ -288,6 +397,28 @@ export function mountBrookMarkdown(
         continue;
       }
       const t0 = onRenderMetrics && hasPerf ? performance.now() : 0;
+      // Incremental-code fast path: an OPEN fence already mounted through hi-inc
+      // appends whatever its frozen prefix just settled and rewrites ONLY the
+      // speculative tail. That is the single biggest write on the streaming path
+      // — a 20 KB fence otherwise re-sets ~7× its own size in highlighted markup
+      // on every patch — and keeping the node also keeps the `<pre>`'s scroll
+      // offset and any text selection inside the frozen region alive. Reuses the
+      // same block node (no replaceWith), so it still feeds the render probe.
+      if (
+        existing.codeInc &&
+        existing.inc &&
+        b.open &&
+        existing.open &&
+        b.kind.type === "CodeBlock" &&
+        existing.kind === "CodeBlock" &&
+        syncIncCode(existing, b)
+      ) {
+        if (onRenderMetrics) noteRender(existing, b, t0);
+        existing.html = b.html;
+        existing.block = b;
+        existing.speculative = b.speculative;
+        continue;
+      }
       // Keyed-table fast path: an OPEN table that already mounted via the keyed
       // tbody updates only its growing trailing row in place — committed `<tr>`
       // nodes are never rebuilt. Reuses the same block node (no replaceWith).
@@ -303,10 +434,59 @@ export function mountBrookMarkdown(
             existing.node.classList.toggle("brook-speculative", b.speculative);
           }
           existing.html = b.html;
+          existing.block = b;
           existing.open = b.open;
           existing.speculative = b.speculative;
           continue;
         }
+      }
+      // Keyed-list fast path: an OPEN list that mounted through the keyed-items
+      // path rewrites only the `<li>`s whose item html actually changed (normally
+      // just the open last one) and appends the items that have since arrived.
+      // Without this the keyed renderer re-stamped EVERY `<li>` on every patch —
+      // it routes around the generic splice, so it was the last quadratic DOM
+      // writer left. Committed `<li>` nodes are now never touched, so a selection
+      // inside one survives. Reuses the same block node (no replaceWith), and is
+      // still a render of it, so it feeds the render-churn probe.
+      if (
+        !fullRebuild &&
+        existing.list &&
+        b.open &&
+        b.kind.type === "List" &&
+        existing.kind === "List"
+      ) {
+        const ld = b.kind.data as ListData | undefined;
+        if (ld && syncKeyedList(existing.list, ld)) {
+          if (onRenderMetrics) noteRender(existing, b, t0);
+          // The node stays the keyed list mirror, so only the class string
+          // (which encodes `speculative`) can have moved.
+          existing.node.className = genericClassName(b);
+          existing.html = b.html;
+          existing.block = b;
+          existing.open = b.open;
+          existing.speculative = b.speculative;
+          continue;
+        }
+      }
+      // Keyed-container fast path: the same treatment for an OPEN Blockquote /
+      // Alert's `nested` sub-blocks — replace only the entries whose html
+      // changed, append the new ones, and leave every settled sub-block's node
+      // alone.
+      if (
+        !fullRebuild &&
+        existing.container &&
+        b.open &&
+        existing.kind === b.kind.type &&
+        (b.kind.type === "Blockquote" || b.kind.type === "Alert") &&
+        syncKeyedContainer(existing.container, b)
+      ) {
+        if (onRenderMetrics) noteRender(existing, b, t0);
+        existing.node.className = genericClassName(b);
+        existing.html = b.html;
+        existing.block = b;
+        existing.open = b.open;
+        existing.speculative = b.speculative;
+        continue;
       }
       // Opt-in morph fast path: an open generic block that only grew its HTML
       // (same kind, still routed through the innerHTML path) is morphed in place,
@@ -325,6 +505,7 @@ export function mountBrookMarkdown(
         morph(existing.node, sanitize ? sanitize(b.html) : b.html);
         if (onRenderMetrics) noteRender(existing, b, t0);
         existing.html = b.html;
+        existing.block = b;
         existing.speculative = b.speculative;
         existing.node.className = genericClassName(b);
         // The node stays the generic innerHTML mirror, so it remains eligible for
@@ -353,11 +534,74 @@ export function mountBrookMarkdown(
         existing.node.insertAdjacentHTML("beforeend", b.html.slice(existing.html.length));
         if (onRenderMetrics) noteRender(existing, b, t0);
         existing.html = b.html;
+        existing.block = b;
         continue;
+      }
+      // Delta-driven child splice (see splice.ts). The prefix-append path above
+      // can only fire when the new html *starts with* the old one, which an open
+      // block almost never does — the core speculatively closes it, so every
+      // patch rewrites the trailing `</em></p>`. The wire already computed the
+      // real boundary; this applies it, appending inside the chain of elements
+      // still open at that offset and leaving every node before it — including a
+      // live text selection — untouched. Bails to the rebuild below whenever it
+      // cannot prove the shape.
+      if (
+        !fullRebuild &&
+        !sanitize &&
+        !hasInlineTransforms &&
+        existing.generic &&
+        b.open &&
+        existing.open &&
+        existing.kind === b.kind.type &&
+        usesGenericPath(b)
+      ) {
+        const keep = spliceKeep(existing.block, b);
+        if (keep !== undefined && spliceHtml(existing.node, existing.html, b.html, keep)) {
+          if (onRenderMetrics) noteRender(existing, b, t0);
+          existing.html = b.html;
+          existing.block = b;
+          existing.speculative = b.speculative;
+          // The node stays the generic innerHTML mirror, so only the class
+          // string (which encodes `speculative`) can have moved.
+          existing.node.className = genericClassName(b);
+          continue;
+        }
+      }
+      // Same splice, applied to an open code block whose body is the PLAIN
+      // escaped `<pre><code>` (no highlighter, `streamingHighlight: false`, or a
+      // language with no table): that `<div>`'s innerHTML is exactly `b.html`,
+      // so the identical reasoning applies one level down.
+      if (
+        !fullRebuild &&
+        existing.plainCode &&
+        b.open &&
+        existing.open &&
+        b.kind.type === "CodeBlock" &&
+        existing.kind === "CodeBlock"
+      ) {
+        const keep = spliceKeep(existing.block, b);
+        if (keep !== undefined && spliceHtml(existing.plainCode, existing.html, b.html, keep)) {
+          if (onRenderMetrics) noteRender(existing, b, t0);
+          existing.html = b.html;
+          existing.block = b;
+          existing.speculative = b.speculative;
+          continue;
+        }
       }
       // Changed → rebuild and swap in place. A table that just closed (or whose
       // data vanished) drops its keyed manager and re-renders the full HTML once.
       existing.table = undefined;
+      // Same for the keyed list / container managers: both point at nodes inside
+      // the subtree about to be discarded, and whichever branch the rebuild takes
+      // re-seeds its own. A closed (or kind-changed) block leaves them unset, so
+      // it can never be resynced against a node that is no longer on screen.
+      existing.list = undefined;
+      existing.container = undefined;
+      // The frozen/tail mirror and the plain-body handle both point into the
+      // node we are about to discard; renderCodeBlock re-seeds whichever the
+      // new node turns out to have.
+      existing.codeInc = undefined;
+      existing.plainCode = undefined;
       // Incremental highlight state belongs to a code block's SOURCE, not to its
       // node, so a per-patch rebuild must keep it (that is what makes the open
       // block linear). It only becomes meaningless when the block stops being a
@@ -374,6 +618,7 @@ export function mountBrookMarkdown(
       existing.node = node;
       if (onRenderMetrics) noteRender(existing, b, t0);
       existing.html = b.html;
+      existing.block = b;
       existing.open = b.open;
       existing.speculative = b.speculative;
       existing.kind = b.kind.type;
@@ -387,6 +632,8 @@ export function mountBrookMarkdown(
         if (!seen.has(id)) {
           if (mb.highlight) mb.highlight.cancel();
           mb.inc = undefined;
+          mb.codeInc = undefined;
+          mb.plainCode = undefined;
           mb.node.remove();
           mounted.delete(id);
         }
@@ -498,7 +745,7 @@ export function mountBrookMarkdown(
     // structured items instead of re-parsing the whole `<ul>`/`<ol>` HTML. Closed
     // lists fall through (their node is reused untouched, never rebuilt).
     if (b.open && kind === "List" && !hasInlineTransforms) {
-      const keyed = renderKeyedList(b);
+      const keyed = renderKeyedList(b, mb);
       if (keyed) return keyed;
     }
 
@@ -513,7 +760,7 @@ export function mountBrookMarkdown(
     // (it must run over the full wrapper string). Closed blocks fall through —
     // their node fingerprint is stable, so they are never rebuilt anyway.
     if (b.open && !sanitize && !hasInlineTransforms && (kind === "Blockquote" || kind === "Alert")) {
-      const wrapper = renderKeyedContainer(b);
+      const wrapper = renderKeyedContainer(b, mb);
       if (wrapper) {
         node.appendChild(wrapper);
         return node;
@@ -539,26 +786,88 @@ export function mountBrookMarkdown(
   // node from the structured `kind.data.items`, one `<li>` per item with its inner
   // HTML sanitized via the shared `sanitize` path. Returns `null` when the items
   // channel is absent (blockData off) so the caller falls back to opaque HTML.
-  function renderKeyedList(b: Block): HTMLElement | null {
+  function renderKeyedList(b: Block, mb: MountedBlock): HTMLElement | null {
     const ld = b.kind.data as ListData | undefined;
     const items = ld?.items;
     if (!Array.isArray(items) || items.length === 0) return null;
     const node = document.createElement("div");
-    node.className =
-      "brook-block brook-block-list" +
-      (b.open ? " brook-open" : "") +
-      (b.speculative ? " brook-speculative" : "");
-    const list = document.createElement(ld?.ordered ? "ol" : "ul");
-    if (ld?.ordered && ld.start !== undefined && ld.start !== 1) {
-      list.setAttribute("start", String(ld.start));
+    // Byte-identical to `genericClassName(b)` for a List; shared so the keyed
+    // sync's in-place class update cannot drift from what a rebuild would set.
+    node.className = genericClassName(b);
+    const ordered = !!ld?.ordered;
+    const list = document.createElement(ordered ? "ol" : "ul");
+    if (ordered && ld!.start !== undefined && ld!.start !== 1) {
+      list.setAttribute("start", String(ld!.start));
     }
-    for (const it of items) {
+    const rendered: string[] = new Array(items.length);
+    for (let i = 0; i < items.length; i++) {
       const li = document.createElement("li");
-      li.innerHTML = sanitize ? sanitize(it.html) : it.html;
+      li.innerHTML = sanitize ? sanitize(items[i].html) : items[i].html;
       list.appendChild(li);
+      rendered[i] = items[i].html;
     }
     node.appendChild(list);
+    // Remember what is on screen so the next patch rewrites only what moved.
+    mb.list = { list, ordered, start: ld?.start, items: rendered };
     return node;
+  }
+
+  /**
+   * Bring an already-mounted keyed list up to date against the new `items`.
+   * Returns `false` when the shape is not one it can prove, and the caller
+   * rebuilds the whole node — which is also why the mutations below need no
+   * rollback: a `false` result always discards this subtree. Every bail is
+   * therefore taken BEFORE the first write.
+   */
+  function syncKeyedList(km: KeyedList, ld: ListData): boolean {
+    keyedAttempts++;
+    const items = ld.items;
+    // An empty/absent items channel is what `renderKeyedList` refuses to build
+    // from, so it is what the rebuild has to see too.
+    if (!Array.isArray(items) || items.length === 0) return false;
+    // `<ul>` and `<ol>` are different elements — a flip is a new node.
+    if (!!ld.ordered !== km.ordered) return false;
+    const cur = km.items;
+    const kids = km.list.children;
+    // The manager must still describe the live element exactly; anything else
+    // (an override or a consumer mutating our subtree) means the index key no
+    // longer identifies what we think it does.
+    if (kids.length !== cur.length) return false;
+
+    // The `start="N"` attribute, on exactly the condition the builder uses.
+    if (ld.start !== km.start) {
+      if (km.ordered && ld.start !== undefined && ld.start !== 1) {
+        km.list.setAttribute("start", String(ld.start));
+      } else {
+        km.list.removeAttribute("start");
+      }
+      km.start = ld.start;
+    }
+
+    const n = items.length;
+    // A speculative revision withdrew trailing items: drop their `<li>`s. The
+    // nested entries are always the trailing children, so this is a pop.
+    while (cur.length > n) {
+      km.list.removeChild(km.list.lastElementChild!);
+      cur.pop();
+    }
+    // Rewrite only the items whose html actually moved. In the streaming case
+    // that is exactly one (the open last item); on a tight→loose flip it is all
+    // of them, which is a legitimate one-off O(current size) resync.
+    for (let i = 0; i < cur.length; i++) {
+      if (cur[i] === items[i].html) continue;
+      (kids[i] as HTMLElement).innerHTML = sanitize ? sanitize(items[i].html) : items[i].html;
+      cur[i] = items[i].html;
+    }
+    // Append the items that have arrived since the last patch.
+    for (let i = cur.length; i < n; i++) {
+      const li = document.createElement("li");
+      li.innerHTML = sanitize ? sanitize(items[i].html) : items[i].html;
+      km.list.appendChild(li);
+      cur.push(items[i].html);
+    }
+    keyedHits++;
+    return true;
   }
 
   // Build a Blockquote / Alert wrapper with KEYED inner sub-block nodes from the
@@ -566,30 +875,90 @@ export function mountBrookMarkdown(
   // `class`/`data-alert`/`role`) come from `b.html`'s opening tag so the streamed
   // wrapper is byte-faithful; the alert title `<p>` is kept as the first child
   // (it is the wrapper, not a body block). Returns null when `nested` is absent.
-  function renderKeyedContainer(b: Block): HTMLElement | null {
-    const nested = (b.kind.data as { nested?: { html: string }[] } | undefined)?.nested;
+  function renderKeyedContainer(b: Block, mb: MountedBlock): HTMLElement | null {
+    const nested = (b.kind.data as ContainerData | undefined)?.nested;
     if (!Array.isArray(nested)) return null;
     const tagName = b.kind.type === "Alert" ? "div" : "blockquote";
     const wrapper = document.createElement(tagName);
     applyOpenTagAttrs(wrapper, b.html);
+    let offset = 0;
+    let title = "";
     if (b.kind.type === "Alert") {
-      const title = alertTitleHtml(b.html);
+      title = alertTitleHtml(b.html);
       if (title) {
         const t = document.createElement("div");
         t.innerHTML = title;
         const titleNode = t.firstElementChild;
-        if (titleNode) wrapper.appendChild(titleNode);
+        if (titleNode) {
+          wrapper.appendChild(titleNode);
+          offset = 1;
+        }
       }
     }
+    const rendered: string[] = new Array(nested.length);
     for (let i = 0; i < nested.length; i++) {
-      const child = document.createElement("div");
-      child.innerHTML = nested[i].html;
-      const inner = child.firstElementChild;
-      // A nested block is a single root element (`<p>…</p>`, `<ul>…</ul>`, …);
-      // unwrap the temp `<div>` so the wrapper holds the real element directly.
-      wrapper.appendChild(inner ?? child);
+      wrapper.appendChild(nestedChild(nested[i].html));
+      rendered[i] = nested[i].html;
     }
+    mb.container = { wrapper, offset, openTag: openTagOf(b.html), title, nested: rendered };
     return wrapper;
+  }
+
+  // One nested sub-block's node. A nested block is a single root element
+  // (`<p>…</p>`, `<ul>…</ul>`, …), so the temp `<div>` is unwrapped and the
+  // wrapper holds the real element directly. Shared by the build and the sync so
+  // a replaced child is byte-identical to the one a rebuild would have made.
+  function nestedChild(html: string): Element {
+    const child = document.createElement("div");
+    child.innerHTML = html;
+    return child.firstElementChild ?? child;
+  }
+
+  /**
+   * Bring an already-mounted keyed container up to date against the new
+   * `nested`. Like {@link syncKeyedList}, `false` means the caller rebuilds the
+   * node outright, so every bail is taken before the first write.
+   */
+  function syncKeyedContainer(kc: KeyedContainer, b: Block): boolean {
+    keyedAttempts++;
+    const nested = (b.kind.data as ContainerData | undefined)?.nested;
+    if (!Array.isArray(nested)) return false;
+    // The wrapper's attributes were stamped from the opening tag at build time,
+    // so a different opening tag is a different wrapper. This is an O(1) slice
+    // (the first `>` is a handful of chars in), and it is also what makes the
+    // alert title stable: the alert's kind lives in that tag's class.
+    if (openTagOf(b.html) !== kc.openTag) return false;
+    // …and belt-and-braces for the title itself, which is the one child the
+    // `nested` key does not cover. Alert-only: the regex anchors on the title
+    // `<p>`, which is the wrapper's first child, so the match terminates near
+    // the start of the html rather than scanning the whole block.
+    if (b.kind.type === "Alert" && alertTitleHtml(b.html) !== kc.title) return false;
+    const cur = kc.nested;
+    const kids = kc.wrapper.children;
+    if (kids.length !== kc.offset + cur.length) return false;
+
+    const n = nested.length;
+    // A speculative revision withdrew trailing sub-blocks. They are the trailing
+    // children (the alert title is always first), so this is a pop.
+    while (cur.length > n) {
+      kc.wrapper.removeChild(kc.wrapper.lastElementChild!);
+      cur.pop();
+    }
+    // Replace only the sub-blocks whose html moved — normally just the open last
+    // one. A nested entry's html carries its own root tag, so the whole child
+    // node is swapped rather than its innerHTML rewritten.
+    for (let i = 0; i < cur.length; i++) {
+      if (cur[i] === nested[i].html) continue;
+      kc.wrapper.replaceChild(nestedChild(nested[i].html), kids[kc.offset + i]);
+      cur[i] = nested[i].html;
+    }
+    // Append the sub-blocks that have arrived since the last patch.
+    for (let i = cur.length; i < n; i++) {
+      kc.wrapper.appendChild(nestedChild(nested[i].html));
+      cur.push(nested[i].html);
+    }
+    keyedHits++;
+    return true;
   }
 
   // Build the initial keyed table node + manager. The `<thead>` and all-but-last
@@ -716,6 +1085,10 @@ export function mountBrookMarkdown(
 
   function renderCodeBlock(b: Block, mb: MountedBlock): HTMLElement {
     const lang = extractLang(b.html) || "text";
+    // A rebuild throws away the nodes both handles pointed at; whichever branch
+    // this render takes re-seeds its own.
+    mb.codeInc = undefined;
+    mb.plainCode = undefined;
     // Mirror CodeBlock.tsx: text is "" while open (the OPEN block's markup comes
     // from the incremental path instead); a closed block decodes once and
     // highlights once. The node is frozen once closed, so highlight runs exactly
@@ -766,7 +1139,13 @@ export function mountBrookMarkdown(
     const body = document.createElement("div");
     body.className = "brook-code-body";
     if (highlighted !== null) {
-      body.appendChild(highlightedPre(lang, highlighted));
+      // An open fence mounts its `<code>` already split into frozen prefix +
+      // speculative tail, so the very next patch can splice instead of rebuild.
+      body.appendChild(
+        openMarkup !== null && mb.inc !== undefined && !fullRebuild
+          ? incPre(lang, mb, mb.inc, openMarkup)
+          : highlightedPre(lang, highlighted),
+      );
     } else {
       const div = document.createElement("div");
       div.tabIndex = 0;
@@ -774,6 +1153,9 @@ export function mountBrookMarkdown(
       div.setAttribute("aria-label", `${lang} code`);
       div.innerHTML = b.html;
       body.appendChild(div);
+      // Only an OPEN block's plain body ever grows; a closed one is frozen by
+      // the fingerprint check and never revisited.
+      if (b.open) mb.plainCode = div;
       if (run !== null && run.rest !== null) {
         // Remember the run on the mount so a rebuild/removal can cancel it, and
         // so a landed result can prove it still belongs to what is on screen.
@@ -784,12 +1166,39 @@ export function mountBrookMarkdown(
           // was superseded while we tokenized — never paint the old tokens.
           if (mb.highlight !== run || mb.node !== block) return;
           mb.highlight = undefined;
+          mb.plainCode = undefined; // the div the splice targeted is gone
           body.replaceChild(highlightedPre(lang, markup), div);
         });
       }
     }
     block.appendChild(body);
     return block;
+  }
+
+  // Advance an already-mounted open fence's incremental state and repaint just
+  // its tail. False → the mirror bowed out (language change, past hi-inc's
+  // cliff, or the split invariant broke) and the caller rebuilds the node.
+  function syncIncCode(mb: MountedBlock, b: Block): boolean {
+    const ic = mb.codeInc!;
+    if ((extractLang(b.html) || "text") !== ic.lang) return false;
+    const markup = incHighlight(mb.inc!, codeText(b));
+    if (markup === null) return false;
+    return paintIncCode(ic, mb.inc!, markup);
+  }
+
+  // `highlightedPre`, but with the `<code>` populated through the frozen/tail
+  // mirror and the mirror recorded on the mount, so later patches splice.
+  function incPre(lang: string, mb: MountedBlock, st: IncState, markup: string): HTMLElement {
+    const pre = document.createElement("pre");
+    pre.tabIndex = 0;
+    pre.setAttribute("role", "region");
+    pre.setAttribute("aria-label", `${lang} code`);
+    const code = document.createElement("code");
+    const ic = newIncCode(code, lang, st);
+    if (paintIncCode(ic, st, markup)) mb.codeInc = ic;
+    else code.innerHTML = markup;
+    pre.appendChild(code);
+    return pre;
   }
 
   // The highlighted body: `<pre tabindex=0 role=region><code>…</code></pre>`.
@@ -919,6 +1328,8 @@ export function mountBrookMarkdown(
           mb.highlight = undefined;
         }
         mb.inc = undefined;
+        mb.codeInc = undefined;
+        mb.plainCode = undefined;
       }
       // The caller owns the worker/stream — never call client.destroy() here
       // (same contract as the JSX renderer: unmounting never destroys the client).
@@ -1069,9 +1480,17 @@ function decodeCodeText(html: string): string {
 // only these names are forwarded onto the keyed wrapper element so it is
 // byte-faithful to the full-wrapper innerHTML path.
 const CONTAINER_ATTR_RE = /([a-zA-Z][a-zA-Z0-9-]*)="([^"]*)"/g;
-function applyOpenTagAttrs(el: HTMLElement, html: string): void {
+
+// The wrapper's opening tag — everything up to the first `>`. The keyed
+// container sync compares this to decide whether the attributes it stamped are
+// still the right ones, so the two must read the same slice.
+function openTagOf(html: string): string {
   const gt = html.indexOf(">");
-  const open = gt < 0 ? html : html.slice(0, gt);
+  return gt < 0 ? html : html.slice(0, gt);
+}
+
+function applyOpenTagAttrs(el: HTMLElement, html: string): void {
+  const open = openTagOf(html);
   let m: RegExpExecArray | null;
   CONTAINER_ATTR_RE.lastIndex = 0;
   while ((m = CONTAINER_ATTR_RE.exec(open))) {

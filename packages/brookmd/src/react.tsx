@@ -19,6 +19,7 @@ import { CodeBlock } from "./renderers/CodeBlock";
 import { MathBlock } from "./renderers/Math";
 import { Mermaid } from "./renderers/Mermaid";
 import { htmlToReact } from "./html-to-react";
+import { useHtmlSplice } from "./react-splice";
 import { warnOnce } from "./warn";
 
 /**
@@ -165,6 +166,15 @@ interface BrookMarkdownProps {
    * the block — an override bypasses the built-in highlighter entirely.
    */
   streamingHighlight?: boolean;
+  /**
+   * @internal TEST-ONLY. Turn off the incremental apply paths (the open code
+   * block's frozen/tail mirror and the open generic block's delta splice) so
+   * every patch re-renders the whole block through React, exactly as it did
+   * before they existed. The DOM-parity fuzz renders one tree with it on and one
+   * with it off and asserts their markup matches after every commit. Not part of
+   * the supported API.
+   */
+  __fullRebuild?: boolean;
   /** Appended to the root's `className` (the `brook-md` class is always present). */
   className?: string;
   /** Set on the root element. */
@@ -319,6 +329,7 @@ function BrookMarkdownFromClient({
   sanitize,
   childMemo,
   streamingHighlight,
+  __fullRebuild,
   className,
   id,
   role,
@@ -400,6 +411,7 @@ function BrookMarkdownFromClient({
             sanitize={sanitize}
             childMemo={childMemo}
             streamingHighlight={streamingHighlight}
+            __fullRebuild={__fullRebuild}
             onRenderMetrics={onMetrics}
             decorators={decorators}
             urlTransform={urlTransform}
@@ -803,6 +815,29 @@ function SafeHtml({
   }, [html, components, childMemo, decorators, urlTransform]) as ReactElement;
 }
 
+/**
+ * The OPEN generic block, applied INCREMENTALLY.
+ *
+ * The plain path re-sets the whole `dangerouslySetInnerHTML` on every patch, so
+ * a block that streams to 20 KB writes megabytes of html and destroys any text
+ * selection inside itself once per frame. This renders the same `<div>` but
+ * hands its children to {@link useHtmlSplice}, which applies the wire's verified
+ * `html_delta` — appending inside the chain of elements still open at the splice
+ * point and touching nothing before it. See react-splice.ts for how React and
+ * the effect share ownership of the node.
+ */
+function SplicedBlock({ className, block }: { className: string; block: Block }) {
+  const host = useRef<HTMLDivElement | null>(null);
+  const seedHtml = useHtmlSplice(host, block, true);
+  return (
+    <div
+      className={className}
+      ref={host}
+      dangerouslySetInnerHTML={{ __html: seedHtml ?? block.html }}
+    />
+  );
+}
+
 // One `<li>` of the keyed list renderer. Memoized on its inner `html` (+ the
 // sanitize/components identity) so React skips the item entirely when an earlier
 // item's HTML is unchanged across a streaming patch — the whole point of the
@@ -1062,6 +1097,8 @@ interface BlockViewProps {
   sanitize?: (html: string) => string;
   childMemo?: boolean;
   streamingHighlight?: boolean;
+  /** @internal TEST-ONLY — see BrookMarkdownProps.__fullRebuild. */
+  __fullRebuild?: boolean;
   onRenderMetrics?: RenderMetricsHook;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
@@ -1122,6 +1159,7 @@ function renderBlockContent({
   sanitize,
   childMemo,
   streamingHighlight,
+  __fullRebuild,
   decorators,
   urlTransform,
 }: {
@@ -1130,6 +1168,7 @@ function renderBlockContent({
   sanitize?: (html: string) => string;
   childMemo?: boolean;
   streamingHighlight?: boolean;
+  __fullRebuild?: boolean;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
 }) {
@@ -1176,6 +1215,8 @@ function renderBlockContent({
             open={block.open}
             code={typeof source === "string" ? source : undefined}
             streamingHighlight={streamingHighlight}
+            block={block}
+            __fullRebuild={__fullRebuild}
           />
         );
       }
@@ -1237,6 +1278,49 @@ function renderBlockContent({
     }
   }
 
+  // Streaming-tail keyed path for an OPEN Blockquote / Alert with structured
+  // `nested` data (blockData on): render one keyed child per inner sub-block, so
+  // only the open last child re-parses each tick instead of the whole wrapper.
+  //
+  // This sits HERE — beside the keyed list/table paths, before the components
+  // branch — rather than inside it. It used to live inside `if (components ||
+  // hasInlineTransforms)` and additionally test `components &&`, which meant a
+  // default-configured stream never reached it at all: a blockquote fell to the
+  // whole-html path and its splice, measured at 9.2× final markup at 5 KB
+  // growing to 22.6× at 20 KB — quadratic, and the last such writer left. The
+  // `components` condition was incidental (it satisfied KeyedContainer's
+  // required prop from a branch that already had a map in hand), not a
+  // correctness requirement: the commit that added this path gated it on
+  // "block.open and nested present and no sanitize hook", and its DOM twin
+  // (`renderKeyedContainer`) has never required overrides. With no overrides the
+  // children route through `htmlToReact` under the stable empty map — exactly
+  // what the keyed TABLE path has always done by default.
+  //
+  // Still off for: a `sanitize` hook (it must run over the full wrapper string),
+  // decorators/urlTransform (they must walk the whole subtree), and closed
+  // blocks (stable html, already memo-skipped wholesale).
+  //
+  // NOT gated on `__fullRebuild`. That flag turns off incremental APPLICATION
+  // (the frozen/tail code mirror, the delta splice) so a reference tree renders
+  // the same markup the slow way; it is not a renderer switch. Gating this on it
+  // would make the reference build a DIFFERENT tree — the whole-html one, which
+  // keeps the inter-block `\n` text nodes between a container's children that
+  // every keyed container path (this one and dom.ts's, since the day both landed)
+  // omits. The fuzz would then report that long-standing whitespace difference as
+  // a splice bug on every commit. Convergence is still checked where it is
+  // meaningful: at settle the block closes, both trees take the whole-html path,
+  // and the one-shot comparison must be byte-identical.
+  if (block.open && !sanitize && !hasInlineTransforms && (kind === "Blockquote" || kind === "Alert")) {
+    const nested = (block.kind.data as { nested?: NestedBlock[] } | undefined)?.nested;
+    if (Array.isArray(nested)) {
+      return (
+        <div className={className}>
+          <KeyedContainer block={block} nested={nested} components={components ?? NO_COMPONENTS} />
+        </div>
+      );
+    }
+  }
+
   // Tag-level / inline overrides apply to OPEN and speculative blocks too, not
   // just settled ones: the streaming tail's HTML is always well-formed (the
   // parser speculatively closes it), so a design-system renderer (Tailwind
@@ -1247,23 +1331,6 @@ function renderBlockContent({
   // bypassed the user sanitizer. The no-`components` fast path is untouched
   // (byte-identical innerHTML).
   if (components || hasInlineTransforms) {
-    // Streaming-tail fast path: an OPEN Blockquote / Alert with structured
-    // `nested` data (blockData on) renders its inner sub-blocks KEYED, so only
-    // the open last child re-parses each tick instead of the whole wrapper. A
-    // `sanitize` hook disables it (it must run over the full wrapper string), and
-    // decorators/urlTransform disable it (they must walk the full subtree) — both
-    // fall through to the opaque-html path below. Closed blocks also fall
-    // through — their HTML is stable, so the whole-wrapper memo already holds.
-    if (components && !hasInlineTransforms && block.open && !sanitize && (kind === "Blockquote" || kind === "Alert")) {
-      const nested = (block.kind.data as { nested?: NestedBlock[] } | undefined)?.nested;
-      if (Array.isArray(nested)) {
-        return (
-          <div className={className}>
-            <KeyedContainer block={block} nested={nested} components={components} />
-          </div>
-        );
-      }
-    }
     const safe = sanitize ? sanitize(block.html) : block.html;
     return (
       <div className={className}>
@@ -1283,6 +1350,14 @@ function renderBlockContent({
     );
   }
 
+  // The streaming tail applies its patch incrementally instead of re-setting the
+  // whole innerHTML each time (see SplicedBlock). A `sanitize` hook opts out:
+  // the node then mirrors the SANITIZER's output, which the wire's offsets no
+  // longer index. A CLOSED block never changes again, so it stays on the plain
+  // path — and that swap is exactly how the node is handed back to React.
+  if (block.open && !sanitize && !__fullRebuild) {
+    return <SplicedBlock className={className} block={block} />;
+  }
   return (
     <div
       className={className}
@@ -1314,6 +1389,7 @@ export function blocksEqual(
     prev.sanitize === next.sanitize &&
     prev.childMemo === next.childMemo &&
     prev.streamingHighlight === next.streamingHighlight &&
+    prev.__fullRebuild === next.__fullRebuild &&
     prev.onRenderMetrics === next.onRenderMetrics &&
     // Identity compare: an unstable decorators/urlTransform (fresh each render)
     // busts the memo so every committed block re-decorates — the O(n²) footgun

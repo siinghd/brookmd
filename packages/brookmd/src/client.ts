@@ -5,6 +5,7 @@ import type { Block, FromWorker, ParserConfig, Patch, ToWorker, WorkerLike } fro
 // field (package.json) redirects asset-urls.js -> asset-urls.native.js
 // (import.meta-free, no Web Worker) for Metro. See asset-urls.ts.
 import { createWorker } from "./asset-urls";
+import { noteSplice } from "./splice";
 
 /**
  * The ordered-block store backing a stream, extracted as a pure function so
@@ -75,7 +76,13 @@ export function applyPatch(store: BlockStore, patch: Patch): void {
       const { html_delta, ...rest } = entry;
       const prev = store.active.find((b) => b.id === entry.id);
       if (!prev) throw new Error(`brookmd: html_delta for block ${entry.id} without a base`);
-      active[i] = { ...rest, html: prev.html.slice(0, html_delta.keep_units) + html_delta.append };
+      const next = { ...rest, html: prev.html.slice(0, html_delta.keep_units) + html_delta.append };
+      active[i] = next;
+      // Publish the splice the wire already proved (see splice.ts): renderers
+      // apply it to the DOM in O(new bytes) instead of re-setting the whole
+      // innerHTML. `Block.html` above is still the full string — this is
+      // additional internal plumbing, not a change to the public shape.
+      noteSplice(next, prev, html_delta.keep_units);
     } else {
       active[i] = entry;
     }

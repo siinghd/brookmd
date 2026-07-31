@@ -192,15 +192,27 @@ function parseOpenTag(html: string, start: number) {
 // prove open blocks and the no-override fast path never reach the parser, and
 // that memoized closed blocks parse exactly once. Negligible cost in prod.
 let parseCount = 0;
+// …and how many CHARACTERS of markup those runs consumed. The count alone says
+// how often the tokenizer ran, not how much it chewed, and a keyed renderer's
+// whole claim is that it re-tokenizes only what changed. This is the unit that
+// makes the element-tree path comparable to the `innerHTML` one: both are then
+// measured as "characters of markup re-processed".
+let parseChars = 0;
 export function getParseCount(): number {
   return parseCount;
 }
+/** @internal Test-only. Characters of markup handed to the tokenizer so far. */
+export function getParseChars(): number {
+  return parseChars;
+}
 export function resetParseCount(): void {
   parseCount = 0;
+  parseChars = 0;
 }
 
 export function parseTrustedHtml(html: string): HNode[] {
   parseCount++;
+  parseChars += html.length;
   const root: HNode[] = [];
   const stack: Array<Extract<HNode, { kind: "el" }>> = [];
   let i = 0;

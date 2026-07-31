@@ -217,6 +217,31 @@ export interface IncState {
   c: number;
   /** Markup for `[0, c)`. Always a byte-prefix of the block's final markup. */
   frozenHtml: string;
+  /**
+   * Bumped whenever `frozenHtml` is TRUNCATED or cleared — the one checkpoint of
+   * rewind {@link adopt} performs, or a restart. It never moves while the prefix
+   * merely GROWS.
+   *
+   * A renderer that mirrors the frozen prefix into the DOM append-only reads it
+   * as the "may I splice?" token: same rev ⇒ the prefix only grew, so appending
+   * `frozenHtml.slice(alreadyWritten)` is exact; a changed rev means the prefix
+   * was rewritten underneath and the mirror must be re-seeded. Length alone is
+   * NOT enough — one call can rewind to `c0` and then re-freeze past the old
+   * length, which looks like a plain append but is not one.
+   */
+  frozenRev: number;
+  /**
+   * The length `frozenHtml` was TRUNCATED to at the last {@link frozenRev} bump:
+   * `frozenLen0` for {@link adopt}'s one-checkpoint rewind, `0` for a restart.
+   *
+   * The rev alone says "rewritten"; this says *from where*, which is what lets a
+   * DOM mirror rewind to a boundary it already holds instead of re-seeding the
+   * whole run. It is load-bearing that this is reported rather than inferred:
+   * `adopt` frequently rewinds and then re-freezes PAST the old length within
+   * the same call, so the observable `frozenHtml.length` can come back unchanged
+   * while its bytes have moved.
+   */
+  frozenCut: number;
   /** The checkpoint BEFORE `c`, and the `frozenHtml` length that went with it —
    *  the one step of rewind a tail revision needs (see {@link adopt}). */
   c0: number;
@@ -248,6 +273,8 @@ export function createInc(lang: string): IncState | null {
     lang: key,
     c: 0,
     frozenHtml: "",
+    frozenRev: 0,
+    frozenCut: 0,
     c0: 0,
     frozenLen0: 0,
     opener: null,
@@ -295,6 +322,8 @@ function adopt(st: IncState, d: number): boolean {
   }
   if (st.c0 > 0 && d >= st.c0 + GAP) {
     st.frozenHtml = st.frozenHtml.slice(0, st.frozenLen0);
+    st.frozenRev++; // the prefix SHRANK — an append-only mirror must rewind
+    st.frozenCut = st.frozenLen0;
     st.c = st.c0;
     st.c0 = 0;
     st.frozenLen0 = 0;
@@ -318,6 +347,10 @@ function dropTail(st: IncState): void {
 function reset(st: IncState): void {
   st.c = 0;
   st.frozenHtml = "";
+  // Monotonic, never zeroed: a reset back to an equal-length prefix must still
+  // read as "rewritten" to a mirror that only remembers the length.
+  st.frozenRev++;
+  st.frozenCut = 0;
   st.c0 = 0;
   st.frozenLen0 = 0;
   st.opener = null;
