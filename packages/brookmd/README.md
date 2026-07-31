@@ -4,7 +4,7 @@ Zero-dep streaming markdown for the browser. Rust→WASM core, one Web Worker pe
 
 Drop in a streaming-aware renderer — **React, Vue, Svelte, Solid, a framework-agnostic `<brook-markdown>` Web Component, or the vanilla DOM mount** — wire each LLM stream to a `BrookClient`, and the markdown renders incrementally off the main thread, block by block, with stable identities so unchanged blocks never re-reconcile.
 
-Parsing runs entirely **off the main thread** — each stream gets its own pooled Web Worker, so many concurrent LLM responses render without contending for the UI thread. On each token the parser re-parses only the **active tail**, not the whole document; patches cross the worker boundary as **verified splices** (not full re-sends, so emitted bytes stay O(n) even for one giant growing block); and heavy renderers (syntax highlighting, math, mermaid) are **deferred until a block closes**. The result is low retained memory and a main thread that stays responsive while streaming. See [the live demo](https://md.hsingh.app/).
+Parsing runs entirely **off the main thread** — each stream gets its own pooled Web Worker, so many concurrent LLM responses render without contending for the UI thread. On each token the parser re-parses only the **active tail**, not the whole document; patches cross the worker boundary as **verified splices** (not full re-sends, so emitted bytes stay O(n) even for one giant growing block); and heavy renderers (math, mermaid) are **deferred until a block closes** — code fences highlight as they stream, re-tokenizing only the last line rather than the whole block per chunk. The result is low retained memory and a main thread that stays responsive while streaming. See [the live demo](https://md.hsingh.app/).
 
 > **Beyond the browser:** the same Rust core also powers experimental React
 > Native, Swift (iOS/macOS), Kotlin/Android, Flutter, and C-ABI bindings —
@@ -248,7 +248,9 @@ controlled-string helpers wrap; in vanilla you call it directly.
 
 `mountBrookMarkdown(client, container, options?)` returns `{ destroy(), refresh() }`.
 Options: `components`, `sanitize`, `virtualize`, `stickToBottom`, `highlightCode`
-(default true), `batch` (default true — one DOM write per `requestAnimationFrame`),
+(default true), `streamingHighlight` (default true — highlight a code fence while
+it is still streaming; see [Streaming syntax highlighting](#streaming-syntax-highlighting)),
+`batch` (default true — one DOM write per `requestAnimationFrame`),
 `morphOpenBlocks` (default false — morph a growing generic open block's subtree in
 place instead of rebuilding it via `innerHTML`, so only the changed parts repaint
 and focus/selection in the streaming tail survive; the rendered result is
@@ -1167,6 +1169,34 @@ import { highlight } from "brookmd/highlight";
 const html = highlight("const x = 1;", "ts");
 ```
 
+### Streaming syntax highlighting
+
+A code fence is highlighted **while it streams**, not only once it closes. On by
+default; turn it off with `streamingHighlight={false}` (React) or
+`{ streamingHighlight: false }` (the DOM mount options / Vue / Svelte / Solid),
+which restores the plain-until-close behaviour.
+
+It stays O(n) over the whole block rather than re-highlighting the fence on every
+chunk. An open block keeps a **frozen prefix** — markup for everything behind a
+checkpoint, which later bytes provably cannot rewrite — and re-tokenizes only the
+**tail** after it, about one source line's worth per patch. When the fence closes,
+the tokenizer resumes from that checkpoint instead of starting over, so a block
+that streamed in highlights near-instantly.
+
+Two things worth knowing:
+
+- **The tail is speculative.** A prefix of source does not tokenize like the same
+  prefix of a longer source: `const s = "hello` is a stray quote plus an
+  identifier until its closing quote lands, and `123.456e` is `123` plus loose
+  fragments until a digit arrives. So the last line's colours can shift as bytes
+  come in. Nothing behind the checkpoint ever changes.
+- **The settled markup is byte-identical** to `highlight(text, lang)` either way.
+  Turning this on or off changes when colour appears, never what it is.
+
+Blocks past the highlighter's 50 000-character guard, unknown languages, and any
+fence taken over by a `components.CodeBlock` / `pre` / `code` override are
+unaffected — they behave exactly as before.
+
 ## Coverage
 
 **CommonMark 0.31: 100% (652/652 spec examples), byte-exact** — every section,
@@ -1218,8 +1248,6 @@ By design, not yet, or only partially:
   (`<span>`/`<div class="math …">` with `gfmMath` on) and a `Mermaid` slot, but
   stays zero-dep: bring your own KaTeX / mermaid pass (or a `components.MathBlock`
   / `components.Mermaid` override) for the actual SVG/MathML output.
-- **Syntax highlighting on open code blocks** — deferred until close. This is a
-  deliberate perf choice.
 
 ## Performance
 

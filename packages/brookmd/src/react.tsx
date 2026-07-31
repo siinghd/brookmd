@@ -149,6 +149,22 @@ interface BrookMarkdownProps {
    * applies only to the streaming tail.
    */
   childMemo?: boolean;
+  /**
+   * Highlight a code fence **while it is still streaming**, instead of showing
+   * plain escaped text until it closes. On by default.
+   *
+   * An open block keeps a frozen prefix and re-tokenizes only its tail on each
+   * patch, so this stays linear in the block's size (it does not re-highlight
+   * the whole fence per chunk). The settled markup is byte-identical either way
+   * — only the tail's colours are provisional, and they may shift as bytes
+   * arrive (`"hello` is a stray quote plus an identifier until its closing quote
+   * lands). Set `false` for the pre-0.27 behaviour: plain body until close.
+   *
+   * No effect on SSR (the server renders closed blocks only), and none at all
+   * when `components.CodeBlock` / `components.pre` / `components.code` take over
+   * the block — an override bypasses the built-in highlighter entirely.
+   */
+  streamingHighlight?: boolean;
   /** Appended to the root's `className` (the `brook-md` class is always present). */
   className?: string;
   /** Set on the root element. */
@@ -302,6 +318,7 @@ function BrookMarkdownFromClient({
   stickToBottom,
   sanitize,
   childMemo,
+  streamingHighlight,
   className,
   id,
   role,
@@ -382,6 +399,7 @@ function BrookMarkdownFromClient({
             virtualize={virtualize}
             sanitize={sanitize}
             childMemo={childMemo}
+            streamingHighlight={streamingHighlight}
             onRenderMetrics={onMetrics}
             decorators={decorators}
             urlTransform={urlTransform}
@@ -1043,6 +1061,7 @@ interface BlockViewProps {
   virtualize?: boolean;
   sanitize?: (html: string) => string;
   childMemo?: boolean;
+  streamingHighlight?: boolean;
   onRenderMetrics?: RenderMetricsHook;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
@@ -1102,6 +1121,7 @@ function renderBlockContent({
   components,
   sanitize,
   childMemo,
+  streamingHighlight,
   decorators,
   urlTransform,
 }: {
@@ -1109,6 +1129,7 @@ function renderBlockContent({
   components?: Components;
   sanitize?: (html: string) => string;
   childMemo?: boolean;
+  streamingHighlight?: boolean;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;
 }) {
@@ -1154,6 +1175,7 @@ function renderBlockContent({
             html={block.html}
             open={block.open}
             code={typeof source === "string" ? source : undefined}
+            streamingHighlight={streamingHighlight}
           />
         );
       }
@@ -1291,6 +1313,7 @@ export function blocksEqual(
     prev.virtualize === next.virtualize &&
     prev.sanitize === next.sanitize &&
     prev.childMemo === next.childMemo &&
+    prev.streamingHighlight === next.streamingHighlight &&
     prev.onRenderMetrics === next.onRenderMetrics &&
     // Identity compare: an unstable decorators/urlTransform (fresh each render)
     // busts the memo so every committed block re-decorates — the O(n²) footgun

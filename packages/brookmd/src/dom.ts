@@ -1,5 +1,6 @@
 import type { BrookClient } from "./client";
 import { highlightDeferred, type DeferredHighlight } from "./hi-defer";
+import { createInc, incHighlight, incSeed, type IncState } from "./hi-inc";
 import { morph } from "./morph";
 import type { Align, Block, BlockComponentProps, BlockKindTag, Decorator, ListData, RenderMetricsHook, TableData, UrlTransform } from "./types-core";
 import { blockProps, extractLang } from "./block-props";
@@ -74,6 +75,17 @@ export interface MountOptions {
   /** Use the built-in code highlighter. Default true; suppressed when a
    *  `components.CodeBlock` override is supplied. */
   highlightCode?: boolean;
+  /**
+   * Highlight a code fence **while it is still streaming**, instead of showing
+   * plain escaped text until it closes. On by default (parity with the React
+   * renderer's `streamingHighlight` prop).
+   *
+   * An open block keeps a frozen prefix and re-tokenizes only its tail on each
+   * patch, so this stays linear in the block's size. The settled markup is
+   * byte-identical either way — only the tail's colours are provisional, and
+   * they may shift as bytes arrive. Set `false` for the pre-0.27 behaviour.
+   */
+  streamingHighlight?: boolean;
   /** Coalesce patches into one DOM write per animation frame. Default true. */
   batch?: boolean;
   /**
@@ -159,6 +171,13 @@ interface MountedBlock {
   // hi-defer.ts). Cancelled when the node is rebuilt/dropped or the renderer is
   // destroyed, and used as the token that proves a landed result is not stale.
   highlight?: DeferredHighlight;
+  // Set only for an OPEN code block being highlighted as it streams (see
+  // hi-inc.ts): the frozen prefix and the cursor it was frozen at. Survives the
+  // per-patch node rebuild — that is the whole point — and is consumed once as
+  // the seed for the close-time run. Dropped when the block is dropped/destroyed
+  // or stops being a code block; a revised (rather than extended) body is caught
+  // by the state's own guard, which salvages or restarts it.
+  inc?: IncState;
   // True when `node` is the generic `<div class="brook-block…">` whose entire
   // `innerHTML` is exactly `html` (no special wrapper, no sanitizer transform).
   // Only such a node is eligible for the prefix-extension tail-append fast path.
@@ -201,6 +220,7 @@ export function mountBrookMarkdown(
   const hasInlineTransforms = !!decorators || !!urlTransform;
   const hasPerf = typeof performance !== "undefined";
   const highlightCode = options.highlightCode !== false && !components?.CodeBlock;
+  const streamingHighlight = options.streamingHighlight !== false;
   const batch = options.batch !== false && typeof requestAnimationFrame === "function";
   const morphOpenBlocks = options.morphOpenBlocks === true;
 
@@ -338,6 +358,12 @@ export function mountBrookMarkdown(
       // Changed → rebuild and swap in place. A table that just closed (or whose
       // data vanished) drops its keyed manager and re-renders the full HTML once.
       existing.table = undefined;
+      // Incremental highlight state belongs to a code block's SOURCE, not to its
+      // node, so a per-patch rebuild must keep it (that is what makes the open
+      // block linear). It only becomes meaningless when the block stops being a
+      // code block; a revised — rather than extended — body is caught by the
+      // state's own guard, which keeps whatever the revision left settled.
+      if (existing.inc && b.kind.type !== "CodeBlock") existing.inc = undefined;
       // A half-finished highlight belongs to the node about to be replaced.
       if (existing.highlight) {
         existing.highlight.cancel();
@@ -360,6 +386,7 @@ export function mountBrookMarkdown(
       for (const [id, mb] of mounted) {
         if (!seen.has(id)) {
           if (mb.highlight) mb.highlight.cancel();
+          mb.inc = undefined;
           mb.node.remove();
           mounted.delete(id);
         }
@@ -689,16 +716,32 @@ export function mountBrookMarkdown(
 
   function renderCodeBlock(b: Block, mb: MountedBlock): HTMLElement {
     const lang = extractLang(b.html) || "text";
-    // Mirror CodeBlock.tsx: text is "" while open, so the body falls to the raw
-    // `<div>` path; a closed block decodes once and highlights once. The node is
-    // frozen once closed, so highlight runs exactly once (no re-tokenize).
+    // Mirror CodeBlock.tsx: text is "" while open (the OPEN block's markup comes
+    // from the incremental path instead); a closed block decodes once and
+    // highlights once. The node is frozen once closed, so highlight runs exactly
+    // once (no re-tokenize).
     const text = b.open ? "" : codeText(b);
+    // An open fence: extend the frozen prefix and re-tokenize only the tail (see
+    // hi-inc.ts). `null` back means the block is past the size guard and gets
+    // the plain escaped body, exactly as it always did.
+    let openMarkup: string | null = null;
+    if (b.open && streamingHighlight) {
+      let inc = mb.inc;
+      if (inc === undefined || inc.lang !== lang.toLowerCase()) {
+        inc = createInc(lang) ?? undefined;
+        mb.inc = inc;
+      }
+      if (inc !== undefined) openMarkup = incHighlight(inc, codeText(b));
+    }
     // The first slice runs HERE, before the node is inserted: an ordinary block
-    // is highlighted in the same paint as always. Only a fence too big for the
-    // budget shows the plain body first and swaps its markup in a few tasks
-    // later — same bytes, one extra paint, no frozen main thread.
-    const run = text ? highlightDeferred(text, lang) : null;
-    const highlighted = run ? run.html : null;
+    // is highlighted in the same paint as always, and a fence that streamed in
+    // resumes from its frozen prefix so only the tail is left to do. Only a fence
+    // too big for the budget shows the plain body first and swaps its markup in a
+    // few tasks later — same bytes, one extra paint, no frozen main thread.
+    const seed = !b.open && mb.inc !== undefined ? incSeed(mb.inc, text, lang) : undefined;
+    const run = text ? highlightDeferred(text, lang, seed) : null;
+    if (!b.open) mb.inc = undefined; // consumed: the block is settled
+    const highlighted = openMarkup ?? (run ? run.html : null);
 
     const block = document.createElement("div");
     block.className = "brook-code-block" + (b.open ? " brook-streaming" : "");
@@ -875,6 +918,7 @@ export function mountBrookMarkdown(
           mb.highlight.cancel();
           mb.highlight = undefined;
         }
+        mb.inc = undefined;
       }
       // The caller owns the worker/stream — never call client.destroy() here
       // (same contract as the JSX renderer: unmounting never destroys the client).

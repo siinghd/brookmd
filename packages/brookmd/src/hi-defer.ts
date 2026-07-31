@@ -57,13 +57,29 @@ export interface DeferredHighlight {
 const noop = (): void => {};
 
 /**
+ * A fresh cursor, or a COPY of the caller's seed.
+ *
+ * A seed is the frozen prefix a block accumulated while it streamed (see
+ * hi-inc.ts): `pos` is a source offset the tokenizer is known to land on as a
+ * token boundary, `out` the markup for everything before it. Because
+ * `stepHighlight` carries no state between tokens, resuming there emits exactly
+ * the bytes a run from 0 would have emitted from that point on — so a block that
+ * streamed in only has to tokenize its unfrozen tail, and still settles to
+ * markup byte-identical to a one-shot `highlight()`. Copying keeps the caller's
+ * state immutable: the run advances its own cursor, not the block's.
+ */
+function seeded(seed?: HighlightState): HighlightState {
+  return seed === undefined ? { pos: 0, out: "" } : { pos: seed.pos, out: seed.out };
+}
+
+/**
  * Tokenize `code` for at most one slice and return the finished markup, or
  * `null` when it did not fit. Pure and synchronous — it schedules nothing, so a
  * renderer can call it from a render pass and only reach for
  * {@link highlightDeferred} when this comes back empty.
  */
-export function highlightWithin(code: string, lang: string): string | null {
-  const state: HighlightState = { pos: 0, out: "" };
+export function highlightWithin(code: string, lang: string, seed?: HighlightState): string | null {
+  const state = seeded(seed);
   return runSlice(code, lang, state) ? state.out : null;
 }
 
@@ -71,8 +87,12 @@ export function highlightWithin(code: string, lang: string): string | null {
  * Highlight `code` without blocking: the first slice runs here, synchronously,
  * and the rest (if any) continues on later tasks. See {@link DeferredHighlight}.
  */
-export function highlightDeferred(code: string, lang: string): DeferredHighlight {
-  const state: HighlightState = { pos: 0, out: "" };
+export function highlightDeferred(
+  code: string,
+  lang: string,
+  seed?: HighlightState,
+): DeferredHighlight {
+  const state = seeded(seed);
   if (runSlice(code, lang, state)) {
     return { html: state.out, rest: null, cancel: noop };
   }

@@ -173,14 +173,16 @@ const LANGS: Record<string, { pats: Pat[]; kw?: Set<string> }> = {
   css: { pats: cssPats },
 };
 
-// `<`, `>`, `&`, `"` — the only characters escapeHtml rewrites. It used to
+// `<`, `>`, `&`, `"` — the only characters escapeHtml rewrites. Context-free by
+// construction (one character in, one fixed entity out), which is what lets the
+// incremental path escape a growing tail one appended slice at a time. It used to
 // build its result one character at a time (`out += c`), which costs a string
 // append per character of every token and of every byte of an escape-fallback
 // block. Now it scans for the next special character and copies the run before
 // it in one slice: the overwhelmingly common "nothing to escape" case returns
 // the input untouched, and the rest costs one append per SPECIAL character
 // instead of one per character. Same bytes out.
-function escapeHtml(s: string): string {
+export function escapeHtml(s: string): string {
   const n = s.length;
   let i = 0;
   for (; i < n; i++) {
@@ -214,6 +216,22 @@ export interface HighlightState {
 }
 
 /**
+ * Called once per token the tokenizer emits, AFTER its markup is appended:
+ * `(cls, start, end, outLen)` where `cls` is the PATTERN class (`ws`, `str`,
+ * `com`, `pun`, `ident`… — not the `kw`/`fn`/`ty` refinement), `[start, end)` is
+ * the source span, and `outLen` is `state.out.length` once the token has been
+ * written. The catch-all one-character fallback reports `cls === ""`.
+ *
+ * Passing no sink is the default and costs one `undefined` test per token; the
+ * escape-fallback path (unknown language / over the size guard) emits no tokens
+ * and so reports nothing.
+ *
+ * @internal The incremental streaming path (hi-inc.ts) is the only consumer —
+ * it needs token boundaries to pick a checkpoint that survives an append.
+ */
+export type TokenSink = (cls: string, start: number, end: number, outLen: number) => void;
+
+/**
  * One resumable slice of {@link highlight}. Consumes WHOLE tokens from
  * `state.pos` until at least `chars` source characters have been taken (or the
  * input ends), appending to `state.out`; returns true once the input is fully
@@ -234,6 +252,7 @@ export function stepHighlight(
   lang: string,
   state: HighlightState,
   chars: number,
+  sink?: TokenSink,
 ): boolean {
   // Defense-in-depth: never tokenize a pathologically huge block — fall back to
   // plain escaped text. An unknown language is the same fallback. Both are
@@ -274,6 +293,7 @@ export function stepHighlight(
         } else {
           // Plain identifier — no span needed.
           out += escapeHtml(text);
+          if (sink) sink(cls, pos, after, out.length);
           pos = after;
           matched = true;
           break;
@@ -284,6 +304,7 @@ export function stepHighlight(
       } else {
         out += `<span class="t-${finalCls}">${escapeHtml(text)}</span>`;
       }
+      if (sink) sink(cls, pos, after, out.length);
       pos = after;
       matched = true;
       break;
@@ -292,6 +313,7 @@ export function stepHighlight(
       // No pattern matched (shouldn't happen with a catch-all ws/other) — emit
       // one char as plain text to make progress.
       out += escapeHtml(code[pos]);
+      if (sink) sink("", pos, pos + 1, out.length);
       pos += 1;
     }
   }
