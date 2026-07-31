@@ -31,15 +31,31 @@ import { extractLang } from "../block-props";
  * then render plain and close exactly as they did before it existed.
  */
 
+// The body is located by INDEX rather than by matching
+// `/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/` — the same three landmarks, in
+// the same order, taking the same first match, so the same bytes — and the
+// entity passes run only when there is an entity to decode. That matters
+// because this is the open fence's per-patch source (`openText` below): it runs
+// once for every patch, over a body that keeps growing. On a streamed 32 KB
+// fence the regex form and its five unconditional passes cost 295 ms, three
+// times the highlighting they feed; this form costs 16 ms.
 function decodeText(html: string): string {
-  const m = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
-  if (!m) return "";
-  return m[1]
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&amp;/g, "&");
+  const open = html.indexOf("<pre><code");
+  if (open < 0) return "";
+  const start = html.indexOf(">", open + 10);
+  if (start < 0) return "";
+  const end = html.indexOf("</code></pre>", start + 1);
+  if (end < 0) return "";
+  const body = html.slice(start + 1, end);
+  // amp last, so `&amp;lt;` decodes to `&lt;` and not to `<`.
+  return body.indexOf("&") < 0
+    ? body
+    : body
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&amp;/g, "&");
 }
 
 

@@ -24,10 +24,25 @@ function decodeEntities(s: string): string {
     .replace(/&amp;/g, "&");
 }
 
-/** Decoded source text inside `<pre><code>…</code></pre>`. */
+/**
+ * Decoded source text inside `<pre><code>…</code></pre>`.
+ *
+ * Located by INDEX rather than by matching
+ * `/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/` — the same three landmarks, in
+ * the same order, taking the same first match, so the same bytes — with the
+ * entity chain skipped when the body holds no `&`. An OPEN fence decodes its
+ * whole body on every patch, so both the regex and the five unconditional
+ * passes were per-patch costs proportional to the block.
+ */
 function decodeCodeText(html: string): string {
-  const m = html.match(/<pre><code[^>]*>([\s\S]*?)<\/code><\/pre>/);
-  return m ? decodeEntities(m[1]) : "";
+  const open = html.indexOf("<pre><code");
+  if (open < 0) return "";
+  const start = html.indexOf(">", open + 10);
+  if (start < 0) return "";
+  const end = html.indexOf("</code></pre>", start + 1);
+  if (end < 0) return "";
+  const body = html.slice(start + 1, end);
+  return body.indexOf("&") < 0 ? body : decodeEntities(body);
 }
 
 /**
