@@ -159,13 +159,23 @@ interface BrookMarkdownProps {
    * the whole fence per chunk). The settled markup is byte-identical either way
    * — only the tail's colours are provisional, and they may shift as bytes
    * arrive (`"hello` is a stray quote plus an identifier until its closing quote
-   * lands). Set `false` for the pre-0.27 behaviour: plain body until close.
+   * lands).
+   *
+   * - `true` / omitted — `"wavefront"`.
+   * - `"wavefront"` — the frozen prefix is coloured; the speculative tail (in
+   *   practice the line being typed) renders as plain text until its line
+   *   completes. The tail is one text node updated through its character data,
+   *   which is what keeps the option's cost at the DOM near zero.
+   * - `"eager"` — colour the tail on every patch too, by rebuilding its span
+   *   markup each time. Sub-line colour latency, ~all of the option's
+   *   style/layout cost.
+   * - `false` — the pre-0.27 behaviour: plain body until close.
    *
    * No effect on SSR (the server renders closed blocks only), and none at all
    * when `components.CodeBlock` / `components.pre` / `components.code` take over
    * the block — an override bypasses the built-in highlighter entirely.
    */
-  streamingHighlight?: boolean;
+  streamingHighlight?: boolean | "wavefront" | "eager";
   /**
    * @internal TEST-ONLY. Turn off the incremental apply paths (the open code
    * block's frozen/tail mirror and the open generic block's delta splice) so
@@ -1112,7 +1122,7 @@ interface BlockViewProps {
   virtualize?: boolean;
   sanitize?: (html: string) => string;
   childMemo?: boolean;
-  streamingHighlight?: boolean;
+  streamingHighlight?: boolean | "wavefront" | "eager";
   /** @internal TEST-ONLY — see BrookMarkdownProps.__fullRebuild. */
   __fullRebuild?: boolean;
   onRenderMetrics?: RenderMetricsHook;
@@ -1183,7 +1193,7 @@ function renderBlockContent({
   components?: Components;
   sanitize?: (html: string) => string;
   childMemo?: boolean;
-  streamingHighlight?: boolean;
+  streamingHighlight?: boolean | "wavefront" | "eager";
   __fullRebuild?: boolean;
   decorators?: Decorator[];
   urlTransform?: UrlTransform;

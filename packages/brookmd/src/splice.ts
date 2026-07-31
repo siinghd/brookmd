@@ -47,6 +47,7 @@
  * what `innerHTML` parity is checked against.
  */
 
+import { escapeHtml } from "./hi";
 import type { IncState } from "./hi-inc";
 import type { Block } from "./types-core";
 
@@ -109,6 +110,46 @@ export function spliceKeep(from: Block, to: Block): number | undefined {
 // --------------------------------------------------------------------------
 
 /**
+ * How an open fence's SPECULATIVE TAIL is painted. The frozen prefix is painted
+ * the same way either way — appended once, never touched again.
+ *
+ * - `"wavefront"` (the default) — the tail is ONE TEXT NODE holding the plain
+ *   source, updated per patch through its character data. No elements are
+ *   created, no markup is parsed, and nothing before it is disturbed, so a patch
+ *   costs the browser a text measure instead of a style/layout pass over a
+ *   freshly built span tree. Colour therefore arrives at the checkpoint — in
+ *   practice one source line behind the stream head.
+ * - `"eager"` — the tail is its highlighted MARKUP, re-parsed on every patch.
+ *   Colour is immediate, at the cost of rebuilding a span-dense subtree per
+ *   frame. This is what the mirror always did.
+ *
+ * Both settle to the same bytes: the tail is thrown away and re-derived at every
+ * patch regardless, and the close-time markup comes from the frozen prefix plus
+ * one final tokenizer run (see hi-inc.ts).
+ */
+export type TailMode = "wavefront" | "eager";
+
+/**
+ * The markup an open fence's `<code>` holds under `mode` — what the mirror
+ * paints incrementally, and what a caller that cannot mirror (a rebuild, the
+ * test-only full-rebuild reference) has to write in one go so the two agree.
+ *
+ * For `"eager"` that is hi-inc's markup verbatim. For `"wavefront"` the frozen
+ * prefix keeps its spans and the tail is the escaped source, which is exactly
+ * what the tail TEXT NODE serializes to.
+ *
+ * The wavefront tail comes from `st.text`/`st.c` rather than from `markup`,
+ * because the plain source is not recoverable from the tail's markup without
+ * re-parsing it. That is only sound while `markup` is the very string this state
+ * just produced, so a stale pair is handed back untouched rather than paired
+ * with a tail it does not belong to.
+ */
+export function incView(st: IncState, markup: string, mode: TailMode): string {
+  if (mode !== "wavefront" || markup !== st.html) return markup;
+  return st.frozenHtml + escapeHtml(st.text.slice(st.c));
+}
+
+/**
  * The live `<code>` of an OPEN code block, split the way hi-inc splits its
  * markup: a **frozen** run of children (proven immutable — appended once and
  * never touched again) followed by a **speculative tail** (rewritten per patch,
@@ -116,15 +157,17 @@ export function spliceKeep(from: Block, to: Block): number | undefined {
  *
  * The two regions are NOT wrapped in elements — `frozenEnd` is simply the last
  * child that belongs to the frozen run — so the resulting `innerHTML` is
- * byte-identical to the `code.innerHTML = markup` this replaces. Only the node
- * *count* differs (a splice can leave two adjacent text nodes where a one-shot
- * parse would have made one), which serializes the same and is exactly what a
- * browser does for any streamed append.
+ * byte-identical to the `code.innerHTML = incView(...)` this replaces. Only the
+ * node *count* differs (a splice can leave two adjacent text nodes where a
+ * one-shot parse would have made one), which serializes the same and is exactly
+ * what a browser does for any streamed append.
  */
 export interface IncCode {
   code: Element;
   /** The language the mirror was built for; a change invalidates it. */
   lang: string;
+  /** How the tail is painted; fixed for the mirror's whole life. */
+  mode: TailMode;
   /** Last child of the frozen run — everything after it is the tail. */
   frozenEnd: ChildNode | null;
   /** Chars of `IncState.frozenHtml` already mirrored into the DOM. */
@@ -138,28 +181,38 @@ export interface IncCode {
    *  else on the streaming path combined. */
   frozenEnd0: ChildNode | null;
   frozenLen0: number;
-  /** The tail markup currently in the DOM, so an unchanged tail is not rewritten. */
+  /** What is on screen after `frozenEnd`, so an unchanged tail is not rewritten:
+   *  the tail MARKUP in `"eager"` mode, the tail SOURCE in `"wavefront"`. */
   tail: string;
+  /** `"wavefront"` only: the single text node carrying the tail source. Created
+   *  once per mirror and then only ever written through its character data —
+   *  that is the whole cost saving, so it is never replaced while it lives. */
+  tailText: Text | null;
 }
 
 /** A fresh, empty mirror for a `<code>` that has nothing painted into it yet. */
-export function newIncCode(code: Element, lang: string, st: IncState): IncCode {
+export function newIncCode(code: Element, lang: string, st: IncState, mode: TailMode): IncCode {
   return {
-    code, lang, frozenEnd: null, frozenLen: 0, frozenRev: st.frozenRev,
-    frozenEnd0: null, frozenLen0: 0, tail: "",
+    code, lang, mode, frozenEnd: null, frozenLen: 0, frozenRev: st.frozenRev,
+    frozenEnd0: null, frozenLen0: 0, tail: "", tailText: null,
   };
 }
 
 /**
  * Mirror hi-inc's frozen/tail split into a live `<code>`: append whatever the
- * frozen prefix settled since the last patch, then replace the speculative
- * tail. Returns false when the mirror cannot be trusted (see the length
- * invariant below) so the caller falls back to a full node rebuild.
+ * frozen prefix settled since the last patch, then update the speculative tail.
+ * Returns false when the mirror cannot be trusted (see the invariants below) so
+ * the caller falls back to a full node rebuild.
  *
  * Cost per patch is |newly frozen| + |tail|. The frozen term sums, across the
  * whole stream, to one pass over the final markup; the tail is bounded by
- * hi-inc's CAP. That is what makes an open fence linear at the DOM, not just
- * at the tokenizer.
+ * hi-inc's CAP. That is what makes an open fence linear at the DOM, not just at
+ * the tokenizer.
+ *
+ * In `"wavefront"` mode the tail term is also the CHEAPEST shape the DOM has:
+ * one character-data write, no elements created and no markup parsed. Only a
+ * checkpoint advance parses anything, and then only the newly frozen slice — so
+ * span creation drops from (tail spans × patches) to one pass over the block.
  */
 export function paintIncCode(ic: IncCode, st: IncState, markup: string): boolean {
   const frozen = st.frozenHtml;
@@ -167,13 +220,20 @@ export function paintIncCode(ic: IncCode, st: IncState, markup: string): boolean
   // A shorter string would mean the two have come apart — bail rather than
   // slice a negative tail out of it.
   if (markup.length < frozen.length) return false;
+  const wave = ic.mode === "wavefront";
+  // The wavefront tail is the SOURCE behind hi-inc's checkpoint, which only the
+  // state knows — so the markup handed in has to be the one that state just
+  // produced. Both call sites pair the two calls, so this is a pointer compare
+  // that never fires in practice; a stale pair rebuilds rather than painting a
+  // tail that does not belong to the frozen prefix.
+  if (wave && markup !== st.html) return false;
   // A rewind (adopt's one checkpoint of backtrack, or a restart) rewrote the
   // frozen prefix, so the mirror's append-only assumption no longer holds and
   // the whole run is re-seeded. Rare by construction; `frozenRev` is what makes
   // it detectable in O(1) — a length compare alone would miss a rewind that
   // re-froze past the old length within the same call.
   let rewound = ic.frozenRev !== st.frozenRev || frozen.length < ic.frozenLen;
-  const tail = markup.slice(frozen.length);
+  const tail = wave ? st.text.slice(st.c) : markup.slice(frozen.length);
   if (!rewound && frozen.length === ic.frozenLen && tail === ic.tail) return true;
   if (rewound && st.frozenRev === ic.frozenRev + 1 && st.frozenCut === ic.frozenLen0) {
     // hi-inc cut back to exactly the checkpoint we still hold a boundary node
@@ -188,25 +248,61 @@ export function paintIncCode(ic: IncCode, st: IncState, markup: string): boolean
     ic.frozenLen0 = 0;
     rewound = false;
   }
-  // Drop the previous tail (and the frozen run too when re-seeding). The tail
-  // is CAP-bounded, so this is O(1) in the block's size.
-  const keep = rewound ? null : ic.frozenEnd;
-  while (ic.code.lastChild !== keep) ic.code.removeChild(ic.code.lastChild!);
   if (rewound) {
+    // Re-seed: nothing of ours survives, including the tail node.
+    while (ic.code.lastChild !== null) ic.code.removeChild(ic.code.lastChild);
     ic.frozenEnd = null;
     ic.frozenLen = 0;
     ic.frozenEnd0 = null;
     ic.frozenLen0 = 0;
     ic.frozenRev = st.frozenRev;
+    ic.tailText = null;
+  } else {
+    // Everything between the (possibly rewound) frozen boundary and the end
+    // goes: the previous tail's MARKUP in `"eager"` mode — CAP-bounded, so O(1)
+    // in the block's size, but also every element in it, every patch, which is
+    // precisely what the wavefront tail exists not to do — and, after a rewind
+    // to a checkpoint we still hold a node for, the frozen nodes past the new
+    // boundary as well.
+    //
+    // The wavefront tail NODE is the one exception: it is kept and rewritten in
+    // place. In `"eager"` mode `tailText` is always null and this is exactly the
+    // single loop it has always been.
+    const t = ic.tailText;
+    if (t !== null) {
+      while (ic.code.lastChild !== t) ic.code.removeChild(ic.code.lastChild!);
+      while (t.previousSibling !== ic.frozenEnd) ic.code.removeChild(t.previousSibling!);
+    } else {
+      while (ic.code.lastChild !== ic.frozenEnd) ic.code.removeChild(ic.code.lastChild!);
+    }
   }
   if (frozen.length > ic.frozenLen) {
     ic.frozenEnd0 = ic.frozenEnd;
     ic.frozenLen0 = ic.frozenLen;
+    // The newly frozen slice belongs BEFORE the tail node, and
+    // `insertAdjacentHTML` only appends — so the tail node steps aside for the
+    // one parse a checkpoint costs and goes straight back. One node move per
+    // source line, against a whole-tail re-parse per patch.
+    const t = ic.tailText;
+    if (t !== null) ic.code.removeChild(t);
     ic.code.insertAdjacentHTML("beforeend", frozen.slice(ic.frozenLen));
     ic.frozenEnd = ic.code.lastChild;
     ic.frozenLen = frozen.length;
+    if (t !== null) ic.code.appendChild(t);
   }
-  if (tail) ic.code.insertAdjacentHTML("beforeend", tail);
+  if (wave) {
+    if (ic.tailText === null && tail !== "") {
+      ic.tailText = ic.code.ownerDocument.createTextNode("");
+      ic.code.appendChild(ic.tailText);
+    }
+    // The whole point: character data, no parse, no elements created, nothing
+    // before it disturbed. Written through `nodeValue` (not handed to
+    // `createTextNode`) so that every char of the tail crosses the same DOM
+    // boundary the work-bound gates instrument, first patch included.
+    if (ic.tailText !== null) ic.tailText.nodeValue = tail;
+  } else if (tail) {
+    ic.code.insertAdjacentHTML("beforeend", tail);
+  }
   ic.tail = tail;
   return true;
 }

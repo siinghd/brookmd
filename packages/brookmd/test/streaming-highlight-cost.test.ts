@@ -39,6 +39,27 @@ import type { Patch } from "../src/types";
  * Every bound is a ratio against the source or the final markup, so it holds on
  * any machine and at any block size. The `OFF` arm is measured alongside purely
  * to keep the ON numbers honest about which costs are the option's at all.
+ *
+ * ## The tail's ELEMENT churn (the second test)
+ *
+ * Script was never where the streaming premium went. Measured in a real browser
+ * on a 32 KB streamed fence: highlight-off 772 ms total (535 script, 123
+ * style+layout); highlight-on 1530 ms (565 script, ~450 style+layout). ~96% of
+ * the ~758 ms premium was style/layout/paint from rebuilding a span-dense tail
+ * every frame — the final DOM is identical either way (5,748 nodes), so it was
+ * churn, not tree size.
+ *
+ * That is not measurable here — happy-dom has no layout engine — so what is
+ * pinned instead is its CAUSE, at the DOM boundary: how many elements the open
+ * fence's `<code>` is made to build, and how many characters are handed to the
+ * HTML parser to build them. The default `"wavefront"` tail is one text node
+ * written through its character data, so per patch it creates no elements and
+ * parses nothing; only a checkpoint (about one source line) parses the newly
+ * frozen slice. `"eager"` — the old behaviour, still available — re-parses the
+ * whole tail every patch.
+ *
+ * The wall-time verdict is deferred to the external paired browser harness; what
+ * this file can prove is that the work that produced it is gone.
  */
 
 const wasmUrl = new URL("../src/wasm/brook_md_core_bg.wasm", import.meta.url);
@@ -49,6 +70,70 @@ let counting = false;
 let domChars = 0;
 let charCodeAtCalls = 0;
 let replaceChars = 0;
+
+/**
+ * Writes aimed at an open fence's `<code>`, split by what they cost the browser.
+ * `parses`/`parsedChars`/`spans` is markup the HTML parser has to turn into
+ * elements — the style/layout trigger; `charData` is text written into an
+ * existing node, which is the cheapest mutation the DOM has.
+ */
+interface CodeChurn {
+  parses: number;
+  parsedChars: number;
+  spans: number;
+  charData: number;
+}
+let code: CodeChurn = { parses: 0, parsedChars: 0, spans: 0, charData: 0 };
+
+function countSpans(html: string): number {
+  let n = 0;
+  for (let i = html.indexOf("<span"); i >= 0; i = html.indexOf("<span", i + 5)) n++;
+  return n;
+}
+
+type IahHost = { insertAdjacentHTML: (p: string, h: string) => void };
+
+/**
+ * Wrap `insertAdjacentHTML` for the duration of one run, and hand back the undo.
+ *
+ * Installed per-measurement rather than once in `beforeAll`, and on whichever
+ * prototype actually OWNS the method our elements resolve to: another file in
+ * this suite spies on it and restores the value onto `HTMLElement.prototype`,
+ * which leaves an own property there permanently SHADOWING `Element.prototype`.
+ * A wrapper installed on `Element.prototype` before that happens still runs; one
+ * installed after it silently measures nothing — and a cost gate that measures
+ * nothing passes every bound it has.
+ */
+function spyInsertAdjacentHTML(): () => void {
+  let owner = (win.HTMLElement as unknown as { prototype: object }).prototype;
+  while (owner !== null && !Object.prototype.hasOwnProperty.call(owner, "insertAdjacentHTML")) {
+    owner = Object.getPrototypeOf(owner);
+  }
+  const host = owner as unknown as IahHost;
+  const real = host.insertAdjacentHTML;
+  host.insertAdjacentHTML = function (this: unknown, pos: string, html: string) {
+    if (counting) {
+      domChars += String(html).length;
+      if (inCode(this)) {
+        code.parses++;
+        code.parsedChars += String(html).length;
+        code.spans += countSpans(String(html));
+      }
+    }
+    return real.call(this, pos, html);
+  };
+  return () => {
+    host.insertAdjacentHTML = real;
+  };
+}
+
+/** Is this node the `<code>` of a code block, or a text node directly inside one? */
+function inCode(n: unknown): boolean {
+  const node = n as { nodeType?: number; tagName?: string; parentNode?: { tagName?: string } };
+  if (node.nodeType === 1) return node.tagName === "CODE";
+  if (node.nodeType === 3) return node.parentNode?.tagName === "CODE";
+  return false;
+}
 
 interface WasmParser {
   append(chunk: string): string;
@@ -77,25 +162,37 @@ beforeAll(async () => {
   // moves to a different function.
   const E = win.Element.prototype as unknown as object;
   const N = win.Node.prototype as unknown as object;
-  for (const [proto, key] of [[E, "innerHTML"], [N, "textContent"], [N, "nodeValue"]] as const) {
+  // A TEXT node's `nodeValue` resolves to `CharacterData`'s own accessor, not
+  // `Node`'s — patching only `Node` would silently miss every character-data
+  // write, which is exactly the channel the wavefront tail moves onto. Only
+  // `nodeValue` is wrapped here: happy-dom's setter chains through `textContent`
+  // and `data` internally, so wrapping those too would count each write 3×.
+  const C = win.CharacterData.prototype as unknown as object;
+  for (const [proto, key] of [
+    [E, "innerHTML"], [N, "textContent"], [N, "nodeValue"], [C, "nodeValue"],
+  ] as const) {
     const d = Object.getOwnPropertyDescriptor(proto, key)!;
+    const parsed = key === "innerHTML";
     Object.defineProperty(proto, key, {
       ...d,
       set(this: unknown, v: string) {
-        if (counting) domChars += String(v ?? "").length;
+        const s = String(v ?? "");
+        if (counting) {
+          domChars += s.length;
+          if (inCode(this)) {
+            if (parsed) {
+              code.parses++;
+              code.parsedChars += s.length;
+              code.spans += countSpans(s);
+            } else {
+              code.charData += s.length;
+            }
+          }
+        }
         d.set!.call(this, v);
       },
     });
   }
-  const iah = (E as { insertAdjacentHTML: (p: string, h: string) => void }).insertAdjacentHTML;
-  (E as { insertAdjacentHTML: unknown }).insertAdjacentHTML = function (
-    this: unknown,
-    pos: string,
-    html: string,
-  ) {
-    if (counting) domChars += String(html).length;
-    return iah.call(this, pos, html);
-  };
 
   String.prototype.charCodeAt = function (this: string, i: number) {
     if (counting) charCodeAtCalls++;
@@ -155,6 +252,7 @@ interface Sample {
   finalMarkup: number;
   patches: number;
   html: string;
+  code: CodeChurn;
 }
 
 /** Stream `doc` in 4-char patches — ~80 tok/s, one patch per frame. */
@@ -177,18 +275,21 @@ function measure(doc: string, opts: MountOptions): Sample {
   domChars = 0;
   charCodeAtCalls = 0;
   replaceChars = 0;
+  code = { parses: 0, parsedChars: 0, spans: 0, charData: 0 };
   __resetIncScanned();
   const step = (raw: string) => {
     applyPatch(store, JSON.parse(raw) as Patch);
     for (const fn of listeners) fn();
     patches++;
   };
+  const unspy = spyInsertAdjacentHTML();
   counting = true;
   try {
     for (let i = 0; i < doc.length; i += 4) step(p.append(doc.slice(i, i + 4)));
     step(p.finalize());
   } finally {
     counting = false;
+    unspy();
     p.free();
   }
   const html = container.innerHTML;
@@ -200,6 +301,7 @@ function measure(doc: string, opts: MountOptions): Sample {
     finalMarkup: html.length,
     patches,
     html,
+    code,
   };
   handle.destroy();
   container.remove();
@@ -260,6 +362,68 @@ t("streamingHighlight adds no per-patch pass over the whole block", () => {
   // (5) OFF is byte-for-byte the path it always was: it never reaches hi-inc,
   //     so it never tokenizes at all.
   expect(off.tokChars).toBe(0);
+});
+
+t("the wavefront tail writes character data, not span markup, per patch", () => {
+  // The same fixture and cadence as above, with the ONLY difference being how
+  // the speculative tail is painted.
+  const doc = codeDoc(8 * 1024);
+  const wave = measure(doc, {}); // the default
+  const eager = measure(doc, { streamingHighlight: "eager" }); // the old behaviour
+  // Every arm has to build the settled block once, span for span. That floor is
+  // identical in both and is what the ratios below are measured against.
+  const settled = countSpans(wave.html);
+
+  const arm = (s: Sample) => ({
+    parses: s.code.parses,
+    parsedChars: s.code.parsedChars,
+    spans: s.code.spans,
+    spansPerSettled: +(s.code.spans / settled).toFixed(2),
+    charData: s.code.charData,
+    parsesPerPatch: +(s.code.parses / s.patches).toFixed(3),
+  });
+  console.log(
+    "streaming-tail churn:",
+    JSON.stringify({ patches: wave.patches, settledSpans: settled, wavefront: arm(wave), eager: arm(eager) }),
+  );
+
+  // (1) PARSES — the count that matters, because each one is a fresh subtree the
+  //     style/layout engine has to take apart and put back. One per CHECKPOINT
+  //     (≈ one source line) plus one at close, instead of one per patch:
+  //     0.13/patch measured, down from 1.13/patch.
+  expect(wave.code.parses / wave.patches).toBeLessThan(0.2);
+  expect(eager.code.parses / eager.patches).toBeGreaterThan(0.9);
+  expect(wave.code.parses * 5).toBeLessThan(eager.code.parses); // 8.6× measured
+
+  // (2) ELEMENT CHURN. The tail's spans were rebuilt once per patch; open, they
+  //     are now never built at all. What is left is the two unavoidable passes —
+  //     the frozen prefix as it settles, and the settled block at close — so the
+  //     count lands near 2× the final block's own spans (2.25× measured) rather
+  //     than growing with the patch count (7.45× on this fixture, and it climbs
+  //     with the patches-per-line ratio: at an LLM's per-token cadence over a
+  //     wider fence it is far worse).
+  expect(wave.code.spans).toBeLessThan(3 * settled);
+  expect(eager.code.spans).toBeGreaterThan(6 * settled);
+  expect(wave.code.spans * 2.5).toBeLessThan(eager.code.spans);
+
+  // (3) …and correspondingly fewer characters handed to the HTML parser: 2.2×
+  //     the final markup (the two passes) instead of 7.5× it.
+  expect(wave.code.parsedChars).toBeLessThan(3 * wave.finalMarkup);
+  expect(wave.code.parsedChars * 2.5).toBeLessThan(eager.code.parsedChars);
+
+  // (4) What the tail costs INSTEAD: character data on a node that already
+  //     exists — no parse, no elements — bounded by the source it re-states
+  //     (about a line per patch). The eager arm pays none of it, which is the
+  //     honest statement of the trade rather than a free lunch.
+  expect(wave.code.charData).toBeGreaterThan(0);
+  expect(eager.code.charData).toBe(0);
+  expect(wave.code.charData).toBeLessThan(20 * doc.length);
+  // Even counting it at par with parsed markup — which flatters the old path,
+  // since a character-data write builds nothing — the wavefront arm moves less.
+  expect(wave.code.charData + wave.code.parsedChars).toBeLessThan(eager.code.parsedChars);
+
+  // (5) And nothing about the settled document moved.
+  expect(wave.html).toBe(eager.html);
 });
 
 t("the HTML-fallback decode is byte-identical to the core's own source", () => {

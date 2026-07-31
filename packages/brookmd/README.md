@@ -248,8 +248,9 @@ controlled-string helpers wrap; in vanilla you call it directly.
 
 `mountBrookMarkdown(client, container, options?)` returns `{ destroy(), refresh() }`.
 Options: `components`, `sanitize`, `virtualize`, `stickToBottom`, `highlightCode`
-(default true), `streamingHighlight` (default true — highlight a code fence while
-it is still streaming; see [Streaming syntax highlighting](#streaming-syntax-highlighting)),
+(default true), `streamingHighlight` (`boolean | "wavefront" | "eager"`, default
+true — highlight a code fence while it is still streaming; see
+[Streaming syntax highlighting](#streaming-syntax-highlighting)),
 `batch` (default true — one DOM write per `requestAnimationFrame`),
 `morphOpenBlocks` (default false — morph a growing generic open block's subtree in
 place instead of rebuilding it via `innerHTML`, so only the changed parts repaint
@@ -1197,6 +1198,39 @@ Two things worth knowing:
   come in. Nothing behind the checkpoint ever changes.
 - **The settled markup is byte-identical** to `highlight(text, lang)` either way.
   Turning this on or off changes when colour appears, never what it is.
+
+#### Where the colour front sits: `"wavefront"` (default) vs `"eager"`
+
+`streamingHighlight` takes `boolean | "wavefront" | "eager"`; `true` means
+`"wavefront"`.
+
+|                 | frozen prefix | speculative tail                            |
+| --------------- | ------------- | ------------------------------------------- |
+| `"wavefront"`   | coloured      | plain text until its line completes          |
+| `"eager"`       | coloured      | coloured, rebuilt every patch                |
+| `false`         | plain         | plain (whole fence stays plain until close)  |
+
+The default paints the tail as a **single text node** and updates its character
+data per patch. Colour therefore follows a wavefront one checkpoint — in practice
+one source line — behind the stream head, and at an LLM's token rate that is a
+sub-second lag on one line.
+
+That is a deliberate trade, and the tail is the right place to make it. The tail's
+colours are *already* provisional by contract (see above): they may change on the
+next byte, so they are the least trustworthy pixels on screen. What they cost is
+not: highlighting them means building a span-dense subtree, throwing it away, and
+building it again on every frame. Measured in a real browser on a streamed 32 KB
+fence, that was **~758 ms** of extra work over the same fence with highlighting
+off — and ~96% of it was style/layout/paint, not script. The final DOM is
+identical either way (same 5,748 nodes); it was pure churn. Painting the tail as
+text removes essentially all of it: element creations under the open `<code>` drop
+from 7.5× the settled block's spans to 2.25× (i.e. the two unavoidable passes),
+and trips through the HTML parser from ~1 per patch to ~0.13.
+
+Pass `"eager"` to put the colour back on the tail per patch — worth it for short
+fences, or when the fence is the whole point of the page and the cost is
+acceptable. Nothing else changes: every mode streams the same TEXT at every patch
+and settles to byte-identical markup.
 
 Blocks past the highlighter's 50 000-character guard, unknown languages, and any
 fence taken over by a `components.CodeBlock` / `pre` / `code` override are

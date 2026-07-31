@@ -218,9 +218,15 @@ const CORPUS: Array<[string, string]> = [
   ],
 ];
 
+// Every tail mode, because each one is a different set of nodes under the open
+// fence's `<code>`: a plain body, one text node, or a span per token. The
+// `__fullRebuild` reference honours the mode too (it writes the same VIEW in one
+// go), so this stays a statement about the incremental apply and not about which
+// visual contract is in force.
 const MODES: Array<[string, MountOptions]> = [
   ["default", {}],
   ["streamingHighlight:false", { streamingHighlight: false }],
+  ["streamingHighlight:eager", { streamingHighlight: "eager" }],
 ];
 
 test.skipIf(!haveWasm)("spliced DOM equals full-rebuild DOM after every sync, and one-shot at settle", () => {

@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { highlight } from "../hi";
 import { highlightDeferred, highlightWithin } from "../hi-defer";
 import { createInc, incHighlight, incSeed, type IncState } from "../hi-inc";
-import { newIncCode, paintIncCode, type IncCode } from "../splice";
+import { incView, newIncCode, paintIncCode, type IncCode, type TailMode } from "../splice";
 import { useHtmlSplice } from "../react-splice";
 import type { Block } from "../types-core";
 import { extractLang } from "../block-props";
@@ -26,6 +26,12 @@ import { extractLang } from "../block-props";
  * paint exactly as before; a big block gets the plain escaped body immediately
  * and swaps in its markup a few tasks later, instead of freezing the main
  * thread for the whole pass.
+ *
+ * The tail is painted as ONE TEXT NODE by default (`"wavefront"`): its colours
+ * arrive at the checkpoint, a source line behind the head, and a patch costs the
+ * browser a character-data write instead of a fresh span subtree. See splice.ts
+ * for why that is the shape worth defaulting to; `streamingHighlight="eager"`
+ * restores the coloured-per-patch tail.
  *
  * `streamingHighlight={false}` opts out of the open-block path only: open blocks
  * then render plain and close exactly as they did before it existed.
@@ -81,8 +87,9 @@ interface Props {
    * as the highlight itself. Absent (blockData off) the HTML is decoded here.
    */
   code?: string;
-  /** Highlight the block while it is still open. Default true. */
-  streamingHighlight?: boolean;
+  /** Highlight the block while it is still open. Default true (`"wavefront"`);
+   *  `"eager"` colours the speculative tail on every patch; `false` opts out. */
+  streamingHighlight?: boolean | "wavefront" | "eager";
   /**
    * The block this markup came from, when the renderer is driven by the stream.
    * Only used to apply the wire's `html_delta` to the PLAIN escaped body of an
@@ -111,6 +118,7 @@ function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebu
   // already; without it the body is decoded here, the same work the plain path
   // hands to `innerHTML` anyway.
   const streaming = open && streamingHighlight !== false;
+  const tailMode: TailMode = streamingHighlight === "eager" ? "eager" : "wavefront";
   const openText = useMemo(
     () => (streaming ? (code ?? decodeText(html)) : ""),
     [streaming, code, html],
@@ -122,7 +130,7 @@ function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebu
   // effect below: a render pass can be double-invoked or thrown away, and this
   // state advances a cursor.
   const incRef = useRef<IncState | null>(null);
-  const [inc, setInc] = useState<{ lang: string; html: string } | null>(null);
+  const [inc, setInc] = useState<{ lang: string; html: string; view: string } | null>(null);
   // The live `<code>` while the streaming markup is on screen, plus the
   // frozen/tail mirror painted into it. React renders that element EMPTY (no
   // children, no dangerouslySetInnerHTML) so it never touches its contents; the
@@ -165,8 +173,20 @@ function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebu
     }
     // No table for this language: the plain body is the only honest answer.
     const markup = st === null ? null : incHighlight(st, openText);
-    setInc(markup === null ? null : { lang, html: markup });
-  }, [streaming, openText, lang]);
+    setInc(
+      markup === null
+        ? null
+        : {
+            lang,
+            html: markup,
+            // `view` is only ever WRITTEN by the full-rebuild reference, which
+            // has to show the same thing the mirror paints or the parity fuzz
+            // would be comparing two different visual contracts. The mirrored
+            // path derives the tail itself, so it does not pay for this.
+            view: __fullRebuild ? incView(st!, markup, tailMode) : markup,
+          },
+    );
+  }, [streaming, openText, lang, tailMode, __fullRebuild]);
 
   const [slow, setSlow] = useState<Slow | null>(null);
 
@@ -204,7 +224,7 @@ function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebu
   // props by one commit, and showing last patch's spans beats flashing the
   // whole block back to plain every tick. A language change does invalidate it.
   const streamed = streaming && inc !== null && inc.lang === lang ? inc.html : null;
-  const highlighted = settled ?? streamed;
+  const highlighted = settled ?? (streamed === null ? null : inc!.view);
   // Only the STREAMING markup is mirrored: it is the one that is re-derived on
   // every patch, and it is the only one hi-inc can split. A settled block writes
   // its final markup through React exactly as before (once — its node is then
@@ -228,17 +248,28 @@ function CodeBlockImpl({ html, open, code, streamingHighlight, block, __fullRebu
     const node = codeRef.current;
     const st = incRef.current;
     if (node === null || st === null || streamed === null) return;
+    // Paint what the STATE holds, not the markup this render captured. The two
+    // can be a patch apart — React may have advanced the state (a passive
+    // effect) before this commit's layout effects — and the frozen prefix and
+    // the tail have to come from the same instant or the mirror would splice a
+    // settled prefix onto a tail that predates it. `streamed` is the signal that
+    // a streaming markup belongs on screen at all; `st.html` is what it IS. Both
+    // converge within the same `act`/frame, so nothing is ever a patch behind.
+    const markup = st.html;
+    if (markup === null) return;
     let m = mirrorRef.current;
-    if (m === null || m.code !== node || m.lang !== lang) {
+    if (m === null || m.code !== node || m.lang !== lang || m.mode !== tailMode) {
       // A fresh (or replaced) element: nothing of ours is in it yet.
       node.innerHTML = "";
-      m = newIncCode(node, lang, st);
+      m = newIncCode(node, lang, st, tailMode);
       mirrorRef.current = m;
     }
-    if (!paintIncCode(m, st, streamed)) {
+    if (!paintIncCode(m, st, markup)) {
       // The split invariant broke (see splice.ts). Fall back to the whole
-      // markup and drop the mirror so the next commit re-seeds it.
-      node.innerHTML = streamed;
+      // markup — under the same tail mode, so one bailed patch does not flash a
+      // differently-painted tail — and drop the mirror so the next commit
+      // re-seeds it.
+      node.innerHTML = incView(st, markup, tailMode);
       mirrorRef.current = null;
     }
   });

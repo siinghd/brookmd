@@ -116,6 +116,9 @@ const CORPUS: Array<[string, string]> = [
 const MODES: Array<[string, Record<string, unknown>]> = [
   ["default", {}],
   ["streamingHighlight:false", { streamingHighlight: false }],
+  // The coloured-per-patch tail: a different set of nodes under the open fence's
+  // `<code>`, and the one the layout effect has to hand back to React cleanly.
+  ["streamingHighlight:eager", { streamingHighlight: "eager" }],
   ["childMemo", { childMemo: true }],
 ];
 

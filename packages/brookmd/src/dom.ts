@@ -2,7 +2,7 @@ import type { BrookClient } from "./client";
 import { highlightDeferred, type DeferredHighlight } from "./hi-defer";
 import { createInc, incHighlight, incSeed, type IncState } from "./hi-inc";
 import { morph } from "./morph";
-import { newIncCode, paintIncCode, spliceHtml, spliceKeep, type IncCode } from "./splice";
+import { incView, newIncCode, paintIncCode, spliceHtml, spliceKeep, type IncCode, type TailMode } from "./splice";
 import type { Align, Block, BlockComponentProps, BlockKindTag, ContainerData, Decorator, ListData, RenderMetricsHook, TableData, UrlTransform } from "./types-core";
 import { blockProps, extractLang } from "./block-props";
 import { decorateSegments } from "./decorate";
@@ -84,9 +84,19 @@ export interface MountOptions {
    * An open block keeps a frozen prefix and re-tokenizes only its tail on each
    * patch, so this stays linear in the block's size. The settled markup is
    * byte-identical either way — only the tail's colours are provisional, and
-   * they may shift as bytes arrive. Set `false` for the pre-0.27 behaviour.
+   * they may shift as bytes arrive.
+   *
+   * - `true` / omitted — `"wavefront"`.
+   * - `"wavefront"` — the frozen prefix is coloured; the speculative tail (in
+   *   practice the line being typed) renders as plain text until its line
+   *   completes. The tail is one text node updated through its character data,
+   *   which is what keeps the option's cost at the DOM near zero.
+   * - `"eager"` — colour the tail on every patch too, by rebuilding its span
+   *   markup each time. Sub-line colour latency, ~all of the option's
+   *   style/layout cost.
+   * - `false` — the pre-0.27 behaviour: plain body until the fence closes.
    */
-  streamingHighlight?: boolean;
+  streamingHighlight?: boolean | "wavefront" | "eager";
   /** Coalesce patches into one DOM write per animation frame. Default true. */
   batch?: boolean;
   /**
@@ -329,6 +339,7 @@ export function mountBrookMarkdown(
   const hasPerf = typeof performance !== "undefined";
   const highlightCode = options.highlightCode !== false && !components?.CodeBlock;
   const streamingHighlight = options.streamingHighlight !== false;
+  const tailMode: TailMode = options.streamingHighlight === "eager" ? "eager" : "wavefront";
   const batch = options.batch !== false && typeof requestAnimationFrame === "function";
   const morphOpenBlocks = options.morphOpenBlocks === true;
   const fullRebuild = options.__fullRebuild === true;
@@ -1106,6 +1117,10 @@ export function mountBrookMarkdown(
       }
       if (inc !== undefined) openMarkup = incHighlight(inc, codeText(b));
     }
+    // What that markup LOOKS like under the tail mode — the mirror paints it
+    // incrementally, and a rebuild has to write the same thing in one go.
+    const openView =
+      openMarkup === null || mb.inc === undefined ? openMarkup : incView(mb.inc, openMarkup, tailMode);
     // The first slice runs HERE, before the node is inserted: an ordinary block
     // is highlighted in the same paint as always, and a fence that streamed in
     // resumes from its frozen prefix so only the tail is left to do. Only a fence
@@ -1114,7 +1129,7 @@ export function mountBrookMarkdown(
     const seed = !b.open && mb.inc !== undefined ? incSeed(mb.inc, text, lang) : undefined;
     const run = text ? highlightDeferred(text, lang, seed) : null;
     if (!b.open) mb.inc = undefined; // consumed: the block is settled
-    const highlighted = openMarkup ?? (run ? run.html : null);
+    const highlighted = openView ?? (run ? run.html : null);
 
     const block = document.createElement("div");
     block.className = "brook-code-block" + (b.open ? " brook-streaming" : "");
@@ -1194,9 +1209,9 @@ export function mountBrookMarkdown(
     pre.setAttribute("role", "region");
     pre.setAttribute("aria-label", `${lang} code`);
     const code = document.createElement("code");
-    const ic = newIncCode(code, lang, st);
+    const ic = newIncCode(code, lang, st, tailMode);
     if (paintIncCode(ic, st, markup)) mb.codeInc = ic;
-    else code.innerHTML = markup;
+    else code.innerHTML = incView(st, markup, tailMode);
     pre.appendChild(code);
     return pre;
   }

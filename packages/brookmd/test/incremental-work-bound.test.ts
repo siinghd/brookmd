@@ -82,6 +82,21 @@ beforeAll(async () => {
       nv.set!.call(this, v);
     },
   });
+  // A TEXT node's `nodeValue` resolves to `CharacterData`'s own accessor rather
+  // than `Node`'s, so the line above never sees one. That is the channel the
+  // open fence's speculative tail (and the splice's whitespace strips) write
+  // through, and it has to be on the meter like every other write. Only
+  // `nodeValue` is wrapped: happy-dom chains it through `textContent` and `data`
+  // internally, so wrapping those as well would count each write three times.
+  const C = win.CharacterData.prototype as unknown as object;
+  const cnv = Object.getOwnPropertyDescriptor(C, "nodeValue")!;
+  Object.defineProperty(C, "nodeValue", {
+    ...cnv,
+    set(this: unknown, v: string) {
+      chars += String(v ?? "").length;
+      cnv.set!.call(this, v);
+    },
+  });
   const iah = (E as { insertAdjacentHTML: (p: string, h: string) => void }).insertAdjacentHTML;
   (E as { insertAdjacentHTML: unknown }).insertAdjacentHTML = function (
     this: unknown,
