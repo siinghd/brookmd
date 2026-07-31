@@ -4,6 +4,33 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.29.1 — 2026-07-31
+
+Performance only; rendered bytes unchanged (asserted: settled markup identical
+with streaming highlight on and off, and mid-stream parity suites untouched).
+
+### Performance
+
+- **Two quadratic terms removed from the streaming-highlight hot path.** An
+  external benchmark of 0.27 showed streaming highlighting costing +36%
+  main-thread time on a code-heavy stream. Most of that was the 0.27 DOM
+  write pattern, already fixed in 0.28 (the on/off DOM-write delta is 151×
+  smaller at this release). Decomposing what remained found two genuinely
+  quadratic terms: the revision guard re-scanned the block character-by-
+  character on *every* patch to find a divergence point whose exact value
+  was never used (~2,070× the source in `charCodeAt` calls — replaced with
+  two `startsWith` questions against a cached prefix), and the fence body
+  was re-decoded out of its rendered HTML on every patch through a lazy
+  regex plus five unconditional entity passes (~5,169× the source — replaced
+  with landmark indexing and an `&`-gated entity chain). Streaming a 32 KB
+  code block, highlight-only JS cost drops **782 ms → 163 ms**, and both
+  terms now scale linearly. A scale-free regression gate
+  (`test/streaming-highlight-cost.test.ts`) pins ratios against source and
+  markup size — verified to fail on the pre-fix tree.
+- Evaluated and rejected on measurement: computing the highlight in the
+  worker (the worker forwards patches as opaque strings; parsing them there
+  costs more than the work it would relocate).
+
 ## 0.29.0 — 2026-07-31
 
 **Sublinear resources.** Total parse work has an Ω(n) floor and stays exactly
