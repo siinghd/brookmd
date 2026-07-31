@@ -258,6 +258,24 @@ pub struct StreamParser {
     buffer: String,
     committed_offset: usize,
     committed_blocks: Vec<Block>,
+    /// Keep each committed block's rendered `html` in `committed_blocks` after
+    /// the block has been emitted (as `newly_committed`) in a patch. ON by
+    /// default: the uniffi / C bindings and the one-shot `allBlocks` SSR
+    /// primitive read the whole rendered document back out of the parser.
+    ///
+    /// A pure STREAMING consumer — the npm worker — reads each committed block
+    /// exactly once, off the patch, and never calls [`Self::all_blocks`]; there
+    /// the retained html pins the entire rendered document for the life of the
+    /// stream on behalf of nobody. With this OFF the html `String` is released
+    /// at commit, so retention is the source buffer plus the open tail (see
+    /// [`Self::all_blocks`] for what that costs, and [`Self::retained_bytes`],
+    /// which reflects it). Only the html payload drops — block metadata stays,
+    /// and an opt-in `kind.data` payload ([`Self::set_block_data`]) is untouched.
+    ///
+    /// NEVER propagated to a NESTED parser ([`Self::make_nested_parser`] and the
+    /// component cache's inline twin): the container / open-item assemblers read
+    /// their inner parser's COMMITTED html on every append.
+    retain_committed_html: bool,
     active_blocks: Vec<Block>,
     next_id: u64,
     finalized: bool,
@@ -1665,6 +1683,7 @@ impl StreamParser {
             buffer: String::new(),
             committed_offset: 0,
             committed_blocks: Vec::new(),
+            retain_committed_html: true,
             active_blocks: Vec::new(),
             next_id: 0,
             finalized: false,
@@ -1860,6 +1879,22 @@ impl StreamParser {
 
     pub fn set_block_data(&mut self, on: bool) {
         self.block_data = on;
+    }
+
+    /// Keep every committed block's rendered `html` retained for
+    /// [`Self::all_blocks`]. ON by default (the whole document stays readable
+    /// out of the parser). Turn it OFF in a pure streaming consumer that reads
+    /// each committed block exactly once off its patch: the html is then
+    /// released at commit, halving what a long stream retains — at the cost of
+    /// `all_blocks` reporting committed blocks with an EMPTY `html` (metadata
+    /// stays exact; it never panics). Patch bytes are identical either way.
+    pub fn with_retain_committed_html(mut self, on: bool) -> Self {
+        self.retain_committed_html = on;
+        self
+    }
+
+    pub fn set_retain_committed_html(&mut self, on: bool) {
+        self.retain_committed_html = on;
     }
 
     /// Enable the opt-in wire delta mode (`WIRE.md` §11): active blocks that
@@ -2132,10 +2167,22 @@ impl StreamParser {
         &self.buffer
     }
 
+    /// Every block parsed so far — committed then active, in document order.
+    ///
+    /// With [`Self::set_retain_committed_html`] turned OFF, a COMMITTED block's
+    /// `html` here is EMPTY: it was released the moment the block was emitted in
+    /// its patch. `id`, `kind`, `start`, `end`, `open` and `speculative` stay
+    /// exact and nothing panics — the flag deliberately trades `all_blocks`
+    /// fidelity for the memory a pure streaming consumer never needed. It
+    /// defaults ON, so a caller that assembles the document from here (the
+    /// bindings, the SSR one-shot path) sees the full html unless it opts out.
     pub fn all_blocks(&self) -> impl Iterator<Item = &Block> {
         self.committed_blocks.iter().chain(self.active_blocks.iter())
     }
 
+    /// Total bytes retained: the source buffer plus every block's rendered html.
+    /// Committed html released by `retain_committed_html = false` is genuinely
+    /// gone, so this counts it as the zero it is.
     pub fn retained_bytes(&self) -> usize {
         let mut n = self.buffer.len();
         for b in &self.committed_blocks {
@@ -2719,8 +2766,34 @@ impl StreamParser {
             }
         }
 
-        for b in newly_committed.iter().cloned() {
-            self.committed_blocks.push(b);
+        // The commit point — and, with `retain_committed_html` off, the html
+        // DROP point. Safe to drop here because every rewrite this reparse
+        // performs already landed in `newly_committed` above (footnote
+        // id/backref resolution renders into the block html before the split,
+        // and the finalize-time footnote section is pushed as its own block a
+        // few lines up), and `newly_committed` — which keeps the full bytes — is
+        // what the patch carries out. Nothing downstream re-reads a committed
+        // block's html: `newly_committed` is built only from `produced` (blocks
+        // freshly rendered this call), no incremental fast path commits
+        // (`newly_committed: Vec::new()` in every one), and `finish_patch` reads
+        // `patch.active` only. So a committed block crosses the wire exactly
+        // once (WIRE.md §2) and `committed_blocks` is, on this path, write-only.
+        for b in newly_committed.iter() {
+            self.committed_blocks.push(if self.retain_committed_html {
+                b.clone()
+            } else {
+                // Metadata only: the html is never copied (a `clone()` then
+                // clear would still pay the memcpy the flag exists to avoid).
+                Block {
+                    id: b.id,
+                    kind: b.kind.clone(),
+                    start: b.start,
+                    end: b.end,
+                    html: String::new(),
+                    open: b.open,
+                    speculative: b.speculative,
+                }
+            });
         }
         self.active_blocks = new_active.clone();
 
@@ -4796,6 +4869,11 @@ impl StreamParser {
     /// strong_count == 1; it's frozen anyway while the open outer block stalls
     /// `committed_offset`. `force_open_tail` matches the full path, which
     /// propagates the open outer block's `open_tail` to ALL inner sub-blocks.
+    ///
+    /// `retain_committed_html` is deliberately NOT propagated (it stays at the
+    /// `new()` default, on): the container / open-item assemblers re-read this
+    /// inner parser's COMMITTED block html on every append, so dropping it here
+    /// would silently blank the outer block's output. Do not add it below.
     fn make_nested_parser(&self) -> Box<StreamParser> {
         let mut inner = Box::new(StreamParser::new());
         inner.unsafe_html = self.unsafe_html;
@@ -5067,7 +5145,9 @@ impl StreamParser {
         // Recursive nested parser — same construction as the container-block
         // cache (same flags; footnotes off, deep-cloned committed refs,
         // force_open_tail matching `render_component`'s opts propagation to all
-        // inner sub-blocks; depth-bounded by the caller).
+        // inner sub-blocks; depth-bounded by the caller). `retain_committed_html`
+        // is NOT propagated, for the reason spelled out on `make_nested_parser`:
+        // the assembler re-reads inner COMMITTED html on every append.
         let mut inner = Box::new(StreamParser::new());
         inner.unsafe_html = self.unsafe_html;
         inner.gfm_autolinks = self.gfm_autolinks;

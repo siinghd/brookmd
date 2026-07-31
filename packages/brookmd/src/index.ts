@@ -15,7 +15,8 @@
  *     // ... wherever your tokens land: client.append(deltaText);
  *     client.finalize();
  */
-export { BrookClient, BrookPool, getDefaultPool } from "./client";
+export { BrookClient, BrookPool, getDefaultPool, sourceFingerprint } from "./client";
+export type { PersistableSnapshot } from "./client";
 export { BrookMarkdown, useBrookStream, useBrookMarkdownString } from "./react";
 export { highlight, supportedLangs } from "./hi";
 export { htmlToReact, parseTrustedHtml, safeUrl, wrapLink } from "./html-to-react";

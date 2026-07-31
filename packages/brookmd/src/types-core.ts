@@ -545,6 +545,22 @@ export interface ParserConfig {
    * serde bytes; output and the `kind` serde shape stay byte-identical when off).
    */
   blockData?: boolean;
+  /**
+   * Keep every committed block's rendered HTML retained **inside the parser**.
+   *
+   * Defaults to **false on the streaming path** (the worker), which is what you
+   * want: the client receives each committed block exactly once, in the patch
+   * that commits it, and stores it itself — so a second copy sitting in WASM for
+   * the life of the stream serves nobody. Dropping it roughly halves a long
+   * stream's retained bytes (`onPatch`'s `retainedBytes`); the wire is
+   * byte-identical either way.
+   *
+   * Set `true` only if you need the parser itself to still hold the whole
+   * rendered document. The server one-shot renderers (`renderToString`,
+   * `parseToBlocks`) read the document back out of the parser and therefore pin
+   * this on regardless of what you pass.
+   */
+  retainCommittedHtml?: boolean;
 }
 
 // Each message carries a `streamId` so one worker can multiplex many parsers

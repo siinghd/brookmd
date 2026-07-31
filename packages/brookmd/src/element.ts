@@ -47,6 +47,7 @@ const CONFIG_ATTRS = [
   "a11y",
   "unsafe-html",
   "block-html",
+  "retain-committed-html",
 ];
 
 export function defineBrookMarkdown(tag = "brook-markdown"): void {
@@ -251,6 +252,9 @@ export function defineBrookMarkdown(tag = "brook-markdown"): void {
       // Only meaningful alongside the sanitizer (`html-allowlist` / drop list),
       // which this element exposes via its `config` property, not an attribute.
       set("block-html", "blockHtml");
+      // Escape hatch for a host that wants the parser to keep the whole rendered
+      // document in WASM; the streaming path drops it by default.
+      set("retain-committed-html", "retainCommittedHtml");
 
       const tags = this.getAttribute("component-tags");
       if (tags !== null) {

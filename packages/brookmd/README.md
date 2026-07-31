@@ -586,6 +586,11 @@ class BrookClient {
   whenReady(): Promise<void>;                       // resolves once WASM loaded; rejects on init failure
   subscribe(listener: () => void): () => void;      // React-friendly store
   getSnapshot(): Block[];                           // ordered current blocks
+  getPersistable(source?: string): PersistableSnapshot;     // capture the rendered doc as JSON
+  hydrate(                                                  // restore it: no worker, no parse
+    snapshot: PersistableSnapshot,
+    opts?: { source?: string },                             // source ⇒ a live thread can resume
+  ): void;
   outline(): { level: number; text: string; id: number }[]; // heading table-of-contents (works mid-stream)
   toPlaintext(): string;                            // rendered document as plain text (search / summaries)
   getMetrics(): { bytes, patches, totalParseMs, throughputKBs,
@@ -1283,6 +1288,101 @@ linear in CI alongside the parse-work counters. Raw-boundary consumers (the
 WASM `BrookParser`, native bindings, C ABI) keep byte-identical v1 wire by
 default and can opt in with `setWireDelta(true)` — see
 [`WIRE.md` §11](https://github.com/siinghd/brookmd/blob/main/crates/brookmd-core/WIRE.md).
+
+## Instant thread reopen — persist and hydrate
+
+Reopening a long thread normally means re-feeding its whole source through the
+parser before the first paint: O(history) work between the click and the pixels,
+which is exactly when a chat UI feels frozen.
+
+It is also unnecessary. A committed block is emitted **once** and is **final**,
+so the blocks a stream already produced are a complete description of the
+document — there is nothing to re-derive. Capture them, store them, restore them:
+
+```ts
+// When the thread closes (or at any checkpoint):
+await db.put(threadId, JSON.stringify(client.getPersistable()));
+
+// When it reopens:
+const client = new BrookClient();
+client.hydrate(JSON.parse(await db.get(threadId))); // no worker, no WASM, no parse
+// <BrookMarkdown client={client} /> paints the whole thread on the first frame.
+```
+
+Measured on a 1 MB / ~2250-block thread: **~5 ms to hydrate vs ~110 ms to
+re-stream** it in 2 KB chunks (~51 ms even for a single-shot re-parse) — before
+counting the worker spin-up and WASM init a re-stream also pays. Hydration is
+O(blocks) of JSON handling; nothing parses.
+
+Hydrated blocks are **ordinary committed blocks**: both renderers mount them
+through the same path as live ones, so a reopened thread renders byte-identical
+to the one the user closed.
+
+### What to store, and when to throw it away
+
+```ts
+interface PersistableSnapshot {
+  hydrateVersion: number; // envelope version; hydrate() refuses what it can't read
+  blocks: Block[];        // exactly what getSnapshot() showed
+  sourceLength: number;   // UTF-16 length of the markdown behind them
+  sourceHash: string;     // fingerprint of that markdown — a staleness check
+  done: boolean;          // had the stream been finalized?
+}
+```
+
+Store it as JSON beside the thread. **Invalidate it when your source moves on**:
+hydrate deliberately does *not* verify the blocks against the source, so a stale
+snapshot would paint stale HTML. That is what `sourceHash` is for:
+
+```ts
+import { sourceFingerprint } from "brookmd";
+
+if (snapshot.sourceHash === sourceFingerprint(mySource)) {
+  client.hydrate(snapshot);                        // instant
+} else {
+  client.setContent(mySource, { done: true });     // the text changed — re-stream
+}
+```
+
+Discard a snapshot whose `hydrateVersion` your build doesn't read, too. Either
+way a failed hydrate is safe to fall back from: a malformed or unreadable
+snapshot is rejected **whole**, with nothing written until every block has
+validated.
+
+> This envelope is a brookmd **package** format, *not* the parser wire contract
+> ([`WIRE.md`](https://github.com/siinghd/brookmd/blob/main/crates/brookmd-core/WIRE.md)).
+> The two are versioned independently.
+
+### Resuming a thread that was still streaming
+
+A `done: false` snapshot was captured mid-stream. Pass the original markdown as
+`source` and the thread simply continues:
+
+```ts
+client.hydrate(snapshot, { source: markdownSoFar });
+client.append(nextDelta); // or client.pipeFrom(await fetch("/api/chat"))
+```
+
+The parser's internal state cannot be serialized (it is an `Rc` graph, not
+data), so continuing a document genuinely requires re-parsing what came before
+it — but that cost moves **off the critical path**. On the first `append`
+brookmd spins up the worker, re-feeds the source in the background, and keeps
+the hydrated blocks on screen throughout: the reader scrolls and reads while the
+parse catches up. New chunks need no buffering — they queue behind the re-feed
+and land the moment it completes (they arrive at model token speed; the parser
+catches up far faster). When the re-parse lands, unchanged blocks are adopted
+**by reference and by id**, so nothing re-renders and nothing remounts at the
+swap.
+
+A `done: true` snapshot is terminal: it needs no `source`, no worker is ever
+created for it, and `append()` throws — a finished thread cannot be extended
+(`reset()` to start a new one). A `done: false` snapshot hydrated *without*
+`source` is view-only: it paints, but appending throws, because a document
+cannot be continued correctly without the text preceding it.
+
+Nothing on the hydrate path touches a worker: `whenReady()` resolves immediately
+and `client.ready` is `true`, so a readiness gate never sits over a thread that
+is already on screen.
 
 ## Security
 

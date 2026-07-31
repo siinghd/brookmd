@@ -39,6 +39,85 @@ export interface OutlineEntry {
   id: number;
 }
 
+/** Envelope version of {@link PersistableSnapshot}. Bumped only when the shape
+ *  changes incompatibly, and versioned INDEPENDENTLY of both the package and
+ *  the parser wire contract (WIRE.md) — see the type's note. */
+const HYDRATE_VERSION = 1;
+
+/**
+ * A self-contained, JSON-serializable capture of everything a stream currently
+ * renders — produced by {@link BrookClient.getPersistable}, restored by
+ * {@link BrookClient.hydrate}.
+ *
+ * Reopening a long thread normally re-feeds its whole source through the parser
+ * before the first paint (O(source), and it blocks the reopen). Persist this
+ * next to the thread instead and restoring it is pure JSON handling: the blocks
+ * go straight into the store and both renderers mount them as ordinary
+ * committed blocks — **no worker, no WASM, no parse**.
+ *
+ * NOT the wire contract. The parser↔renderer wire (WIRE.md) is a separate,
+ * separately-versioned boundary; this envelope is a brookmd *package* format
+ * that only {@link BrookClient.hydrate} consumes.
+ */
+export interface PersistableSnapshot {
+  /** Envelope version. {@link BrookClient.hydrate} refuses anything it does not
+   *  know how to read, so a stored snapshot never half-restores. */
+  hydrateVersion: number;
+  /**
+   * The blocks exactly as {@link BrookClient.getSnapshot} showed them at
+   * capture: the committed history plus whatever tail was on screen. Plain
+   * JSON — a `Block` carries no hidden state (the renderers' splice bookkeeping
+   * lives in a WeakMap, never on the block), so `JSON.stringify` round-trips it.
+   */
+  blocks: Block[];
+  /** UTF-16 length of the markdown that produced `blocks`. */
+  sourceLength: number;
+  /** {@link sourceFingerprint} of that markdown. A staleness check — "is the
+   *  source I stored still the one these blocks came from?" — and deliberately
+   *  nothing more: not a checksum, not security. */
+  sourceHash: string;
+  /** Whether the captured stream had been finalized. A `done` snapshot is a
+   *  terminal document: it needs no source and can never be resumed. */
+  done: boolean;
+}
+
+/**
+ * 32-bit FNV-1a over a string's UTF-16 code units, as 8 hex digits. Backs
+ * {@link PersistableSnapshot.sourceHash}: cheap enough to run over a megabyte
+ * of markdown, sharp enough to notice that a stored source changed. Exported so
+ * a caller can make the same staleness decision brookmd does —
+ * `snap.sourceHash === sourceFingerprint(mySource)`. Not a security primitive.
+ */
+export function sourceFingerprint(source: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < source.length; i++) {
+    h ^= source.charCodeAt(i);
+    // The FNV prime via Math.imul: a 32-bit wrapping multiply, no float rounding.
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
+/** Shape-check one entry of a persisted `blocks` array. Restoring a malformed
+ *  snapshot must fail WHOLE rather than half-fill the store: a partially
+ *  restored document renders as a real one and silently lies to the reader. */
+function isPersistedBlock(b: unknown): b is Block {
+  if (typeof b !== "object" || b === null) return false;
+  const x = b as Record<string, unknown>;
+  return (
+    typeof x.id === "number" &&
+    Number.isFinite(x.id) &&
+    typeof x.html === "string" &&
+    typeof x.start === "number" &&
+    typeof x.end === "number" &&
+    typeof x.open === "boolean" &&
+    typeof x.speculative === "boolean" &&
+    typeof x.kind === "object" &&
+    x.kind !== null &&
+    typeof (x.kind as Record<string, unknown>).type === "string"
+  );
+}
+
 /** Strip tags (→ space) and decode the small entity set the core emits, then
  *  collapse whitespace. INVARIANT: the simple `<[^>]*>` strip is only safe
  *  because every input here is HTML the Rust core produced via escape_html /
@@ -537,6 +616,12 @@ export class BrookClient {
   // same-length-or-shorter replacement the growth check misses). Also cleared on
   // an explicit caller reset().
   private recoveryAttempted = false;
+  // Whether any chunk has been appended in this generation. Read only by
+  // getPersistable's source fallback, to tell "nothing was ever driven" (whose
+  // source is the empty document) from "driven, but this client did not retain
+  // it" — the one configuration, recovery off plus manual appends, where the
+  // source is genuinely unknown and the caller must supply it.
+  private appendedAny = false;
 
   // Opt-in rAF coalescing (see constructor `coalesce`). When on AND
   // requestAnimationFrame exists, intra-frame emit()s collapse into ONE
@@ -583,6 +668,25 @@ export class BrookClient {
   /** Set by mergeStale when it had to compact a hole out of the view, so
    *  getSnapshot skips caching a view whose indices no longer track `base`. */
   private mergeDropped = false;
+
+  // --- Hydration (see getPersistable / hydrate) ---
+  // Set by hydrate(): this store was FILLED FROM JSON, never parsed, so no
+  // worker has ever seen this document. Sticky until reset() — a resumed client
+  // is still "a hydrated client" as far as getPersistable is concerned.
+  private hydrated = false;
+  // The restored envelope's own fields, kept so the resume can re-check
+  // staleness and so getPersistable() can re-emit an untouched snapshot exactly.
+  private hydratedDone = false;
+  private hydratedLength = 0;
+  private hydratedHash = "";
+  // The original markdown behind a hydrated snapshot (hydrate's `source`), held
+  // ONLY until the resume re-feed consumes it. Null for a `done` snapshot, which
+  // is terminal and needs none.
+  private hydratedSource: string | null = null;
+  // Latch: the resume re-feed has been issued, or the caller took over by
+  // driving the whole document itself. From here append()/finalize() behave
+  // exactly as on any other client.
+  private resumed = false;
 
   // Perf
   private appendedBytes = 0;
@@ -721,7 +825,18 @@ export class BrookClient {
   }
 
   get ready(): boolean {
+    // A hydrated document is already readable with no worker in the picture.
+    // Reporting `false` there would leave a `ready`-gated spinner sitting over a
+    // fully rendered thread forever.
+    if (this.hydrationPending) return true;
     return this.pw?.ready ?? false;
+  }
+
+  /** True while a hydrated document has never been handed to a parser: the
+   *  store holds restored blocks and no worker exists. Cleared once the resume
+   *  re-feed is issued (or the caller re-drives the whole document itself). */
+  private get hydrationPending(): boolean {
+    return this.hydrated && !this.resumed;
   }
 
   /**
@@ -739,6 +854,11 @@ export class BrookClient {
   }
 
   whenReady(): Promise<void> {
+    // A hydrated document is on screen already and no parser has been asked
+    // for — resolve without acquiring. This is what keeps "reopen a finished
+    // thread" free of WASM entirely: a readiness gate must not be the thing that
+    // spawns the worker hydration exists to avoid.
+    if (this.hydrationPending) return Promise.resolve();
     const pw = this.ensureAcquired();
     return this.pool.whenWorkerReady(pw);
   }
@@ -753,9 +873,13 @@ export class BrookClient {
   }
 
   append(chunk: string) {
+    // First content-bearing op on a hydrated thread: rebuild the parser state
+    // that could not be serialized, in the background, before this chunk.
+    if (this.hydrationPending) this.beginResume();
     const pw = this.ensureAcquired();
     this.settleRebind();
     if (this.firstAppendMs === 0) this.firstAppendMs = performance.now();
+    this.appendedAny = true;
     if (this.recovery) {
       // Accumulate the driven document so a transient worker death can re-feed it
       // (this also captures setContent, which drives via append(delta)).
@@ -772,6 +896,15 @@ export class BrookClient {
   }
 
   finalize() {
+    if (this.hydrationPending) {
+      // A thread hydrated as already-finalized IS finalized. Re-finalizing would
+      // spin up a worker and a parser for a document that will never be parsed —
+      // exactly the cost hydration exists to avoid — so this is a no-op.
+      if (this.hydratedDone) return;
+      // Otherwise resume first, so the finalize below lands on a parser that has
+      // been given the history (queued ahead of it by postMessage's FIFO order).
+      this.beginResume();
+    }
     const pw = this.ensureAcquired();
     this.settleRebind();
     // The terminal patch this triggers must reach subscribers synchronously, not
@@ -916,6 +1049,10 @@ export class BrookClient {
           // the merge adopt identical blocks (an unchanged re-feed re-renders
           // nothing at all).
           this.softReset(this.getSnapshot());
+          // `lastContent` was empty, so the append below carries the WHOLE
+          // document. A hydrated client therefore needs no resume re-feed — this
+          // append IS the re-parse, over the very view softReset just preserved.
+          this.retireHydration();
         }
         this.append(content.slice(this.lastContent.length));
       } else {
@@ -928,6 +1065,10 @@ export class BrookClient {
         const displayed = this.getSnapshot();
         if (content.length > 0 && displayed.length > 0) this.softReset(displayed);
         else this.reset();
+        // Same as the whole-document prefix case above: the caller supplied the
+        // entire document, so a hydrated client's resume re-feed is redundant
+        // (and would prepend a stale source to it).
+        this.retireHydration();
         this.append(content);
       }
       this.lastContent = content;
@@ -937,6 +1078,255 @@ export class BrookClient {
       this.finalize();
       this.contentDone = true;
     }
+  }
+
+  /**
+   * Capture everything this client currently renders as a plain-JSON
+   * {@link PersistableSnapshot}: `JSON.stringify` it, store it beside the
+   * thread, and {@link hydrate} it back later to repaint with **no parse at
+   * all**. This is the persistence half of instant thread reopen.
+   *
+   * The committed wire is already a complete serialization — a committed block
+   * is emitted exactly once and is final (WIRE.md §2) — so there is nothing to
+   * re-derive: the snapshot IS the document. Cost here is one pass to
+   * fingerprint the source; cost on the way back in is a `Map` fill.
+   *
+   * @param source the markdown driven into this stream, used ONLY to compute
+   *   {@link PersistableSnapshot.sourceHash}. Optional, because a client with
+   *   `recovery` on (the default) already retains it, as does a
+   *   `setContent`-driven one; required in the single configuration that holds
+   *   neither — `recovery: false` plus manual `append()` — where omitting it
+   *   throws rather than persisting a snapshot no one can check for staleness.
+   */
+  getPersistable(source?: string): PersistableSnapshot {
+    const blocks = this.getSnapshot();
+    if (source === undefined && this.hydrationPending) {
+      // Hydrated and untouched since: the source is unchanged BY DEFINITION, so
+      // re-emit the restored envelope's own fingerprint rather than demand a
+      // source this client never had (a `done` hydrate is given none).
+      return {
+        hydrateVersion: HYDRATE_VERSION,
+        blocks,
+        sourceLength: this.hydratedLength,
+        sourceHash: this.hydratedHash,
+        done: this.hydratedDone,
+      };
+    }
+    const src = source ?? this.retainedSource();
+    if (src === null) {
+      throw new Error(
+        "brookmd: getPersistable() needs the source markdown to fingerprint, and this client " +
+          "retains none (constructed with `recovery: false` and driven with append()). Pass it " +
+          "explicitly: client.getPersistable(source).",
+      );
+    }
+    return {
+      hydrateVersion: HYDRATE_VERSION,
+      blocks,
+      sourceLength: src.length,
+      sourceHash: sourceFingerprint(src),
+      done: this.contentDone,
+    };
+  }
+
+  /** The full driven document when this client happens to hold it: the recovery
+   *  buffer is exactly that whenever `recovery` is on (the default), and
+   *  setContent's baseline covers the recovery-off controlled-string mode.
+   *  `null` means genuinely unknown — reachable only with recovery off AND
+   *  manual appends. */
+  private retainedSource(): string | null {
+    if (this.recovery) return this.recoveryBuffer;
+    if (this.lastContent.length > 0) return this.lastContent;
+    // Nothing has been appended in this generation, so the driven document IS
+    // the empty one — a real, correctly fingerprinted source. (Deliberately not
+    // inferred from an empty store: a client that has appended has nothing
+    // rendered either until its first patch comes back.)
+    if (!this.appendedAny) return "";
+    return null;
+  }
+
+  /**
+   * Restore a {@link PersistableSnapshot} into an untouched client. The blocks
+   * land in the store as ordinary committed blocks and `getSnapshot()` returns
+   * them immediately, so the first paint already has the whole document —
+   * **no worker is created, no WASM loads, nothing is parsed**. Reopening a
+   * thread costs O(blocks) of JSON handling instead of O(source) of parsing.
+   *
+   * Call it on a fresh client before anything is appended and, ideally, before
+   * the renderer mounts (hydrating an already-mounted client works — it
+   * notifies subscribers — but costs an extra render). Hydrating a client that
+   * already holds content throws.
+   *
+   * **Resuming a live thread.** A snapshot with `done: false` was still
+   * streaming. Pass `source` — the markdown behind the snapshot — and the first
+   * {@link append} rebuilds parser state in the background: the parser's
+   * internals are an `Rc` graph with no serialized form, so continuing a
+   * document genuinely requires re-parsing what came before it, but that cost
+   * moves OFF the critical path. The hydrated blocks stay on screen and the
+   * reader scrolls them while the worker catches up; new chunks queue behind the
+   * re-feed and land the moment it does. Without `source` the thread is
+   * view-only and appending throws — continuing a document correctly is not
+   * possible without the text that precedes it.
+   *
+   * **Hydration does not verify the blocks against the source.** The snapshot is
+   * trusted as produced; `sourceHash` exists so the CALLER can notice its stored
+   * source moved on and re-stream instead of painting stale HTML. The resume
+   * path re-checks it, lets the fresh parse win, and warns in dev.
+   *
+   * @throws if the envelope version is unknown, the snapshot is malformed, or
+   *   this client already holds content. Validation completes before anything is
+   *   written, so a rejected snapshot leaves the client exactly as it was.
+   */
+  hydrate(snapshot: PersistableSnapshot, opts?: { source?: string }): void {
+    if (this.hydrated || this.pw !== null || this.getSnapshot().length > 0) {
+      throw new Error(
+        "brookmd: hydrate() must be called on an untouched client, before any " +
+          "append()/setContent()/finalize(). Construct a new BrookClient (or reset() this one).",
+      );
+    }
+    if (typeof snapshot !== "object" || snapshot === null) {
+      throw new Error("brookmd: hydrate() expects a PersistableSnapshot object.");
+    }
+    if (snapshot.hydrateVersion !== HYDRATE_VERSION) {
+      throw new Error(
+        `brookmd: cannot hydrate a version ${String(snapshot.hydrateVersion)} snapshot — this ` +
+          `build reads version ${HYDRATE_VERSION}. Discard it and re-stream the source.`,
+      );
+    }
+    if (
+      !Array.isArray(snapshot.blocks) ||
+      typeof snapshot.done !== "boolean" ||
+      typeof snapshot.sourceHash !== "string" ||
+      typeof snapshot.sourceLength !== "number" ||
+      !Number.isFinite(snapshot.sourceLength) ||
+      snapshot.sourceLength < 0
+    ) {
+      throw new Error(
+        "brookmd: malformed PersistableSnapshot (bad blocks / done / sourceHash / sourceLength).",
+      );
+    }
+    // Build the whole store into locals and commit only once every block has
+    // passed — see isPersistedBlock on why a half-restored store is worse than
+    // a thrown error the caller can fall back from.
+    const committed = new Map<number, Block>();
+    const committedOrder: number[] = new Array(snapshot.blocks.length);
+    for (let i = 0; i < snapshot.blocks.length; i++) {
+      const b = snapshot.blocks[i];
+      if (!isPersistedBlock(b)) {
+        throw new Error(
+          `brookmd: malformed PersistableSnapshot — block at index ${i} is not a Block.`,
+        );
+      }
+      // The id is the React key / DOM node key AND the store's map key, so a
+      // duplicate would leave committedOrder and `committed` disagreeing and
+      // publish the same block at two positions.
+      if (committed.has(b.id)) {
+        throw new Error(`brookmd: malformed PersistableSnapshot — duplicate block id ${b.id}.`);
+      }
+      committedOrder[i] = b.id;
+      committed.set(b.id, b);
+    }
+    // Copy the array (not the blocks): `store.snapshot` is compared BY
+    // REFERENCE by the merge cache, so it must be ours, not one the caller may
+    // still mutate. The blocks themselves stay shared — they are immutable by
+    // the store contract, and copying them would defeat the whole point.
+    this.store = { committed, committedOrder, active: [], snapshot: snapshot.blocks.slice() };
+    this.hydrated = true;
+    this.hydratedDone = snapshot.done;
+    this.hydratedLength = snapshot.sourceLength;
+    this.hydratedHash = snapshot.sourceHash;
+    this.hydratedSource = snapshot.done ? null : opts?.source ?? null;
+    // Seed setContent's diff baseline so a controlled-string caller handing back
+    // `source + newTokens` takes the cheap prefix path (→ append(delta) →
+    // resume) instead of diverging into a full reparse.
+    if (this.hydratedSource !== null) this.lastContent = this.hydratedSource;
+    this.contentDone = snapshot.done;
+    // Normally there is nobody to tell yet; notify anyway so hydrating an
+    // already-mounted client repaints instead of showing an empty document.
+    this.emit(true);
+  }
+
+  /**
+   * The first content-bearing op on a hydrated thread: give the parser back the
+   * state it could not be handed.
+   *
+   * There is no way around re-parsing — the core keeps `Rc` graphs with no
+   * `Deserialize` — but every part of that cost sits off the critical path. The
+   * hydrated blocks are already painted and STAY painted: `softReset` preserves
+   * them exactly as the setContent divergence swap does, so the reader keeps
+   * reading and scrolling while the worker chews through the history on its own
+   * thread. The caller's new chunks need no buffer of ours — `postMessage` is
+   * FIFO per worker, so they queue behind the re-feed and are parsed the instant
+   * it catches up. When the re-parse's patch lands, `mergeStale` adopts every
+   * unchanged block BY REFERENCE (same object, same id), so the swap re-renders
+   * and remounts nothing, and the live tail streams on from there.
+   */
+  private beginResume(): void {
+    // An empty hydrate has no history for the parser to rebuild — there is
+    // simply nothing to resume, so carry on as a fresh stream.
+    if (this.hydratedLength === 0 && this.store.snapshot.length === 0) {
+      this.retireHydration();
+      return;
+    }
+    if (this.hydratedDone) {
+      throw new Error(
+        "brookmd: this client was hydrated from a FINALIZED snapshot (done: true), and a " +
+          "completed thread cannot be appended to. Call reset() to start a new stream, or " +
+          "hydrate a `done: false` snapshot with its `source` to resume one.",
+      );
+    }
+    const source = this.hydratedSource;
+    if (source === null) {
+      throw new Error(
+        "brookmd: cannot append to a hydrated client without its source. Continuing a document " +
+          "means re-parsing the text that came before it — pass it at hydrate time: " +
+          "client.hydrate(snapshot, { source }).",
+      );
+    }
+    // Latch BEFORE re-feeding: the append at the bottom re-enters append().
+    this.retireHydration();
+    if (
+      typeof process !== "undefined" &&
+      process.env.NODE_ENV !== "production" &&
+      (source.length !== this.hydratedLength || sourceFingerprint(source) !== this.hydratedHash)
+    ) {
+      // The stored source is not the one these blocks came from. Not fatal: the
+      // re-parse below is authoritative, and mergeStale swaps the changed blocks
+      // in (trimming to the new length on the terminal patch), so the document
+      // self-heals to the source. Say so anyway — the caller's persistence has
+      // drifted, and next time it should re-stream instead of hydrating.
+      warnOnce(
+        "hydrate-stale",
+        "brookmd: the source passed to hydrate() does not match the snapshot's fingerprint, so " +
+          "the resume re-parse will replace the hydrated blocks. Compare `snapshot.sourceHash` " +
+          "with `sourceFingerprint(source)` before hydrating and re-stream when they differ.",
+      );
+    }
+    // Keep the hydrated view on screen across the rebuild, exactly as a
+    // setContent divergence swap does — this IS that swap, with the "old"
+    // document restored from JSON instead of parsed.
+    this.softReset(this.getSnapshot());
+    this.append(source);
+  }
+
+  /** The resume re-feed is no longer wanted: either it has just been issued, or
+   *  the caller took over by driving the whole document itself. Releases the
+   *  retained source so one document, not two, stays in memory. */
+  private retireHydration(): void {
+    this.resumed = true;
+    this.hydratedSource = null;
+  }
+
+  /** Drop every trace of a hydrate. An explicit reset() is a brand-new
+   *  document, so a restored view must not keep intercepting appends or re-feed
+   *  a source that is no longer the one being streamed. */
+  private clearHydration(): void {
+    this.hydrated = false;
+    this.resumed = false;
+    this.hydratedDone = false;
+    this.hydratedSource = null;
+    this.hydratedLength = 0;
+    this.hydratedHash = "";
   }
 
   reset() {
@@ -956,6 +1346,7 @@ export class BrookClient {
     this.failedError = null;
     this.recoveryAttempted = false;
     this.pendingRebind = false; // this reset IS the fresh generation
+    this.clearHydration(); // ...and a fresh generation is no longer a restored one
     this.resetParser();
     if (hadContent) this.emit(true); // clear-the-view notify is synchronous
   }
@@ -1017,6 +1408,7 @@ export class BrookClient {
     this.firstAppendMs = 0;
     this.retainedBytes = 0;
     this.wasmMemoryBytes = 0;
+    this.appendedAny = false;
     this.lastContent = ""; // setContent baseline: the worker drops the parser here
     this.contentDone = false;
     // Clear the recovery buffer: the worker's parser is being dropped, so the

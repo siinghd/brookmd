@@ -87,6 +87,16 @@ Swift/Kotlin/C-ABI bindings ship prebuilt from CI as checksummed
 per ABI, Apple XCFrameworks with iOS + macOS slices); the React Native package
 vendors its binaries in the npm tarball.
 
+**What each layer gets.** Everything in the Rust core — byte-exact
+CommonMark/GFM output, the streaming caches and O(new-bytes) guarantees, the
+sanitizers, and every `ParserConfig` feature — is identical on **all**
+platforms above. The client-layer optimizations live in the npm package's
+TS/renderer layer and are **web-path only**: streaming syntax highlighting,
+incremental DOM application, `hydrate()` instant reopen, and the
+`retainCommittedHtml` memory default (native bindings consume `allBlocks()`
+and keep full retention). Native hosts render the wire themselves, so those
+concerns — and those optimizations — belong to their renderer layer.
+
 ## Development
 
 ```bash

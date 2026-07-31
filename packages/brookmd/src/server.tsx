@@ -105,6 +105,11 @@ function makeParser(config?: ParserConfig): BrookParser {
   p.setBlockHtml(config?.blockHtml ?? false);
   p.setAllowSchemes(config?.allowSchemes ?? []);
   p.setBlockData(config?.blockData ?? false);
+  // Pinned ON, unlike the worker: `parseToBlocks` (and `renderToString` through
+  // it) assembles the document from `allBlocks()` at the end, so the parser must
+  // still hold every committed block's HTML. A `retainCommittedHtml: false` in
+  // config would empty the output, so it is deliberately not honored here.
+  p.setRetainCommittedHtml(true);
   return p;
 }
 

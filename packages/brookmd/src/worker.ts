@@ -43,6 +43,12 @@ const core = new WorkerCore({
     p.setBlockHtml(c?.blockHtml ?? false);
     p.setAllowSchemes(c?.allowSchemes ?? []);
     p.setBlockData(c?.blockData ?? false);
+    // Committed HTML retention is OFF by default here (the core defaults it ON
+    // for the bindings' `allBlocks` readers). This worker never calls
+    // allBlocks(): every committed block leaves in the patch that commits it and
+    // is never re-read, so retaining a second copy in WASM for the life of the
+    // stream costs the whole rendered document for nobody.
+    p.setRetainCommittedHtml(c?.retainCommittedHtml ?? false);
     // Wire delta mode (WIRE.md §11) is always on for OUR worker↔client pair:
     // active re-emits cross the WASM and postMessage boundaries as splices
     // instead of full html (O(n) total for a growing block), and applyPatch

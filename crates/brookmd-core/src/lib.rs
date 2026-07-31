@@ -269,6 +269,20 @@ impl BrookParser {
         self.inner.set_wire_delta(on);
     }
 
+    /// Keep every committed block's rendered HTML retained inside the parser for
+    /// `allBlocks()`. ON by default. Turn it OFF in a pure STREAMING consumer —
+    /// one that reads each committed block exactly once out of its patch and
+    /// never calls `allBlocks()` (the npm worker): the HTML is then released the
+    /// moment the block is emitted, so a long stream retains the source buffer
+    /// plus the open tail instead of the whole rendered document (`retainedBytes`
+    /// reflects it). Patch bytes are identical either way; the only cost is that
+    /// `allBlocks()` then reports committed blocks with an EMPTY `html` (id,
+    /// kind, start, end, open, speculative all stay exact).
+    #[wasm_bindgen(js_name = setRetainCommittedHtml)]
+    pub fn set_retain_committed_html(&mut self, on: bool) {
+        self.inner.set_retain_committed_html(on);
+    }
+
     /// Set the opt-in component-tag allowlist (e.g. `["Thinking", "Callout"]`).
     /// A `<Tag>…</Tag>` whose name is listed renders as a component whose inner
     /// content is markdown — safely, without unsafe HTML (the tag is allowlisted

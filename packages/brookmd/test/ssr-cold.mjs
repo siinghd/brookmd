@@ -56,6 +56,26 @@ try {
   ok("renderToString <BrookMarkdown client> + <BrookMarkdown stream>");
 } catch (e) { fail("React renderToString", e); }
 
+// 3b) A persisted thread hydrates and server-renders with NO browser globals:
+//     hydration is a Map fill, so a stored snapshot can be rendered straight
+//     into the HTML response — no Worker, no WASM, nothing to wait for.
+try {
+  const { createElement } = await import("react");
+  const { renderToString } = await import("react-dom/server");
+  const { BrookMarkdown } = await import("../src/react.tsx");
+  const { sourceFingerprint } = await import("../src/index.ts");
+  const c = new BrookClient();
+  c.hydrate({
+    hydrateVersion: 1,
+    blocks: [{ id: 0, kind: { type: "Paragraph" }, start: 0, end: 5, html: "<p>hello</p>", open: false, speculative: false }],
+    sourceLength: 5, sourceHash: sourceFingerprint("hello"), done: true,
+  });
+  if (c.getSnapshot().length !== 1) throw new Error("expected the hydrated block");
+  const html = renderToString(createElement(BrookMarkdown, { client: c }));
+  if (!html.includes("hello")) throw new Error("hydrated SSR markup unexpected: " + html);
+  ok("hydrate() + renderToString (no Worker, no parse)");
+} catch (e) { fail("hydrate SSR", e); }
+
 // 4) Cross-framework SSR — safe here (dedicated process; no sibling suite to
 //    poison via @vue/runtime-dom's module-level `doc` cache). This is the
 //    load-bearing home for Vue/Solid/Svelte server rendering.
