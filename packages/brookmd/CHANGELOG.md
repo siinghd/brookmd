@@ -4,6 +4,63 @@ Notable changes to brookmd (formerly `flux-md`). Format based on
 [Keep a Changelog](https://keepachangelog.com/); this project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## 0.28.0 — 2026-07-31
+
+**Browser-side linearity.** The parser and wire have been O(new bytes) per
+append for a while; this release makes the *DOM application* match. Before, an
+open (streaming) block was fully rebuilt on every animation frame — a 20 KB
+highlighted code block wrote ~44 million characters of `innerHTML` over its
+lifetime (≈2,150× the wire bytes), and a per-frame `replaceWith` destroyed any
+text selection or `<pre>` scroll position inside the block. Every open-block
+path now applies patches incrementally, measured at **2–3.4× the block's final
+markup, flat across sizes** (1× is the write-it-once floor), and enforced by a
+chars-written regression gate so browser-side linearity is CI-pinned like the
+parser's scaling shapes.
+
+### Performance
+
+- **Open blocks apply the wire's splice instead of rebuilding.** The delta
+  signal (`keep_units`) the wire already computed was being discarded at the
+  client; it now reaches both renderers, which rebuild only the element the
+  splice lands in (fast path fires ~94% of syncs; any ambiguity falls back to
+  a full rebuild, so correctness never depends on the fast path).
+- **Open code blocks reuse the streaming highlighter's frozen prefix**: the
+  frozen markup is appended once and never rewritten; only the bounded
+  speculative tail repaints. 20 KB highlighted stream: ~44 MB written → ~370 KB
+  (**~120× less**).
+- **Keyed list/container sync in the DOM renderer** (`blockData` on): settled
+  `<li>`s / nested container children are never re-rendered — new items append,
+  only the open last item repaints; a tight→loose flip resyncs once, keyed by
+  `(index, html)` so it cannot be silently missed. Streamed 20 KB list: 284× →
+  **2.9×**; blockquote: 318× → **3.4×**.
+- **React's keyed container path now engages by default.** It was accidentally
+  gated behind a `components` map (git history shows the gate was incidental);
+  a default-config streaming blockquote/alert now renders keyed — 22.6× and
+  growing → **3.4× flat**. React and DOM implementations were cross-checked to
+  byte-identical work counts.
+- Known documented fallback: a streamed table with `blockData: false` still
+  takes the full-rebuild path (the splice refuses table tag chains — foster
+  parenting). `blockData: true` tables were already incremental (1.7×). A
+  table-scoped splice was measured (15% improvement) and rejected as not worth
+  the parser-divergence risk.
+
+### Fixed
+
+- **Text selection and `<pre>` scroll survive streaming.** Selecting text in
+  the already-settled part of a streaming block no longer collapses on the
+  next token; a code block's horizontal scroll position is preserved. Both are
+  pinned by tests with negative controls.
+
+### Changed
+
+- The DOM inside an open, streaming `<code>` element is now two spans (frozen +
+  speculative tail) while streaming; it settles to the same single-markup form
+  as before when the block closes. CSS that targets `code > *` structurally
+  may observe the difference mid-stream only. Settled output is unchanged.
+- React's default open blockquote/alert omits inter-block whitespace text
+  nodes mid-stream (matching the DOM renderer's long-standing keyed behavior);
+  layout is unaffected and settle output is byte-identical.
+
 ## 0.27.0 — 2026-07-31
 
 ### Added
