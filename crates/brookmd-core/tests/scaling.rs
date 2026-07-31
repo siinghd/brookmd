@@ -473,6 +473,32 @@ fn fence_giant_info(target: usize) -> String {
     s
 }
 
+/// The linear CONTROL twin of [`fence_giant_info`]: the same `` ```rust `` +
+/// `attr `-run bytes, cut into CLOSED fences with a bounded 1 KB opener line.
+///
+/// A giant open fence opener has no same-bytes linear twin — every other open
+/// block re-emits its growing `Block.html` per append (the O(n²/chunk) wire
+/// contract), and closing the opener turns the rest of the bytes into fence
+/// CONTENT of an open block, which is that same floor. Bounding each opener
+/// instead keeps the per-byte work identical (same opener parse, same info
+/// split, same escaping) while making the document provably O(n): each fence
+/// commits after a fixed number of appends, so a cache that re-derived its
+/// opener per append would cost this control a constant factor, not a growth
+/// term. That is exactly what a control twin has to be — a yardstick for what n
+/// bytes of this stream cost on this runner right now.
+fn fence_closed_info_runs(target: usize) -> String {
+    let mut s = String::new();
+    while s.len() < target {
+        let start = s.len();
+        s.push_str("```rust ");
+        while s.len() - start < 1024 {
+            s.push_str("attr ");
+        }
+        s.push_str("\n```\n\n");
+    }
+    s
+}
+
 /// A blockquote whose FIRST line never completes. Once its content diverges from
 /// every alert marker the container cache arms mid-line, so the slow-path tail
 /// reparse is gone (scanned linear); its open paragraph still re-renders each
@@ -1493,6 +1519,143 @@ fn wire_delta_emitted_is_linear() {
     assert!(failures.is_empty(), "wire-delta emitted regression(s):\n  {}", failures.join("\n  "));
 }
 
+// ---- wall-clock guard harness ---------------------------------------------
+
+/// The ratios one full wall-guard measurement pass produces.
+///
+/// Wall guards exist because the work counters are blind to allocation-class
+/// quadratics: an armed cache that re-derives a growing region every append
+/// scans nothing extra and inline-renders nothing extra — it just allocates and
+/// memcpys — so `scanned`/`rendered` stay flat and green while wall goes O(n²).
+/// Two shipped regressions were caught only this way. They stay.
+///
+/// But they are also the only gate here that can flake: wall time on a shared
+/// runner carries the runner's weather, and raw growth-over-a-span carries it
+/// UNDAMPED (a 29.1x reading on a shape whose quiet value is 18.5x once turned a
+/// commit with zero Rust changes red, while the deterministic counter gate for
+/// the same shape passed in the same job).
+///
+/// So every wall guard also measures a CONTROL twin — same sizes, same span,
+/// back to back on the same runner, on a shape that does equivalent LINEAR work
+/// — and gates on a ratio the weather cancels out of:
+///
+/// * `vs_control` — worst per-size `shape / control`. The sharpest form, and the
+///   one to use whenever the twin is the SAME document minus the single property
+///   under test (the flush-prose twins, the escaped-HTML twin): ~1x when fixed,
+///   30-300x when broken, and a runner hiccup lands on both twins.
+/// * `growth_vs_control` — the shape's growth across the span divided by the
+///   control's growth across the same span. For a twin that is necessarily a
+///   DIFFERENT document (the fence opener has no same-bytes linear twin), the
+///   per-size ratio carries an arbitrary per-byte constant; dividing the growths
+///   cancels it. ~1x when fixed, ~(observed broken growth / span) when broken.
+/// * `growth` — raw shape growth across the span. Noise-fragile by construction,
+///   so it is kept only as a SECONDARY catch for a catastrophic regression, with
+///   a limit far from both the quiet value and the runner's weather.
+///
+/// A limit of [`f64::INFINITY`] leaves a field printed but not gated.
+#[derive(Clone, Copy)]
+struct WallRatios {
+    vs_control: f64,
+    growth_vs_control: f64,
+    growth: f64,
+}
+
+impl WallRatios {
+    fn within(&self, limits: &WallRatios) -> bool {
+        self.vs_control < limits.vs_control
+            && self.growth_vs_control < limits.growth_vs_control
+            && self.growth < limits.growth
+    }
+
+    /// Elementwise better (smaller) of two passes — see [`WallGuard::measure`].
+    fn better(&self, other: &WallRatios) -> WallRatios {
+        WallRatios {
+            vs_control: self.vs_control.min(other.vs_control),
+            growth_vs_control: self.growth_vs_control.min(other.growth_vs_control),
+            growth: self.growth.min(other.growth),
+        }
+    }
+}
+
+/// One wall-clock guard: a SHAPE and its CONTROL twin, measured at the same
+/// sizes and interleaved size by size so a slow stretch of runner hits both.
+struct WallGuard {
+    label: &'static str,
+    /// Column header for the control's millisecond column (e.g. `"flush"`).
+    control_label: &'static str,
+    sizes: &'static [usize],
+    /// Samples per size; the best (least-noisy, never the worst) is kept.
+    runs: usize,
+    shape: fn(usize) -> String,
+    control: fn(usize) -> String,
+    opts: Opts,
+    control_opts: Opts,
+    limits: WallRatios,
+}
+
+impl WallGuard {
+    /// One full measurement pass: best-of-`runs` wall time for the shape and for
+    /// its control at every size, printed per size, reduced to [`WallRatios`].
+    fn pass(&self) -> WallRatios {
+        let best = |md: &str, o: Opts| {
+            (0..self.runs).map(|_| measure(md, CHUNK, o).wall_ms).fold(f64::INFINITY, f64::min)
+        };
+        let mut walls = Vec::with_capacity(self.sizes.len());
+        let mut controls = Vec::with_capacity(self.sizes.len());
+        let mut worst_vs_control = 0.0f64;
+        for &n in self.sizes {
+            let wall = best(&(self.shape)(n), self.opts);
+            let control = best(&(self.control)(n), self.control_opts);
+            let vs = wall / control;
+            worst_vs_control = worst_vs_control.max(vs);
+            let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
+            println!(
+                "{} {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  {} {:>8.2} ms  \
+                 (x{vs:.1} vs control)",
+                self.label,
+                n / 1024,
+                wall,
+                self.control_label,
+                control
+            );
+            walls.push(wall);
+            controls.push(control);
+        }
+        let growth = walls[walls.len() - 1] / walls[0];
+        let control_growth = controls[controls.len() - 1] / controls[0];
+        WallRatios {
+            vs_control: worst_vs_control,
+            growth_vs_control: growth / control_growth,
+            growth,
+        }
+    }
+
+    /// Retry-once damping: measure, and if any GATED ratio would fail, re-measure
+    /// the whole set once (fresh best-of-`runs`) and keep the better value of
+    /// each. One retry only — a real quadratic reproduces on both passes, a
+    /// scheduler hiccup does not. The retry costs nothing on a green run.
+    fn measure(&self) -> WallRatios {
+        let first = self.pass();
+        if first.within(&self.limits) {
+            return first;
+        }
+        println!(
+            "{}: pass 1 breaches a limit (vs-control {:.1}x/{:.1}, growth-vs-control {:.1}x/{:.1}, \
+             growth {:.1}x/{:.1}) — RE-MEASURING the full set once and asserting on the better \
+             run; runner weather does not reproduce, a quadratic does",
+            self.label,
+            first.vs_control,
+            self.limits.vs_control,
+            first.growth_vs_control,
+            self.limits.growth_vs_control,
+            first.growth,
+            self.limits.growth,
+        );
+        let second = self.pass();
+        first.better(&second)
+    }
+}
+
 /// The growing-OPENER-LINE shape, gated on WALL time — deliberately, because no
 /// counter here can see its failure mode.
 ///
@@ -1507,37 +1670,63 @@ fn wire_delta_emitted_is_linear() {
 /// informational and also flat (the frozen HTML is small). Wall time is the only
 /// signal that moves, so this asserts on it.
 ///
-/// Crude by construction: wall is noisy. Damped by taking the best of 3 runs per
-/// size and by an 8x span (64 KB → 512 KB opener line), where linear ≈ 8x and
-/// quadratic ≈ 64x — a factor-8 gap. The limit sits at 24x: 3x headroom over
-/// linear, 2.7x below the quadratic floor. The regression this pins measured 64x.
+/// Crude by construction: wall is noisy. Damped four ways (see [`WallRatios`]):
+/// best of 5 runs per size, an 8x span (64 KB → 512 KB opener line) where linear
+/// ≈ 8x and quadratic ≈ 64x, a retry-once re-measure, and above all the
+/// [`fence_closed_info_runs`] control twin.
+///
+/// The PRIMARY gate is `growth_vs_control` — this shape's growth over the span
+/// divided by the linear control's growth over the same span, which is ~1.0 when
+/// the cache stays frozen and ~6x when it does not (the pinned regression grew
+/// 50.5x-64x where the control grows ~8x). Limit 3x: 2.5x above the quiet value,
+/// 2x below the broken one, and a runner that slows one twin down slows the
+/// other with it. The raw growth stays as a SECONDARY catch at 48x — halfway to
+/// the quadratic floor, so it only fires on a catastrophe and never on weather
+/// (it read 8.9x quiet).
 #[test]
 fn fence_opener_line_growth_is_wall_linear() {
     const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
-    let mut walls = Vec::with_capacity(SIZES.len());
-    for &n in &SIZES {
-        let md = fence_giant_info(n);
-        // Best of 3 — the least-noisy sample, never the worst.
-        let wall = (0..3)
-            .map(|_| measure(&md, CHUNK, Opts::default()).wall_ms)
-            .fold(f64::INFINITY, f64::min);
-        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
-        println!(
-            "fence_giant_info opener {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)",
-            n / 1024,
-            wall
-        );
-        walls.push(wall);
+    let limits = WallRatios { vs_control: f64::INFINITY, growth_vs_control: 3.0, growth: 48.0 };
+    let r = WallGuard {
+        label: "fence_giant_info opener",
+        control_label: "closed fences",
+        sizes: &SIZES,
+        runs: 5,
+        shape: fence_giant_info,
+        control: fence_closed_info_runs,
+        opts: Opts::default(),
+        control_opts: Opts::default(),
+        limits,
     }
+    .measure();
     let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
-    let ratio = walls[walls.len() - 1] / walls[0];
-    println!("fence_giant_info wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
+    println!(
+        "fence_giant_info growth {:.1}x vs the linear control's growth = {:.1}x (limit {:.0}); \
+         raw wall ratio {:.1} (span x{span:.0}, limit {:.0}); per-size cost vs control \
+         {:.1}x (informational — a different document, so the constant is arbitrary)",
+        r.growth,
+        r.growth_vs_control,
+        limits.growth_vs_control,
+        r.growth,
+        limits.growth,
+        r.vs_control,
+    );
     assert!(
-        ratio < 24.0,
-        "growing fence opener line went superlinear in WALL time: {ratio:.1}x for {span:.0}x \
-         input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x). Something re-derives a \
-         growing part of the opener line per append — FenceInfoCache must stay frozen.",
-        span * span
+        r.growth_vs_control < limits.growth_vs_control,
+        "growing fence opener line grew {:.1}x its LINEAR control's growth across the same \
+         {span:.0}x span (limit {:.0}x; ~1x when frozen). Something re-derives a growing part of \
+         the opener line per append — FenceInfoCache must stay frozen.",
+        r.growth_vs_control,
+        limits.growth_vs_control,
+    );
+    assert!(
+        r.growth < limits.growth,
+        "growing fence opener line went superlinear in WALL time: {:.1}x for {span:.0}x input \
+         (limit {:.0}x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x). Something re-derives a growing \
+         part of the opener line per append — FenceInfoCache must stay frozen.",
+        r.growth,
+        limits.growth,
+        span * span,
     );
 }
 
@@ -1655,60 +1844,58 @@ fn indented_blockquote_ragged(target: usize) -> String {
 }
 
 /// Wall-time twin of the `rendered` counter gate for the indented-continuation
-/// paragraph (see [`indented_wrapped_para`]). Same crude-but-wide shape as
-/// `fence_opener_line_growth_is_wall_linear`: best of 3 per size, an 8x span
-/// (64 KB → 512 KB) where linear ≈ 8x and quadratic ≈ 64x, limit 24x.
+/// paragraph (see [`indented_wrapped_para`]): best of 3 per size over an 8x span
+/// (64 KB → 512 KB), against the [`flush_wrapped_para`] control twin.
 ///
-/// Growth ratio alone is a blunt instrument HERE, though: one giant open
-/// paragraph re-emits its whole `Block.html` every append (the documented wire
-/// contract — see the `emitted` counter), which is an O(n²/chunk) memcpy floor
-/// no commit-cut fix can remove, and it dominates the 512 KB sample. So the
-/// sharp assertion is the second one: indented prose must cost about what the
-/// identical FLUSH prose costs. That ratio is ~1x when the cut advances and was
-/// 60x+ when it pinned at 0.
+/// Growth over the span is a blunt instrument HERE: one giant open paragraph
+/// re-emits its whole `Block.html` every append (the documented wire contract —
+/// see the `emitted` counter), which is an O(n²/chunk) memcpy floor no commit-cut
+/// fix can remove, and it dominates the 512 KB sample — the quiet reading is
+/// already 18.5x of a 24x limit, which is what made this the guard that flaked
+/// (29.1x on a contended runner, with the counter gate for the same shape green
+/// in the same job). So the PRIMARY assertion is the flush control: indented
+/// prose must cost about what the byte-identical FLUSH prose costs, ~1x when the
+/// cut advances and 60x+ when it pinned at 0. Raw growth stays as a SECONDARY
+/// catch, moved out to 48x — halfway to the quadratic floor.
 #[test]
 fn indented_continuation_para_is_wall_linear() {
     const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
-    // Best of 3 — the least-noisy sample, never the worst.
-    let best = |md: &str| {
-        (0..3)
-            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
-            .fold(f64::INFINITY, f64::min)
-    };
-    let mut walls = Vec::with_capacity(SIZES.len());
-    let mut worst_vs_flush = 0.0f64;
-    for &n in &SIZES {
-        let wall = best(&indented_wrapped_para(n));
-        let flush = best(&flush_wrapped_para(n));
-        let vs_flush = wall / flush;
-        worst_vs_flush = worst_vs_flush.max(vs_flush);
-        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
-        println!(
-            "indented_wrapped_para {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
-             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
-            n / 1024,
-            wall,
-            flush
-        );
-        walls.push(wall);
+    let limits = WallRatios { vs_control: 4.0, growth_vs_control: f64::INFINITY, growth: 48.0 };
+    let r = WallGuard {
+        label: "indented_wrapped_para",
+        control_label: "flush",
+        sizes: &SIZES,
+        runs: 3,
+        shape: indented_wrapped_para,
+        control: flush_wrapped_para,
+        opts: Opts::default(),
+        control_opts: Opts::default(),
+        limits,
     }
-    println!("indented_wrapped_para worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    .measure();
+    println!(
+        "indented_wrapped_para worst cost vs flush prose {:.1}x (limit {:.0}); raw wall ratio \
+         {:.1} (span x8, limit {:.0}; {:.1}x the flush control's own growth)",
+        r.vs_control, limits.vs_control, r.growth, limits.growth, r.growth_vs_control,
+    );
     assert!(
-        worst_vs_flush < 4.0,
-        "indented continuation lines cost {worst_vs_flush:.1}x what the identical FLUSH prose \
-         costs (limit 4x). The paragraph commit cut stopped advancing — `is_boundary` must keep \
-         proposing the first word of an indent-led line."
+        r.vs_control < limits.vs_control,
+        "indented continuation lines cost {:.1}x what the identical FLUSH prose costs (limit \
+         {:.0}x). The paragraph commit cut stopped advancing — `is_boundary` must keep proposing \
+         the first word of an indent-led line.",
+        r.vs_control,
+        limits.vs_control,
     );
     let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
-    let ratio = walls[walls.len() - 1] / walls[0];
-    println!("indented_wrapped_para wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
     assert!(
-        ratio < 24.0,
-        "indented continuation lines went superlinear in WALL time: {ratio:.1}x for {span:.0}x \
-         input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x). The paragraph commit cut \
-         stopped advancing — `is_boundary` must keep proposing the first word of an indent-led \
-         line.",
-        span * span
+        r.growth < limits.growth,
+        "indented continuation lines went superlinear in WALL time: {:.1}x for {span:.0}x input \
+         (limit {:.0}x; linear ≈ {span:.0}x, the open paragraph's re-emit floor ≈ 18x, quadratic \
+         ≈ {:.0}x). The paragraph commit cut stopped advancing — `is_boundary` must keep \
+         proposing the first word of an indent-led line.",
+        r.growth,
+        limits.growth,
+        span * span,
     );
 }
 
@@ -1720,44 +1907,42 @@ fn indented_continuation_para_is_wall_linear() {
 #[test]
 fn indented_para_ragged_chunks_is_wall_linear() {
     const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
-    let best = |md: &str| {
-        (0..3)
-            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
-            .fold(f64::INFINITY, f64::min)
-    };
-    let mut walls = Vec::with_capacity(SIZES.len());
-    let mut worst_vs_flush = 0.0f64;
-    for &n in &SIZES {
-        let wall = best(&indented_wrapped_para_ragged(n));
-        let flush = best(&flush_wrapped_para_ragged(n));
-        let vs_flush = wall / flush;
-        worst_vs_flush = worst_vs_flush.max(vs_flush);
-        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
-        println!(
-            "indented_ragged {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
-             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
-            n / 1024,
-            wall,
-            flush
-        );
-        walls.push(wall);
+    let limits = WallRatios { vs_control: 4.0, growth_vs_control: f64::INFINITY, growth: 48.0 };
+    let r = WallGuard {
+        label: "indented_ragged",
+        control_label: "flush",
+        sizes: &SIZES,
+        runs: 3,
+        shape: indented_wrapped_para_ragged,
+        control: flush_wrapped_para_ragged,
+        opts: Opts::default(),
+        control_opts: Opts::default(),
+        limits,
     }
-    println!("indented_ragged worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    .measure();
+    println!(
+        "indented_ragged worst cost vs flush prose {:.1}x (limit {:.0}); raw wall ratio {:.1} \
+         (span x8, limit {:.0}; {:.1}x the flush control's own growth)",
+        r.vs_control, limits.vs_control, r.growth, limits.growth, r.growth_vs_control,
+    );
     assert!(
-        worst_vs_flush < 4.0,
-        "chunk-misaligned indented continuation lines cost {worst_vs_flush:.1}x what the \
-         identical FLUSH prose costs (limit 4x). An append boundary landing on a line's leading \
-         indent must SUSPEND the paragraph cache (`trailing_open_ws_line`), not drop it into a \
-         full re-scan + re-render."
+        r.vs_control < limits.vs_control,
+        "chunk-misaligned indented continuation lines cost {:.1}x what the identical FLUSH prose \
+         costs (limit {:.0}x). An append boundary landing on a line's leading indent must SUSPEND \
+         the paragraph cache (`trailing_open_ws_line`), not drop it into a full re-scan + \
+         re-render.",
+        r.vs_control,
+        limits.vs_control,
     );
     let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
-    let ratio = walls[walls.len() - 1] / walls[0];
-    println!("indented_ragged wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
     assert!(
-        ratio < 24.0,
-        "chunk-misaligned indented continuation lines went superlinear in WALL time: {ratio:.1}x \
-         for {span:.0}x input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x).",
-        span * span
+        r.growth < limits.growth,
+        "chunk-misaligned indented continuation lines went superlinear in WALL time: {:.1}x for \
+         {span:.0}x input (limit {:.0}x; linear ≈ {span:.0}x, the open paragraph's re-emit floor \
+         ≈ 12x, quadratic ≈ {:.0}x).",
+        r.growth,
+        limits.growth,
+        span * span,
     );
 }
 
@@ -1768,43 +1953,41 @@ fn indented_para_ragged_chunks_is_wall_linear() {
 #[test]
 fn indented_list_item_ragged_is_wall_linear() {
     const SIZES: [usize; 4] = [64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024];
-    let best = |md: &str| {
-        (0..3)
-            .map(|_| measure(md, CHUNK, Opts::default()).wall_ms)
-            .fold(f64::INFINITY, f64::min)
-    };
-    let mut walls = Vec::with_capacity(SIZES.len());
-    let mut worst_vs_flush = 0.0f64;
-    for &n in &SIZES {
-        let wall = best(&indented_list_item_ragged(n));
-        let flush = best(&flush_list_item_ragged(n));
-        let vs_flush = wall / flush;
-        worst_vs_flush = worst_vs_flush.max(vs_flush);
-        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
-        println!(
-            "indented_list_item {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
-             flush {:>8.2} ms  (x{vs_flush:.1} vs flush)",
-            n / 1024,
-            wall,
-            flush
-        );
-        walls.push(wall);
+    let limits = WallRatios { vs_control: 4.0, growth_vs_control: f64::INFINITY, growth: 48.0 };
+    let r = WallGuard {
+        label: "indented_list_item",
+        control_label: "flush",
+        sizes: &SIZES,
+        runs: 3,
+        shape: indented_list_item_ragged,
+        control: flush_list_item_ragged,
+        opts: Opts::default(),
+        control_opts: Opts::default(),
+        limits,
     }
-    println!("indented_list_item worst cost vs flush prose {worst_vs_flush:.1}x (limit 4)");
+    .measure();
+    println!(
+        "indented_list_item worst cost vs flush prose {:.1}x (limit {:.0}); raw wall ratio {:.1} \
+         (span x8, limit {:.0}; {:.1}x the flush control's own growth)",
+        r.vs_control, limits.vs_control, r.growth, limits.growth, r.growth_vs_control,
+    );
     assert!(
-        worst_vs_flush < 4.0,
-        "an open list item's indented continuation lines cost {worst_vs_flush:.1}x what the \
-         identical FLUSH item costs (limit 4x). The item's NESTED parser must keep suspending \
-         its paragraph cache on a transient end (`ParaEnd::OpenBlank`), not dropping it."
+        r.vs_control < limits.vs_control,
+        "an open list item's indented continuation lines cost {:.1}x what the identical FLUSH \
+         item costs (limit {:.0}x). The item's NESTED parser must keep suspending its paragraph \
+         cache on a transient end (`ParaEnd::OpenBlank`), not dropping it.",
+        r.vs_control,
+        limits.vs_control,
     );
     let span = (SIZES[SIZES.len() - 1] / SIZES[0]) as f64; // 8x
-    let ratio = walls[walls.len() - 1] / walls[0];
-    println!("indented_list_item wall ratio {ratio:.1} (span x{span:.0}, limit 24)");
     assert!(
-        ratio < 24.0,
-        "an open list item's indented continuation lines went superlinear in WALL time: \
-         {ratio:.1}x for {span:.0}x input (limit 24x; linear ≈ {span:.0}x, quadratic ≈ {:.0}x).",
-        span * span
+        r.growth < limits.growth,
+        "an open list item's indented continuation lines went superlinear in WALL time: {:.1}x \
+         for {span:.0}x input (limit {:.0}x; linear ≈ {span:.0}x, the open item's re-emit floor ≈ \
+         15x, quadratic ≈ {:.0}x).",
+        r.growth,
+        limits.growth,
+        span * span,
     );
 }
 
@@ -1844,46 +2027,43 @@ fn block_html_sanitize_is_wall_linear() {
     // 64 KB up: below that the per-append fixed costs swamp the fold and the
     // ratio is pure noise (a 32 KB sample swung 1.9x–5.1x run to run).
     const SIZES: [usize; 3] = [64 * 1024, 128 * 1024, 256 * 1024];
-    let on = Opts { html_sanitize: true, block_html: true, ..Opts::default() };
-    // The control twin: sanitizer engaged, block HTML still escaped.
-    let control = Opts { html_sanitize: true, ..Opts::default() };
-    // Best of 5 — the least-noisy sample, never the worst.
-    let best = |md: &str, o: Opts| {
-        (0..5).map(|_| measure(md, CHUNK, o).wall_ms).fold(f64::INFINITY, f64::min)
+    // Raw growth stays ungated on BOTH twins (see the note above): the escaped
+    // control grows faster than the sanitized shape on the same stream.
+    let limits = WallRatios {
+        vs_control: 6.0,
+        growth_vs_control: f64::INFINITY,
+        growth: f64::INFINITY,
     };
-    let mut walls = Vec::with_capacity(SIZES.len());
-    let mut escs = Vec::with_capacity(SIZES.len());
-    let mut worst_vs_control = 0.0f64;
-    for &n in &SIZES {
-        let md = block_html_ragged(n);
-        let wall = best(&md, on);
-        let esc = best(&md, control);
-        let vs = wall / esc;
-        worst_vs_control = worst_vs_control.max(vs);
-        let each = walls.last().map(|prev| wall / *prev as f64).unwrap_or(0.0);
-        println!(
-            "block_html_ragged {:>4} KB  wall {:>8.2} ms  (x{each:.1} vs previous size)  \
-             escaped {:>8.2} ms  (x{vs:.1} vs escaped)",
-            n / 1024,
-            wall,
-            esc
-        );
-        walls.push(wall);
-        escs.push(esc);
+    let r = WallGuard {
+        label: "block_html_ragged",
+        control_label: "escaped",
+        sizes: &SIZES,
+        runs: 5,
+        shape: block_html_ragged,
+        control: block_html_ragged,
+        opts: Opts { html_sanitize: true, block_html: true, ..Opts::default() },
+        // The control twin: sanitizer engaged, block HTML still escaped.
+        control_opts: Opts { html_sanitize: true, ..Opts::default() },
+        limits,
     }
-    println!("block_html_ragged worst cost vs escaped control {worst_vs_control:.1}x (limit 6)");
+    .measure();
     println!(
-        "block_html_ragged raw wall growth {:.1}x over a 4x span (informational — the open \
-         block's per-append full re-emit is an O(n\u{b2}/chunk) memcpy floor; the ESCAPED control \
-         grows {:.1}x on the same stream)",
-        walls[walls.len() - 1] / walls[0],
-        escs[escs.len() - 1] / escs[0],
+        "block_html_ragged worst cost vs escaped control {:.1}x (limit {:.0})",
+        r.vs_control, limits.vs_control
+    );
+    println!(
+        "block_html_ragged raw wall growth {:.1}x over a 4x span, {:.2}x the ESCAPED control's \
+         growth on the same stream (informational — the open block's per-append full re-emit is \
+         an O(n\u{b2}/chunk) memcpy floor both twins pay)",
+        r.growth, r.growth_vs_control,
     );
     assert!(
-        worst_vs_control < 6.0,
-        "sanitizing block HTML costs {worst_vs_control:.1}x what ESCAPING the same bytes costs \
-         (limit 6x). The HtmlBlockCache token fold must consume each token exactly once — \
-         re-sanitizing the growing block per append measured 247x on both work counters and \
-         121x this control's wall time."
+        r.vs_control < limits.vs_control,
+        "sanitizing block HTML costs {:.1}x what ESCAPING the same bytes costs (limit {:.0}x). \
+         The HtmlBlockCache token fold must consume each token exactly once — re-sanitizing the \
+         growing block per append measured 247x on both work counters and 121x this control's \
+         wall time.",
+        r.vs_control,
+        limits.vs_control,
     );
 }
